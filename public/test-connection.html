@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test de Conexión - Luciano Cargas</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 30px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        
+        .test-section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .test-section h2 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        
+        .test-item {
+            margin-bottom: 10px;
+            padding: 10px;
+            background: white;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .test-item label {
+            font-weight: 500;
+            color: #555;
+        }
+        
+        .status {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status.pending {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 20px;
+            transition: background 0.3s;
+        }
+        
+        .btn:hover {
+            background: #5568d3;
+        }
+        
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .result {
+            margin-top: 15px;
+            padding: 15px;
+            background: #e9ecef;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            display: none;
+        }
+        
+        .result.show {
+            display: block;
+        }
+        
+        .config {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .config input {
+            width: 100%;
+            padding: 8px;
+            margin-top: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        
+        .config label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: 600;
+            color: #856404;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Test de Conexión</h1>
+        <p class="subtitle">Verifica que Frontend, Backend y Base de Datos estén conectados</p>
+        
+        <div class="config">
+            <label>URL del Backend (Google Apps Script):</label>
+            <input type="text" id="backend-url" placeholder="https://script.google.com/macros/s/.../exec" 
+                   value="https://script.google.com/macros/s/AKfycbzbqV7fnQtdWJ0yYzUAdZ9BtagturnmZ7s97fI__WFoJLx3yW759thyQfCxrPPEgK1NXQ/exec">
+            
+            <label style="margin-top: 15px;">API Key:</label>
+            <input type="text" id="api-key" placeholder="Tu API Key aquí" value="TMiToken89899">
+        </div>
+        
+        <div class="test-section">
+            <h2>📡 Pruebas de Conexión</h2>
+            
+            <div class="test-item">
+                <label>Backend responde (GET clientes)</label>
+                <span class="status pending" id="test-1">Pendiente</span>
+            </div>
+            
+            <div class="test-item">
+                <label>Lectura de datos (GET productos)</label>
+                <span class="status pending" id="test-2">Pendiente</span>
+            </div>
+            
+            <div class="test-item">
+                <label>Escritura de datos (POST cliente)</label>
+                <span class="status pending" id="test-3">Pendiente</span>
+            </div>
+            
+            <div class="test-item">
+                <label>Verificación en Google Sheets</label>
+                <span class="status pending" id="test-4">Pendiente</span>
+            </div>
+        </div>
+        
+        <button class="btn" onclick="runTests()" id="test-btn">▶️ Ejecutar Pruebas</button>
+        
+        <div class="result" id="result">
+            <strong>Resultados:</strong><br>
+            <div id="result-content"></div>
+        </div>
+    </div>
+    
+    <script>
+        function updateStatus(testId, status, message = '') {
+            const element = document.getElementById(testId);
+            element.className = 'status ' + status;
+            element.textContent = status === 'success' ? '✅ OK' : 
+                                 status === 'error' ? '❌ Error' : '⏳ Pendiente';
+            
+            if (message) {
+                element.title = message;
+            }
+        }
+        
+        function log(message) {
+            const resultDiv = document.getElementById('result');
+            const content = document.getElementById('result-content');
+            content.innerHTML += message + '<br>';
+            resultDiv.classList.add('show');
+            resultDiv.scrollTop = resultDiv.scrollHeight;
+        }
+        
+        async function runTests() {
+            const btn = document.getElementById('test-btn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Ejecutando pruebas...';
+            
+            // Reset statuses
+            ['test-1', 'test-2', 'test-3', 'test-4'].forEach(id => {
+                updateStatus(id, 'pending');
+            });
+            
+            const resultContent = document.getElementById('result-content');
+            resultContent.innerHTML = '';
+            
+            const url = document.getElementById('backend-url').value.trim();
+            const apiKey = document.getElementById('api-key').value.trim();
+            
+            if (!url || !apiKey) {
+                alert('⚠️ Por favor completa la URL y API Key');
+                btn.disabled = false;
+                btn.textContent = '▶️ Ejecutar Pruebas';
+                return;
+            }
+            
+            log('🧪 Iniciando pruebas de conexión...');
+            log(`📡 URL: ${url}`);
+            log(`🔑 API Key: ${apiKey}`);
+            log('');
+            
+            // Test 1: GET clientes
+            try {
+                log('📤 Test 1: GET clientes...');
+                const response1 = await fetch(`${url}?endpoint=clientes&apiKey=${apiKey}`);
+                const data1 = await response1.json();
+                
+                if (data1.success) {
+                    updateStatus('test-1', 'success', `OK - ${data1.data.length} registros`);
+                    log(`✅ Test 1: OK - Backend responde correctamente (${data1.data.length} clientes)`);
+                } else {
+                    updateStatus('test-1', 'error', data1.error || 'Error desconocido');
+                    log(`❌ Test 1: ERROR - ${data1.error || 'Error desconocido'}`);
+                }
+            } catch (error) {
+                updateStatus('test-1', 'error', error.message);
+                log(`❌ Test 1: ERROR - ${error.message}`);
+            }
+            
+            // Test 2: GET productos
+            try {
+                log('📤 Test 2: GET productos...');
+                const response2 = await fetch(`${url}?endpoint=productos&apiKey=${apiKey}`);
+                const data2 = await response2.json();
+                
+                if (data2.success) {
+                    updateStatus('test-2', 'success', `OK - ${data2.data.length} registros`);
+                    log(`✅ Test 2: OK - Lectura de datos funciona (${data2.data.length} productos)`);
+                } else {
+                    updateStatus('test-2', 'error', data2.error || 'Error desconocido');
+                    log(`❌ Test 2: ERROR - ${data2.error || 'Error desconocido'}`);
+                }
+            } catch (error) {
+                updateStatus('test-2', 'error', error.message);
+                log(`❌ Test 2: ERROR - ${error.message}`);
+            }
+            
+            // Test 3: POST cliente
+            try {
+                log('📤 Test 3: POST crear cliente...');
+                const testCliente = {
+                    endpoint: 'clientes',
+                    apiKey: apiKey,
+                    nombre: 'Test Conexión ' + Date.now(),
+                    telefono: '999999999',
+                    direccion: 'Dirección de Prueba'
+                };
+                
+                const response3 = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(testCliente)
+                });
+                
+                const data3 = await response3.json();
+                
+                if (data3.success) {
+                    updateStatus('test-3', 'success', `OK - Cliente creado: ${data3.data.id}`);
+                    log(`✅ Test 3: OK - Escritura de datos funciona (Cliente ID: ${data3.data.id})`);
+                    window.testClienteId = data3.data.id;
+                    window.testClienteNombre = testCliente.nombre;
+                } else {
+                    updateStatus('test-3', 'error', data3.error || 'Error desconocido');
+                    log(`❌ Test 3: ERROR - ${data3.error || 'Error desconocido'}`);
+                }
+            } catch (error) {
+                updateStatus('test-3', 'error', error.message);
+                log(`❌ Test 3: ERROR - ${error.message}`);
+            }
+            
+            // Test 4: Verificar en Sheets
+            if (window.testClienteId) {
+                updateStatus('test-4', 'success', 'Verifica manualmente en Google Sheets');
+                log(`✅ Test 4: Abre tu Google Sheet y verifica que existe el cliente "${window.testClienteNombre}"`);
+                log('   💡 Si lo ves, significa que Frontend → Backend → Base de Datos funciona correctamente');
+            } else {
+                updateStatus('test-4', 'pending', 'No se pudo crear cliente de prueba');
+                log(`⚠️ Test 4: No se puede verificar porque el Test 3 falló`);
+            }
+            
+            log('');
+            log('🎉 Pruebas completadas!');
+            
+            btn.disabled = false;
+            btn.textContent = '▶️ Ejecutar Pruebas';
+        }
+        
+        // Auto-ejecutar si los campos están llenos
+        window.addEventListener('DOMContentLoaded', () => {
+            const url = document.getElementById('backend-url').value;
+            const apiKey = document.getElementById('api-key').value;
+            if (url && apiKey && url.includes('script.google.com')) {
+                // No auto-ejecutar, dejar que el usuario lo haga
+            }
+        });
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Luciano Cargas - Sistema de Gestión</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Indicador de carga global -->
+    <div id="global-loader" class="global-loader" style="display: none;">
+        <div class="loader-spinner"></div>
+        <p>Cargando...</p>
+    </div>
+
+    <!-- Navegación lateral -->
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <h2>Luciano Cargas</h2>
+        </div>
+        <ul class="nav-menu">
+            <!-- Inicio -->
+            <li><a href="#" data-page="dashboard" class="nav-link active">
+                <span class="nav-icon">🏠</span>
+                <span class="nav-text">Inicio</span>
+            </a></li>
+            
+            <!-- Flujo del Día (ordenado según proceso) -->
+            <li class="nav-category">
+                <a href="#" class="nav-category-toggle">
+                    <span class="nav-icon">📋</span>
+                    <span class="nav-text">Flujo del Día</span>
+                    <span class="nav-arrow">▼</span>
+                </a>
+                <ul class="nav-submenu nav-flow-menu">
+                    <li class="nav-flow-phase"><span>Fase 1</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="pedidos" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">1</span>
+                            <span class="nav-flow-label">Pedidos del día</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="proveedores-pedido" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">2</span>
+                            <span class="nav-flow-label">Pedido a proveedores</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-phase"><span>Fase 2</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="recepcion" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">3</span>
+                            <span class="nav-flow-label">Confirmar recepción</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="precios" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">4</span>
+                            <span class="nav-flow-label">Precios al cliente</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-phase"><span>Fase 3</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cierre" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">5</span>
+                            <span class="nav-flow-label">Cerrar el día</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cobranzas" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">6</span>
+                            <span class="nav-flow-label">Cobranzas pendientes</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="pagos" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">7</span>
+                            <span class="nav-flow-label">Pagos a proveedores</span>
+                        </a>
+                    </li>
+                </ul>
+            </li>
+            
+            <!-- Configuración (datos base) -->
+            <li class="nav-category">
+                <a href="#" class="nav-category-toggle">
+                    <span class="nav-icon">⚙️</span>
+                    <span class="nav-text">Configuración</span>
+                    <span class="nav-arrow">▼</span>
+                </a>
+                <ul class="nav-submenu">
+                    <li><a href="#" data-page="clientes" class="nav-link">Clientes</a></li>
+                    <li><a href="#" data-page="productos" class="nav-link">Productos</a></li>
+                    <li><a href="#" data-page="proveedores" class="nav-link">Proveedores</a></li>
+                    <li><a href="#" data-page="stock" class="nav-link">Stock de Bebidas</a></li>
+                </ul>
+            </li>
+            
+            <!-- Historial y Consultas -->
+            <li class="nav-category">
+                <a href="#" class="nav-category-toggle">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-text">Historial</span>
+                    <span class="nav-arrow">▼</span>
+                </a>
+                <ul class="nav-submenu">
+                    <li><a href="#" data-page="historial" class="nav-link">Historial de Días</a></li>
+                </ul>
+            </li>
+        </ul>
+    </nav>
+
+    <!-- Contenido principal -->
+    <main class="main-content">
+        <header class="header">
+            <div class="header-left">
+                <h1 class="header-title">Luciano Cargas</h1>
+                <span class="header-subtitle" id="page-title">Dashboard</span>
+            </div>
+            <div class="header-right">
+                <span class="user-email" id="user-email"></span>
+                <button class="btn-logout" id="btn-logout" title="Cerrar sesión">
+                    <span>🚪</span> Salir
+                </button>
+            </div>
+        </header>
+
+        <!-- Dashboard -->
+        <div id="dashboard" class="page active">
+            <!-- Gráfico de métricas -->
+            <div class="metrics-section">
+                <div class="metrics-card">
+                    <h3 class="metrics-title">Top 5 Productos Más Vendidos (Semana)</h3>
+                    <div class="chart-container">
+                        <canvas id="topProductsChart"></canvas>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Cards informativos -->
+            <div class="dashboard-grid">
+                <div class="dashboard-card" onclick="Navigation.navigateTo('pedidos')">
+                    <h3>📋 Pedidos del día</h3>
+                    <div class="card-value" id="dashboard-pedidos-count">0</div>
+                    <p class="card-label">Total</p>
+                </div>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('cobranzas')">
+                    <h3>💵 Cobranzas pendientes</h3>
+                    <div class="card-value" id="dashboard-cobranzas-count">$0</div>
+                    <p class="card-label">Por cobrar</p>
+                </div>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('pagos')">
+                    <h3>💳 Proveedores a pagar</h3>
+                    <div class="card-value" id="dashboard-pagos-count">$0</div>
+                    <p class="card-label">Saldo total</p>
+                </div>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('stock')">
+                    <h3>📦 Stock bajo</h3>
+                    <div class="card-value" id="dashboard-stock-count">0</div>
+                    <p class="card-label">Productos</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Clientes -->
+        <div id="clientes" class="page">
+            <div class="page-header">
+                <h2>Clientes</h2>
+                <button class="btn btn-primary" id="btn-agregar-cliente">Agregar cliente</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Nombre</th>
+                            <th>Teléfono</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="clientes-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Productos -->
+        <div id="productos" class="page">
+            <div class="page-header">
+                <h2>Productos</h2>
+                <button class="btn btn-primary" id="btn-agregar-producto">Agregar producto</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Nombre</th>
+                            <th>Tipo</th>
+                            <th>Unidad</th>
+                            <th>Proveedor</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="productos-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Proveedores -->
+        <div id="proveedores" class="page">
+            <div class="page-header">
+                <h2>Proveedores</h2>
+                <button class="btn btn-primary" id="btn-agregar-proveedor">Agregar proveedor</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Nombre</th>
+                            <th>Rubro</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="proveedores-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Pedidos del día -->
+        <div id="pedidos" class="page">
+            <div class="page-header">
+                <h2>Pedidos del día</h2>
+                <button class="btn btn-primary" id="btn-agregar-pedido">Agregar pedido</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Producto</th>
+                            <th>Tipo</th>
+                            <th>Cantidad</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pedidos-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-guardar-pedidos">Guardar</button>
+            </div>
+        </div>
+
+        <!-- Pedido a proveedores -->
+        <div id="proveedores-pedido" class="page">
+            <div class="page-header">
+                <h2>Pedido a proveedores</h2>
+            </div>
+            <div id="proveedores-pedido-container">
+                <!-- Se llena dinámicamente -->
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-imprimir-pedido">Imprimir</button>
+                <button class="btn btn-primary" id="btn-marcar-pedido">Marcar pedido</button>
+            </div>
+        </div>
+
+        <!-- Recepción -->
+        <div id="recepcion" class="page">
+            <div class="page-header">
+                <h2>Confirmación de lo que llegó</h2>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Producto</th>
+                            <th>Pedido</th>
+                            <th>Llegó</th>
+                            <th>Precio real</th>
+                            <th>Proveedor</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recepcion-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-guardar-recepcion">Guardar</button>
+                <button class="btn btn-primary" id="btn-confirmar-recepcion">Confirmar</button>
+            </div>
+        </div>
+
+        <!-- Precios al cliente -->
+        <div id="precios" class="page">
+            <div class="page-header">
+                <h2>Precios al cliente</h2>
+            </div>
+            
+            <!-- Controles de filtro y comisión -->
+            <div class="precios-controls" style="display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; align-items: flex-end;">
+                <div class="form-group" style="flex: 1; min-width: 200px;">
+                    <label for="precios-filtro-cliente" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Filtrar por cliente:</label>
+                    <select id="precios-filtro-cliente" class="form-control" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
+                        <option value="">Todos los clientes</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex: 1; min-width: 200px;">
+                    <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión por unidad:</label>
+                    <input type="text" id="precios-comision" class="form-control" value="350" data-price-input="true" inputmode="numeric" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
+                </div>
+                <div class="form-group" style="display: flex; gap: 10px;">
+                    <button class="btn btn-secondary" id="btn-limpiar-filtro" style="white-space: nowrap;">Limpiar filtro</button>
+                </div>
+            </div>
+            
+            <!-- Resumen del cliente (se muestra cuando hay filtro activo) -->
+            <div id="precios-resumen-cliente" style="display: none;">
+                <h3>Resumen del Cliente</h3>
+                <div>
+                    <div>
+                        <strong>Cliente:</strong>
+                        <span id="resumen-cliente-nombre">-</span>
+                    </div>
+                    <div>
+                        <strong>Total Productos:</strong>
+                        <span id="resumen-total-productos">$0</span>
+                    </div>
+                    <div>
+                        <strong>Comisión:</strong>
+                        <span id="resumen-comision">$0</span>
+                    </div>
+                    <div>
+                        <strong>Saldo Total:</strong>
+                        <span id="resumen-saldo-total">$0</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Producto</th>
+                            <th>Cant.</th>
+                            <th>Precio real</th>
+                            <th>Precio cliente</th>
+                            <th>Ganancia</th>
+                            <th>Total</th>
+                        </tr>
+                    </thead>
+                    <tbody id="precios-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                    <tfoot id="precios-tfoot" style="display: none;">
+                        <!-- Se llena dinámicamente cuando hay filtro por cliente -->
+                    </tfoot>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-generar-lista-precios">Generar lista</button>
+                <button class="btn btn-primary" id="btn-guardar-precios">Guardar</button>
+                <button class="btn btn-success" id="btn-exportar-pdf-precios">Exportar PDF</button>
+            </div>
+        </div>
+
+        <!-- Cierre del día -->
+        <div id="cierre" class="page">
+            <div class="page-header">
+                <h2>Cierre del día</h2>
+            </div>
+            <div class="cierre-container">
+                <div class="cierre-panel">
+                    <h3>Resumen del cierre</h3>
+                    <ul id="cierre-resumen">
+                        <li>Cobranzas</li>
+                        <li>Proveedores</li>
+                        <li>Stock</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-volver-cierre">Volver</button>
+                <button class="btn btn-primary" id="btn-cerrar-dia">Cerrar día</button>
+            </div>
+        </div>
+
+        <!-- Cobranzas -->
+        <div id="cobranzas" class="page">
+            <div class="page-header">
+                <h2>Cobranzas pendientes</h2>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Fecha</th>
+                            <th>Cliente</th>
+                            <th>Total</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cobranzas-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-ver-cobranza">Ver</button>
+                <button class="btn btn-primary" id="btn-registrar-cobro">Registrar cobro</button>
+            </div>
+        </div>
+
+        <!-- Pagos -->
+        <div id="pagos" class="page">
+            <div class="page-header">
+                <h2>Proveedores (saldos)</h2>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Proveedor</th>
+                            <th>Saldo</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pagos-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-registrar-pago">Registrar pago</button>
+            </div>
+        </div>
+
+        <!-- Stock -->
+        <div id="stock" class="page">
+            <div class="page-header">
+                <h2>Stock de bebidas</h2>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Producto</th>
+                            <th>Stock</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="stock-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-ajustar-stock">Ajustar stock</button>
+                <button class="btn btn-secondary" id="btn-verificar-stock">🔔 Verificar stock bajo</button>
+                <button class="btn btn-secondary" id="btn-config-notificaciones">⚙️ Configurar notificaciones</button>
+            </div>
+        </div>
+
+        <!-- Historial -->
+        <div id="historial" class="page">
+            <div class="page-header">
+                <h2>Historial de días</h2>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Fecha</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historial-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-ver-dia">Ver día</button>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modales -->
+    <div id="modal-overlay" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">Título</h3>
+                <button class="modal-close" id="modal-close">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- Contenido dinámico -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="modal-cancel">Cancelar</button>
+                <button class="btn btn-primary" id="modal-save">Guardar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alert Personalizado -->
+    <div id="custom-alert-overlay" class="custom-alert-overlay">
+        <div class="custom-alert">
+            <div class="custom-alert-icon" id="custom-alert-icon">
+                <!-- Icono dinámico -->
+            </div>
+            <div class="custom-alert-content">
+                <h3 id="custom-alert-title">Título</h3>
+                <p id="custom-alert-message">Mensaje</p>
+            </div>
+            <div class="custom-alert-footer">
+                <button class="btn btn-primary" id="custom-alert-btn">Aceptar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Personalizado -->
+    <div id="custom-confirm-overlay" class="custom-alert-overlay">
+        <div class="custom-alert custom-confirm">
+            <div class="custom-alert-icon warning">
+                <span>⚠️</span>
+            </div>
+            <div class="custom-alert-content">
+                <h3 id="custom-confirm-title">Confirmar acción</h3>
+                <p id="custom-confirm-message">¿Está seguro?</p>
+            </div>
+            <div class="custom-alert-footer">
+                <button class="btn btn-secondary" id="custom-confirm-cancel">Cancelar</button>
+                <button class="btn btn-primary" id="custom-confirm-accept">Aceptar</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="auth.js"></script>
+    <script src="app.js"></script>
+    <script>
+        // Verificar autenticación y configurar UI
+        (function() {
+            // Verificar autenticación inmediatamente
+            if (!Auth.isAuthenticated()) {
+                window.location.href = 'login.html';
+                return;
+            }
+            
+            // Configurar UI después de que el DOM esté listo
+            document.addEventListener('DOMContentLoaded', () => {
+                // Mostrar email del usuario
+                const userEmail = Auth.getUserEmail();
+                const userEmailEl = document.getElementById('user-email');
+                if (userEmailEl) {
+                    userEmailEl.textContent = userEmail;
+                }
+                
+                // Manejar logout
+                const btnLogout = document.getElementById('btn-logout');
+                if (btnLogout) {
+                    btnLogout.addEventListener('click', () => {
+                        if (confirm('¿Deseas cerrar sesión?')) {
+                            Auth.logout();
+                        }
+                    });
+                }
+            });
+        })();
+    </script>
+</body>
+</html>
+
