@@ -1,6 +1,6 @@
 // Configuración de la API (igual que en app.js)
 const API_CONFIG = {
-    baseUrl: 'https://script.google.com/macros/s/AKfycbwBCiu3eRl6RJXE5ZetRVgWfWp0el0pN50BysXcekPTXMnjApWS0EX-sx4K3QZVO_u2jg/exec',
+    baseUrl: 'https://script.google.com/macros/s/AKfycbw8MRUd3Knlnbexk-sHixUr_P0XIA7NJafNc9qplITfnaBmBVwIY7l7ieQGpE13SN9msw/exec',
     apiKey: 'TMiToken89899'
 };
 
@@ -45,9 +45,9 @@ const Auth = {
                 
                 // Crear la función callback global
                 window[callbackName] = (data) => {
-                    // Limpiar
+                    settled = true;
                     delete window[callbackName];
-                    document.body.removeChild(script);
+                    if (script.parentNode) script.parentNode.removeChild(script);
 
                     /**
                      * La API responde con el formato:
@@ -78,24 +78,23 @@ const Auth = {
                 const url = `${API_CONFIG.baseUrl}?apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&endpoint=login&email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}&callback=${callbackName}`;
                 
                 script.src = url;
-                
-                // Manejar errores
-                script.onerror = () => {
+
+                let settled = false;
+                const finish = (result) => {
+                    if (settled) return;
+                    settled = true;
                     delete window[callbackName];
-                    document.body.removeChild(script);
-                    resolve({ success: false, error: 'Error de conexión. Intenta nuevamente.' });
+                    if (script.parentNode) script.parentNode.removeChild(script);
+                    resolve(result);
                 };
                 
-                // Timeout de 10 segundos
+                script.onerror = () => {
+                    finish({ success: false, error: 'Error de conexión. Intenta nuevamente.' });
+                };
+                
                 setTimeout(() => {
-                    if (window[callbackName]) {
-                        delete window[callbackName];
-                        if (script.parentNode) {
-                            document.body.removeChild(script);
-                        }
-                        resolve({ success: false, error: 'Tiempo de espera agotado. Intenta nuevamente.' });
-                    }
-                }, 10000);
+                    finish({ success: false, error: 'Tiempo de espera agotado. Intenta nuevamente.' });
+                }, 60000);
                 
                 document.body.appendChild(script);
                 

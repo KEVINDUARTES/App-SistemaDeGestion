@@ -222,6 +222,10 @@ function handleRequest(e, method) {
       case 'pedidos/delete':
         result = deletePedido(data.id);
         break;
+
+      case 'pedidos/update':
+        result = updatePedido(data);
+        break;
       
       case 'pedidos/marcar-enviados':
         result = marcarPedidosEnviados(data.fecha);
@@ -242,6 +246,18 @@ function handleRequest(e, method) {
       
       case 'recepcion/confirmar':
         result = confirmarRecepcion(data.fecha);
+        break;
+
+      case 'recepcion/confirmar-item':
+        result = confirmarRecepcionItem(data);
+        break;
+
+      case 'recepcion/desconfirmar-item':
+        result = desconfirmarRecepcionItem(data);
+        break;
+
+      case 'recepcion/eliminar-item':
+        result = deleteRecepcionItem(data);
         break;
       
       // Precios Cliente
@@ -280,10 +296,41 @@ function handleRequest(e, method) {
           result = registrarCobro(data);
         }
         break;
+
+      case 'cobranzas/cobrar-cliente':
+        result = cobrarClienteHoy(data);
+        break;
+
+      case 'cobranzas/totales-hoy':
+        result = getTotalesClientesHoy(data.fecha);
+        break;
       
       // Estadísticas
       case 'estadisticas/productos-mas-vendidos':
         result = getTopProductosVendidos(data.dias || 7, data.limite || 5);
+        break;
+
+      case 'dashboard/resumen':
+        result = getDashboardResumen(data.fecha, data.dias || 7, data.limite || 5);
+        break;
+
+      case 'app/bootstrap':
+        result = getAppBootstrap(data.fecha, data.dias || 7, data.limite || 5);
+        break;
+
+      case 'flujo/dias-pendientes':
+        result = getDiasPendientes();
+        break;
+
+      case 'flujo/dia':
+        result = getFlujoDia(data.fecha);
+        break;
+
+      case 'admin/reset-datos':
+        if (actualMethod !== 'POST') {
+          throw new Error('Método no permitido');
+        }
+        result = resetAllDatos(data.confirmacion);
         break;
       
       // Pagos Proveedores
@@ -337,6 +384,14 @@ function handleRequest(e, method) {
         } else if (actualMethod === 'POST') {
           result = saveConfiguracionNotificaciones(data);
         }
+        break;
+
+      case 'whatsapp/status':
+        result = getWhatsAppStatus();
+        break;
+
+      case 'whatsapp/enviar':
+        result = enviarMensajeWhatsApp(data.telefono, data.mensaje);
         break;
       
       default:
@@ -437,17 +492,231 @@ function getSheet(sheetName) {
   return sheet;
 }
 
+/** Caché de valores por hoja dentro de la misma ejecución (evita getDataRange repetidos) */
+let _sheetValuesCache = {};
+
+/** Memo de catálogo procesado (rowsToObjects) dentro de la misma ejecución */
+let _catalogMemo = {
+  clientes: null,
+  productos: null,
+  proveedoresList: null,
+  clientesMap: null,
+  productosMap: null
+};
+
+function invalidateCatalogMemo() {
+  _catalogMemo = {
+    clientes: null,
+    productos: null,
+    proveedoresList: null,
+    clientesMap: null,
+    productosMap: null
+  };
+}
+
+function readSheetValues(sheetName) {
+  if (!_sheetValuesCache[sheetName]) {
+    const sheet = getSheet(sheetName);
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    var values = [];
+    if (lastRow > 0 && lastCol > 0) {
+      values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+    }
+    _sheetValuesCache[sheetName] = {
+      sheet: sheet,
+      headers: values.length ? values[0] : [],
+      rows: values.length > 1 ? values.slice(1) : []
+    };
+  }
+  return _sheetValuesCache[sheetName];
+}
+
+function invalidateSheetCache(sheetName) {
+  if (sheetName) {
+    delete _sheetValuesCache[sheetName];
+    if (sheetName === CONFIG.SHEETS.CLIENTES ||
+        sheetName === CONFIG.SHEETS.PROVEEDORES ||
+        sheetName === CONFIG.SHEETS.PRODUCTOS) {
+      invalidateCatalogMemo();
+    }
+  } else {
+    _sheetValuesCache = {};
+    invalidateCatalogMemo();
+  }
+}
+
+/** Caché entre ejecuciones (CacheService) — reduce lecturas de Sheets */
+var SERVER_CACHE_TTL = {
+  catalog: 600,
+  saldos: 180,
+  fecha: 90,
+  flujo: 60,
+  dias: 90
+};
+
+function serverCacheGet(key) {
+  try {
+    var raw = CacheService.getScriptCache().get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function serverCacheSet(key, value, ttlSeconds) {
+  try {
+    var json = JSON.stringify(value);
+    if (json.length > 95000) return;
+    CacheService.getScriptCache().put(key, json, ttlSeconds || SERVER_CACHE_TTL.catalog);
+  } catch (e) {
+    // Cuota o valor demasiado grande
+  }
+}
+
+function serverCacheRemove(key) {
+  try {
+    CacheService.getScriptCache().remove(key);
+  } catch (e) {}
+}
+
+function serverCacheRemoveMany(keys) {
+  keys.forEach(function(k) { serverCacheRemove(k); });
+}
+
+function invalidateServerCacheForSheet(sheetName) {
+  var keys = [];
+  if (sheetName === CONFIG.SHEETS.CLIENTES) keys.push('sc:clientes');
+  if (sheetName === CONFIG.SHEETS.PRODUCTOS) keys.push('sc:productos');
+  if (sheetName === CONFIG.SHEETS.PROVEEDORES) {
+    keys.push('sc:proveedores_list');
+    keys.push('sc:saldos');
+  }
+  if (sheetName === CONFIG.SHEETS.PEDIDOS) keys.push('sc:dias');
+  if (sheetName === CONFIG.SHEETS.RECEPCION) keys.push('sc:saldos');
+  if (sheetName === CONFIG.SHEETS.PAGOS_PROVEEDORES) keys.push('sc:saldos');
+  if (sheetName === CONFIG.SHEETS.CIERRE_DIA) keys.push('sc:dias');
+  if (sheetName === CONFIG.SHEETS.PRECIOS_CLIENTE) keys.push('sc:dias');
+  if (sheetName === CONFIG.SHEETS.COBRANZAS) keys.push('sc:cobranzas');
+  if (sheetName === CONFIG.SHEETS.STOCK_BEBIDAS) keys.push('sc:stock');
+  keys.push('sc:boot:' + todayArgentina());
+  serverCacheRemoveMany(keys);
+}
+
+function invalidateServerCacheFecha(fecha) {
+  if (!fecha) return;
+  var f = normalizeFecha(fecha);
+  serverCacheRemoveMany([
+    'sc:pedidos:' + f,
+    'sc:recepcion:' + f,
+    'sc:precios:' + f,
+    'sc:flujo:' + f,
+    'sc:dias',
+    'sc:boot:' + f
+  ]);
+}
+
+function invalidateAllServerCache() {
+  serverCacheRemoveMany([
+    'sc:clientes', 'sc:productos', 'sc:proveedores_list', 'sc:saldos',
+    'sc:cobranzas', 'sc:stock', 'sc:dias'
+  ]);
+}
+
+function findInIdMap(map, id) {
+  if (!id || !map) return null;
+  var hit = map[String(id)];
+  if (hit) return hit;
+  Object.keys(map).forEach(function(key) {
+    if (idsMatch(key, id)) hit = map[key];
+  });
+  return hit || null;
+}
+
+/**
+ * Elimina todas las filas de datos de una hoja (conserva encabezados).
+ */
+function clearSheetDataRows(sheetName) {
+  var sheet = getSheet(sheetName);
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.deleteRows(2, lastRow - 1);
+  }
+  initializeSheet(sheet, sheetName);
+}
+
+/**
+ * Borra todos los datos operativos del spreadsheet (clientes, pedidos, etc.).
+ * Requiere confirmación explícita por seguridad.
+ */
+function resetAllDatos(confirmacion) {
+  if (confirmacion !== 'BORRAR TODO') {
+    throw new Error('Confirmación inválida. Debe enviar confirmacion: BORRAR TODO');
+  }
+
+  var hojasOperativas = [
+    CONFIG.SHEETS.CLIENTES,
+    CONFIG.SHEETS.PROVEEDORES,
+    CONFIG.SHEETS.PRODUCTOS,
+    CONFIG.SHEETS.PEDIDOS,
+    CONFIG.SHEETS.RECEPCION,
+    CONFIG.SHEETS.PRECIOS_CLIENTE,
+    CONFIG.SHEETS.CIERRE_DIA,
+    CONFIG.SHEETS.COBRANZAS,
+    CONFIG.SHEETS.PAGOS_PROVEEDORES,
+    CONFIG.SHEETS.CAJA_MOVIMIENTOS,
+    CONFIG.SHEETS.STOCK_BEBIDAS
+  ];
+
+  hojasOperativas.forEach(function(sheetName) {
+    clearSheetDataRows(sheetName);
+  });
+
+  var configSheet = getSheet(CONFIG.SHEETS.CONFIGURACION);
+  configSheet.clear();
+  initializeSheet(configSheet, CONFIG.SHEETS.CONFIGURACION);
+
+  invalidateSheetCache();
+  invalidateAllServerCache();
+
+  return {
+    success: true,
+    hojasLimpiadas: hojasOperativas.length + 1,
+    mensaje: 'Todos los datos fueron eliminados. Las hojas quedaron solo con encabezados.'
+  };
+}
+
+var SHEET_ERROR_STRINGS = ['#ERROR!', '#REF!', '#VALUE!', '#N/A', '#DIV/0!', '#NULL!', '#NAME?', '#NUM!'];
+
+function sanitizeCellValue(val) {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'object' && val instanceof Error) return '';
+  if (typeof val === 'string' && SHEET_ERROR_STRINGS.indexOf(val) !== -1) return '';
+  return val;
+}
+
+function rowsToObjects(headers, rows) {
+  return rows.map(function(row) {
+    var obj = {};
+    headers.forEach(function(header, index) {
+      obj[header] = sanitizeCellValue(row[index]);
+    });
+    return obj;
+  });
+}
+
 /**
  * Inicializa headers de una hoja
  */
 function initializeSheet(sheet, sheetName) {
   const headers = {
     'Clientes': ['id', 'nombre', 'telefono', 'activo'],
-    'Proveedores': ['id', 'nombre', 'rubro', 'activo'],
+    'Proveedores': ['id', 'nombre', 'rubro', 'telefono', 'activo'],
     'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default'],
     'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado'],
     'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
-    'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente'],
+    'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
     'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado'],
     'PagosProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'metodo', 'nota'],
@@ -465,6 +734,12 @@ function initializeSheet(sheet, sheetName) {
       sheet.appendRow(['email_notificaciones', CONFIG.DEFAULT_EMAIL]);
       sheet.appendRow(['notificaciones_activas', 'true']);
       sheet.appendRow(['hora_verificacion', '09:00']);
+      sheet.appendRow(['whatsapp_auto_envio', 'false']);
+      sheet.appendRow(['whatsapp_modo', 'manual']);
+      sheet.appendRow(['whatsapp_phone_id', '']);
+      sheet.appendRow(['whatsapp_token', '']);
+      sheet.appendRow(['whatsapp_bridge_url', '']);
+      sheet.appendRow(['whatsapp_bridge_key', '']);
     }
   }
 }
@@ -525,11 +800,33 @@ function normalizeFecha(fecha) {
     const month = String(dateObj.getMonth() + 1).padStart(2, '0');
     const day = String(dateObj.getDate()).padStart(2, '0');
     
-    return `${year}-${month}-${day}`;
+    return year + '-' + month + '-' + day;
   } catch (error) {
     Logger.log('Error normalizando fecha: ' + error.toString());
     return null;
   }
+}
+
+/** Fecha calendario de Argentina, independiente de la zona del servidor. */
+function todayArgentina() {
+  return Utilities.formatDate(new Date(), 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd');
+}
+
+function ensureColumn(sheet, columnName) {
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  if (headers.indexOf(columnName) === -1) {
+    var col = headers.length + 1;
+    sheet.getRange(1, col).setValue(columnName);
+    sheet.getRange(1, col).setFontWeight('bold');
+  }
+}
+
+function totalPrecioClienteLinea(precio) {
+  var cantidad = parseFloat(precio.cantidad) || 0;
+  var unit = normalizeAmount(precio.precio_cliente);
+  var comision = normalizeAmount(precio.comision_unitaria);
+  return Math.round(cantidad * unit) + Math.round(cantidad * comision);
 }
 
 /**
@@ -559,67 +856,108 @@ function normalizeAmount(value) {
 // ========== CLIENTES ==========
 
 function getClientes() {
-  const sheet = getSheet(CONFIG.SHEETS.CLIENTES);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const clientes = [];
-  
-  for (let i = 1; i < data.length; i++) {
-    const cliente = {};
-    headers.forEach((header, index) => {
-      cliente[header] = data[i][index];
-    });
-    // Mostrar todos los clientes (activos e inactivos)
-    clientes.push(cliente);
+  if (_catalogMemo.clientes) return _catalogMemo.clientes;
+  var sc = serverCacheGet('sc:clientes');
+  if (sc) {
+    _catalogMemo.clientes = sc;
+    return sc;
   }
-  
-  return clientes;
+  var cached = readSheetValues(CONFIG.SHEETS.CLIENTES);
+  _catalogMemo.clientes = rowsToObjects(cached.headers, cached.rows);
+  serverCacheSet('sc:clientes', _catalogMemo.clientes, SERVER_CACHE_TTL.catalog);
+  return _catalogMemo.clientes;
+}
+
+function getClientesMap() {
+  if (_catalogMemo.clientesMap) return _catalogMemo.clientesMap;
+  var clientes = getClientes();
+  var map = {};
+  clientes.forEach(function(c) { map[String(c.id)] = c; });
+  _catalogMemo.clientesMap = map;
+  return map;
+}
+
+function ensureClientesSchema(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  if (headers.indexOf('telefono') === -1) {
+    const activoIndex = headers.indexOf('activo');
+    if (activoIndex !== -1) {
+      sheet.insertColumnBefore(activoIndex + 1);
+      sheet.getRange(1, activoIndex + 1).setValue('telefono');
+    } else {
+      sheet.getRange(1, headers.length + 1).setValue('telefono');
+    }
+  }
+
+  if (headers.indexOf('activo') === -1) {
+    sheet.getRange(1, sheet.getLastColumn() + 1).setValue('activo');
+  }
 }
 
 function createCliente(data) {
+  var nombre = String(data.nombre || '').trim();
+  if (!nombre) throw new Error('El nombre del cliente es requerido');
+
+  var existente = getClientes().find(function(cliente) {
+    return String(cliente.nombre || '').trim().toLowerCase() === nombre.toLowerCase();
+  });
+  if (existente) {
+    return {
+      id: existente.id,
+      nombre: existente.nombre,
+      telefono: existente.telefono || data.telefono || '',
+      activo: existente.activo,
+      existente: true
+    };
+  }
+
   const sheet = getSheet(CONFIG.SHEETS.CLIENTES);
+  ensureClientesSchema(sheet);
   const id = generateId();
   
   const newRow = [
     id,
-    data.nombre,
-    data.telefono || '',
+    nombre,
+    String(data.telefono || '').trim(),
     true
   ];
   
   sheet.appendRow(newRow);
-  return { id: id, ...data };
+  invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
+  return { id: id, nombre: nombre, telefono: data.telefono || '', activo: true };
 }
 
 function updateCliente(data) {
   const sheet = getSheet(CONFIG.SHEETS.CLIENTES);
+  ensureClientesSchema(sheet);
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
-  
-  // Log para debug
-  Logger.log('updateCliente - data recibido:', JSON.stringify(data));
-  Logger.log('updateCliente - data.activo tipo:', typeof data.activo);
-  Logger.log('updateCliente - data.activo valor:', data.activo);
-  
+  const headers = values[0];
+  const idIdx     = headers.indexOf('id');
+  const nombreIdx = headers.indexOf('nombre');
+  const telIdx    = headers.indexOf('telefono');
+  const activoIdx = headers.indexOf('activo');
+
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === data.id) {
-      sheet.getRange(i + 1, 2).setValue(data.nombre);
-      sheet.getRange(i + 1, 3).setValue(data.telefono || '');
-      
-      // Convertir explícitamente a booleano
-      // Manejar strings 'true', 'false', booleanos, y otros valores
+    if (idsMatch(values[i][idIdx !== -1 ? idIdx : 0], data.id)) {
+      if (nombreIdx !== -1) sheet.getRange(i + 1, nombreIdx + 1).setValue(data.nombre);
+      if (telIdx    !== -1) sheet.getRange(i + 1, telIdx + 1).setValue(String(data.telefono || '').trim());
+
       let activoValue;
       if (data.activo === 'false' || data.activo === false || data.activo === 0 || data.activo === '0') {
         activoValue = false;
       } else if (data.activo === 'true' || data.activo === true || data.activo === 1 || data.activo === '1') {
         activoValue = true;
       } else {
-        // Por defecto, si no se especifica, mantener como true
         activoValue = true;
       }
-      
-      Logger.log('updateCliente - guardando activo como:', activoValue);
-      sheet.getRange(i + 1, 4).setValue(activoValue);
+      if (activoIdx !== -1) sheet.getRange(i + 1, activoIdx + 1).setValue(activoValue);
+
+      invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
       return { success: true };
     }
   }
@@ -633,8 +971,10 @@ function deleteCliente(id) {
   const values = dataRange.getValues();
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === id) {
+    if (idsMatch(values[i][0], id)) {
       sheet.deleteRow(i + 1);
+      invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
       return { success: true };
     }
   }
@@ -644,136 +984,192 @@ function deleteCliente(id) {
 
 // ========== PROVEEDORES ==========
 
-function getProveedores() {
-  const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const proveedores = [];
-  
-  // OPTIMIZACIÓN: Calcular todos los saldos de una vez
-  const saldos = calcularTodosSaldosProveedores();
-  
-  for (let i = 1; i < data.length; i++) {
-    const proveedor = {};
-    headers.forEach((header, index) => {
-      proveedor[header] = data[i][index];
-    });
-    
-    // Usar saldo pre-calculado
-    proveedor.saldo = saldos[proveedor.id] || 0;
-    
-    // Mostrar todos los proveedores (activos e inactivos)
-    proveedores.push(proveedor);
+function idsMatch(a, b) {
+  return String(a) === String(b);
+}
+
+/**
+ * Asegura que la hoja Proveedores tenga las columnas esperadas (incl. telefono).
+ * Migra hojas antiguas con formato id, nombre, rubro, activo.
+ */
+function ensureProveedoresSchema(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  let headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  if (headers.indexOf('telefono') === -1) {
+    const activoIndex = headers.indexOf('activo');
+    if (activoIndex !== -1) {
+      sheet.insertColumnBefore(activoIndex + 1);
+      sheet.getRange(1, activoIndex + 1).setValue('telefono');
+    } else {
+      sheet.getRange(1, headers.length + 1).setValue('telefono');
+    }
+    headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   }
-  
-  return proveedores;
+
+  if (headers.indexOf('activo') === -1) {
+    sheet.getRange(1, sheet.getLastColumn() + 1).setValue('activo');
+  }
+}
+
+function getProveedorHeaderIndexes(headers) {
+  return {
+    id: headers.indexOf('id'),
+    nombre: headers.indexOf('nombre'),
+    rubro: headers.indexOf('rubro'),
+    telefono: headers.indexOf('telefono'),
+    activo: headers.indexOf('activo')
+  };
+}
+
+function parseActivoValue(value) {
+  if (value === 'false' || value === false || value === 0 || value === '0') {
+    return false;
+  }
+  if (value === 'true' || value === true || value === 1 || value === '1') {
+    return true;
+  }
+  return true;
+}
+
+function getProveedoresList() {
+  if (_catalogMemo.proveedoresList) return _catalogMemo.proveedoresList;
+  var sc = serverCacheGet('sc:proveedores_list');
+  if (sc) {
+    _catalogMemo.proveedoresList = sc;
+    return sc;
+  }
+  var cached = readSheetValues(CONFIG.SHEETS.PROVEEDORES);
+  _catalogMemo.proveedoresList = rowsToObjects(cached.headers, cached.rows);
+  serverCacheSet('sc:proveedores_list', _catalogMemo.proveedoresList, SERVER_CACHE_TTL.catalog);
+  return _catalogMemo.proveedoresList;
+}
+
+function getProveedores() {
+  var list = getProveedoresList();
+  var saldos = calcularTodosSaldosProveedores();
+  return list.map(function(proveedor) {
+    return Object.assign({}, proveedor, { saldo: saldos[proveedor.id] || 0 });
+  });
 }
 
 function createProveedor(data) {
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
+  ensureProveedoresSchema(sheet);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const cols = getProveedorHeaderIndexes(headers);
   const id = generateId();
-  
-  const newRow = [
-    id,
-    data.nombre,
-    data.rubro || '',
-    true
-  ];
-  
-  sheet.appendRow(newRow);
-  return { id: id, ...data };
+
+  const row = new Array(headers.length).fill('');
+  row[cols.id] = id;
+  row[cols.nombre] = data.nombre;
+  row[cols.rubro] = data.rubro || '';
+  if (cols.telefono !== -1) {
+    row[cols.telefono] = String(data.telefono || '').trim();
+  }
+  if (cols.activo !== -1) {
+    row[cols.activo] = true;
+  }
+
+  sheet.appendRow(row);
+  invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
+  return { id: id, ...data, activo: true };
 }
 
 function updateProveedor(data) {
+  if (!data || !data.id) {
+    throw new Error('ID de proveedor no proporcionado');
+  }
+
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  // Log para debug
-  Logger.log('updateProveedor - data recibido:', JSON.stringify(data));
-  Logger.log('updateProveedor - data.activo tipo:', typeof data.activo);
-  Logger.log('updateProveedor - data.activo valor:', data.activo);
-  
+  ensureProveedoresSchema(sheet);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const cols = getProveedorHeaderIndexes(headers);
+  const values = sheet.getDataRange().getValues();
+  const activoValue = parseActivoValue(data.activo);
+
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === data.id) {
-      sheet.getRange(i + 1, 2).setValue(data.nombre);
-      sheet.getRange(i + 1, 3).setValue(data.rubro || '');
-      
-      // Convertir explícitamente a booleano (igual que en clientes)
-      let activoValue;
-      if (data.activo === 'false' || data.activo === false || data.activo === 0 || data.activo === '0') {
-        activoValue = false;
-      } else if (data.activo === 'true' || data.activo === true || data.activo === 1 || data.activo === '1') {
-        activoValue = true;
-      } else {
-        // Por defecto, si no se especifica, mantener como true
-        activoValue = true;
+    if (idsMatch(values[i][cols.id], data.id)) {
+      const rowNumber = i + 1;
+      sheet.getRange(rowNumber, cols.nombre + 1).setValue(data.nombre);
+      sheet.getRange(rowNumber, cols.rubro + 1).setValue(data.rubro || '');
+      if (cols.telefono !== -1) {
+        sheet.getRange(rowNumber, cols.telefono + 1).setValue(String(data.telefono || '').trim());
       }
-      
-      Logger.log('updateProveedor - guardando activo como:', activoValue);
-      sheet.getRange(i + 1, 4).setValue(activoValue);
-      return { success: true };
+      if (cols.activo !== -1) {
+        sheet.getRange(rowNumber, cols.activo + 1).setValue(activoValue);
+      }
+      invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
+      return { success: true, id: data.id, activo: activoValue };
     }
   }
-  
+
   throw new Error('Proveedor no encontrado');
 }
 
 function deleteProveedor(id) {
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
+  ensureProveedoresSchema(sheet);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const idIndex = headers.indexOf('id');
+  const values = sheet.getDataRange().getValues();
+
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === id) {
+    if (idsMatch(values[i][idIndex], id)) {
       sheet.deleteRow(i + 1);
+      invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
       return { success: true };
     }
   }
-  
+
   throw new Error('Proveedor no encontrado');
 }
 
-// OPTIMIZACIÓN: Calcular todos los saldos de una vez
+// OPTIMIZACIÓN: Calcular todos los saldos de una vez (usa caché de hojas)
 function calcularTodosSaldosProveedores() {
-  const saldos = {};
-  
-  // Leer recepciones UNA SOLA VEZ
-  const recepcionSheet = getSheet(CONFIG.SHEETS.RECEPCION);
-  const recepciones = recepcionSheet.getDataRange().getValues();
-  
-  // Calcular deudas por proveedor
-  for (let i = 1; i < recepciones.length; i++) {
-    const proveedorId = recepciones[i][3]; // columna proveedor_id
-    const confirmado = recepciones[i][7];  // columna confirmado
-    
-    if (confirmado === true) {
-      const llego = recepciones[i][5] || 0;
-      const precio = normalizeAmount(recepciones[i][6]);
-      const total = llego * precio;
-      
-      if (!saldos[proveedorId]) {
-        saldos[proveedorId] = 0;
-      }
+  var sc = serverCacheGet('sc:saldos');
+  if (sc) return sc;
+
+  var saldos = {};
+
+  var recepcion = readSheetValues(CONFIG.SHEETS.RECEPCION);
+  var headersR = recepcion.headers;
+  var idxProv = headersR.indexOf('proveedor_id');
+  var idxLlego = headersR.indexOf('llego');
+  var idxPrecio = headersR.indexOf('precio_real');
+  var idxConfirmado = headersR.indexOf('confirmado');
+  if (idxProv === -1) idxProv = 3;
+  if (idxLlego === -1) idxLlego = 5;
+  if (idxPrecio === -1) idxPrecio = 6;
+  if (idxConfirmado === -1) idxConfirmado = 7;
+
+  recepcion.rows.forEach(function(row) {
+    if (row[idxConfirmado] === true) {
+      var proveedorId = row[idxProv];
+      var total = (row[idxLlego] || 0) * normalizeAmount(row[idxPrecio]);
+      if (!saldos[proveedorId]) saldos[proveedorId] = 0;
       saldos[proveedorId] += total;
     }
-  }
-  
-  // Leer pagos UNA SOLA VEZ
-  const pagosSheet = getSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
-  const pagos = pagosSheet.getDataRange().getValues();
-  
-  // Restar pagos por proveedor
-  for (let i = 1; i < pagos.length; i++) {
-    const proveedorId = pagos[i][2]; // columna proveedor_id
-    const monto = normalizeAmount(pagos[i][3]); // columna monto
-    
-    if (!saldos[proveedorId]) {
-      saldos[proveedorId] = 0;
-    }
+  });
+
+  var pagos = readSheetValues(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  var headersP = pagos.headers;
+  var idxProvP = headersP.indexOf('proveedor_id');
+  var idxMonto = headersP.indexOf('monto');
+  if (idxProvP === -1) idxProvP = 2;
+  if (idxMonto === -1) idxMonto = 3;
+
+  pagos.rows.forEach(function(row) {
+    var proveedorId = row[idxProvP];
+    var monto = normalizeAmount(row[idxMonto]);
+    if (!saldos[proveedorId]) saldos[proveedorId] = 0;
     saldos[proveedorId] -= monto;
-  }
-  
+  });
+
+  serverCacheSet('sc:saldos', saldos, SERVER_CACHE_TTL.saldos);
   return saldos;
 }
 
@@ -786,43 +1182,69 @@ function calcularSaldoProveedor(proveedorId) {
 // ========== PRODUCTOS ==========
 
 function getProductos() {
-  const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const productos = [];
-  
-  for (let i = 1; i < data.length; i++) {
-    const producto = {};
-    headers.forEach((header, index) => {
-      producto[header] = data[i][index];
-    });
-    productos.push(producto);
+  if (_catalogMemo.productos) return _catalogMemo.productos;
+  var sc = serverCacheGet('sc:productos');
+  if (sc) {
+    _catalogMemo.productos = sc;
+    return sc;
   }
-  
-  return productos;
+  var cached = readSheetValues(CONFIG.SHEETS.PRODUCTOS);
+  _catalogMemo.productos = rowsToObjects(cached.headers, cached.rows);
+  serverCacheSet('sc:productos', _catalogMemo.productos, SERVER_CACHE_TTL.catalog);
+  return _catalogMemo.productos;
+}
+
+function getProductosMap() {
+  if (_catalogMemo.productosMap) return _catalogMemo.productosMap;
+  var productos = getProductos();
+  var map = {};
+  productos.forEach(function(p) { map[String(p.id)] = p; });
+  _catalogMemo.productosMap = map;
+  return map;
 }
 
 function createProducto(data) {
+  var nombre = String(data.nombre || '').trim();
+  if (!nombre) throw new Error('El nombre del producto es requerido');
+
+  var existente = getProductos().find(function(producto) {
+    return String(producto.nombre || '').trim().toLowerCase() === nombre.toLowerCase();
+  });
+  if (existente) {
+    return {
+      id: existente.id,
+      nombre: existente.nombre,
+      tipo: existente.tipo,
+      unidad: existente.unidad,
+      proveedor_default: existente.proveedor_default || '',
+      existente: true
+    };
+  }
+
   const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
   const id = generateId();
   
   const newRow = [
     id,
-    data.nombre,
+    nombre,
     data.tipo,
     data.unidad || '',
     data.proveedor_default || ''
   ];
   
   sheet.appendRow(newRow);
+  invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
   
   // Si es bebida, crear registro de stock
   if (data.tipo === 'bebida') {
     const stockSheet = getSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
     stockSheet.appendRow([id, 0, data.minimo || 10]);
+    invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
   }
   
-  return { id: id, ...data };
+  return { id: id, nombre: nombre, tipo: data.tipo, unidad: data.unidad || '', proveedor_default: data.proveedor_default || '' };
 }
 
 /**
@@ -833,14 +1255,17 @@ function updateProducto(data) {
   const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
+  const idIdx = values[0] ? values[0].indexOf('id') : 0;
+  const colId = idIdx === -1 ? 0 : idIdx;
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === data.id) {
-      // Columnas: 1=id, 2=nombre, 3=tipo, 4=unidad, 5=proveedor_default
+    if (idsMatch(values[i][colId], data.id)) {
       sheet.getRange(i + 1, 2).setValue(data.nombre);
       sheet.getRange(i + 1, 3).setValue(data.tipo);
       sheet.getRange(i + 1, 4).setValue(data.unidad || '');
       sheet.getRange(i + 1, 5).setValue(data.proveedor_default || '');
+      invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
       return { success: true };
     }
   }
@@ -852,10 +1277,17 @@ function deleteProducto(id) {
   const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
+  const idIdx = values[0] ? values[0].indexOf('id') : 0;
+  const colId = idIdx === -1 ? 0 : idIdx;
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === id) {
+    if (idsMatch(values[i][colId], id)) {
       sheet.deleteRow(i + 1);
+      invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
+      try {
+        deleteStock(id);
+      } catch (e) {}
       return { success: true };
     }
   }
@@ -866,64 +1298,68 @@ function deleteProducto(id) {
 // ========== PEDIDOS ==========
 
 function getPedidos(fecha = null) {
-  const sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const pedidos = [];
-  
-  // Normalizar la fecha de búsqueda
-  const fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
-  
-  // OPTIMIZACIÓN: Leer clientes y productos UNA SOLA VEZ
-  const clientes = getClientes();
-  const productos = getProductos();
-  
-  // Crear mapas para búsqueda O(1) en lugar de O(n)
-  const clientesMap = {};
-  clientes.forEach(c => { clientesMap[c.id] = c; });
-  
-  const productosMap = {};
-  productos.forEach(p => { productosMap[p.id] = p; });
-  
-  for (let i = 1; i < data.length; i++) {
-    // Si filtramos por fecha y no coincide, saltar
+  var fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
+  if (fechaBusqueda) {
+    var scPed = serverCacheGet('sc:pedidos:' + fechaBusqueda);
+    if (scPed) return scPed;
+  }
+
+  var cached = readSheetValues(CONFIG.SHEETS.PEDIDOS);
+  var headers = cached.headers;
+  var clientesMap = getClientesMap();
+  var productosMap = getProductosMap();
+  var pedidos = [];
+
+  cached.rows.forEach(function(row) {
     if (fechaBusqueda) {
-      const fechaPedido = normalizeFecha(data[i][1]);
+      var fechaPedido = normalizeFecha(row[1]);
       if (fechaPedido !== fechaBusqueda) {
-        continue;
+        return;
       }
     }
-    
-    const pedido = {};
-    headers.forEach((header, index) => {
-      pedido[header] = data[i][index];
+
+    var pedido = {};
+    headers.forEach(function(header, index) {
+      pedido[header] = row[index];
     });
-    
-    // Normalizar la fecha en el pedido para consistencia
+
     if (pedido.fecha) {
       pedido.fecha = normalizeFecha(pedido.fecha);
     }
-    
-    // Búsqueda O(1) con mapa en lugar de O(n) con find()
-    const cliente = clientesMap[pedido.cliente_id];
+
+    var cliente = findInIdMap(clientesMap, pedido.cliente_id);
     pedido.cliente_nombre = cliente ? cliente.nombre : '';
-    
-    const producto = productosMap[pedido.producto_id];
+
+    var producto = findInIdMap(productosMap, pedido.producto_id);
     pedido.producto_nombre = producto ? producto.nombre : '';
-    
+
     pedidos.push(pedido);
+  });
+
+  if (fechaBusqueda) {
+    serverCacheSet('sc:pedidos:' + fechaBusqueda, pedidos, SERVER_CACHE_TTL.fecha);
   }
-  
   return pedidos;
 }
 
 function createPedido(data) {
+  if (!data || !data.cliente_id || !data.producto_id) {
+    throw new Error('Cliente y producto son requeridos');
+  }
+  if (!findInIdMap(getClientesMap(), data.cliente_id)) {
+    throw new Error('Ese cliente no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  }
+  if (!findInIdMap(getProductosMap(), data.producto_id)) {
+    throw new Error('Ese producto no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  }
+
   const sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
   const id = generateId();
+  const fecha = data.fecha || todayArgentina();
   
   const newRow = [
     id,
-    data.fecha || new Date().toISOString().split('T')[0],
+    fecha,
     data.cliente_id,
     data.producto_id,
     data.tipo,
@@ -932,7 +1368,61 @@ function createPedido(data) {
   ];
   
   sheet.appendRow(newRow);
-  return { id: id, ...data };
+  invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheFecha(fecha);
+  return { id: id, ...data, fecha: fecha, enviado: false };
+}
+
+function updatePedido(data) {
+  if (!data || !data.id) {
+    throw new Error('ID de pedido requerido');
+  }
+
+  var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  var values = sheet.getDataRange().getValues();
+  if (values.length < 2) {
+    throw new Error('Pedido no encontrado');
+  }
+
+  var headers = values[0];
+  var idIdx = headers.indexOf('id');
+  var fechaIdx = headers.indexOf('fecha');
+  var clienteIdx = headers.indexOf('cliente_id');
+  var productoIdx = headers.indexOf('producto_id');
+  var tipoIdx = headers.indexOf('tipo');
+  var cantidadIdx = headers.indexOf('cantidad');
+  if (idIdx === -1) idIdx = 0;
+
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][idIdx], data.id)) continue;
+
+    var fecha = normalizeFecha(values[i][fechaIdx !== -1 ? fechaIdx : 1]);
+    if (clienteIdx !== -1 && data.cliente_id) values[i][clienteIdx] = data.cliente_id;
+    if (productoIdx !== -1 && data.producto_id) values[i][productoIdx] = data.producto_id;
+    if (tipoIdx !== -1 && data.tipo) values[i][tipoIdx] = data.tipo;
+    if (cantidadIdx !== -1 && data.cantidad !== undefined && data.cantidad !== null) {
+      values[i][cantidadIdx] = data.cantidad;
+    }
+
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+    if (fecha) invalidateServerCacheFecha(fecha);
+
+    return {
+      success: true,
+      id: data.id,
+      fecha: fecha,
+      cliente_id: data.cliente_id,
+      producto_id: data.producto_id,
+      tipo: data.tipo,
+      cantidad: data.cantidad,
+      enviado: values[i][headers.indexOf('enviado')]
+    };
+  }
+
+  throw new Error('Pedido no encontrado');
 }
 
 function deletePedido(id) {
@@ -942,7 +1432,11 @@ function deletePedido(id) {
   
   for (let i = 1; i < values.length; i++) {
     if (values[i][0] === id) {
+      var fecha = normalizeFecha(values[i][1]);
       sheet.deleteRow(i + 1);
+      invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+      if (fecha) invalidateServerCacheFecha(fecha);
       return { success: true };
     }
   }
@@ -988,22 +1482,25 @@ function marcarPedidosEnviados(fecha) {
     return { success: true, marcados: marcados, mensaje: `Se marcaron ${marcados} pedido(s) como enviados` };
   }
   
-  // Si la columna ya existe, actualizar
-  const fechaNormalizada = normalizeFecha(fecha);
-  let marcados = 0;
-  
-  for (let i = 1; i < values.length; i++) {
-    const fechaPedido = normalizeFecha(values[i][fechaIndex]);
-    if (fechaPedido === fechaNormalizada) {
-      // Solo marcar si no está ya marcado
-      if (values[i][enviadoIndex] !== true) {
-        sheet.getRange(i + 1, enviadoIndex + 1).setValue(true);
-        marcados++;
-      }
+  var fechaNormalizada = normalizeFecha(fecha);
+  var marcados = 0;
+
+  for (var j = 1; j < values.length; j++) {
+    var fechaPedido = normalizeFecha(values[j][fechaIndex]);
+    if (fechaPedido === fechaNormalizada && values[j][enviadoIndex] !== true) {
+      values[j][enviadoIndex] = true;
+      marcados++;
     }
   }
-  
-  return { success: true, marcados: marcados, mensaje: `Se marcaron ${marcados} pedido(s) como enviados` };
+
+  if (marcados > 0) {
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+    invalidateServerCacheFecha(fechaNormalizada);
+  }
+
+  return { success: true, marcados: marcados, mensaje: 'Se marcaron ' + marcados + ' pedido(s) como enviados' };
 }
 
 /**
@@ -1021,152 +1518,165 @@ function marcarPedidosEnviadosPorIds(pedidosIds) {
   const values = dataRange.getValues();
   const headers = values[0];
   
-  // Buscar índice de las columnas necesarias
   const idIndex = headers.indexOf('id');
-  const enviadoIndex = headers.indexOf('enviado');
+  const fechaIndex = headers.indexOf('fecha');
+  var enviadoIndex = headers.indexOf('enviado');
   
-  // Si no existe la columna enviado, agregarla
+  var idsMap = {};
+  pedidosIds.forEach(function(id) { idsMap[String(id)] = true; });
+  var fechas = {};
+  
   if (enviadoIndex === -1) {
     const lastCol = sheet.getLastColumn() + 1;
     sheet.getRange(1, lastCol).setValue('enviado');
-    // Crear un mapa de IDs para búsqueda rápida
-    const idsMap = {};
-    pedidosIds.forEach(id => { idsMap[id] = true; });
+    enviadoIndex = lastCol - 1;
     
     let marcados = 0;
     for (let i = 1; i < values.length; i++) {
-      if (idsMap[values[i][idIndex]]) {
+      if (idsMap[String(values[i][idIndex])]) {
         sheet.getRange(i + 1, lastCol).setValue(true);
         marcados++;
+        if (fechaIndex !== -1) {
+          var fechaNueva = normalizeFecha(values[i][fechaIndex]);
+          if (fechaNueva) fechas[fechaNueva] = true;
+        }
       }
     }
-    
+    Object.keys(fechas).forEach(function(f) { invalidateServerCacheFecha(f); });
+    invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
     return { success: true, marcados: marcados, mensaje: `Se marcaron ${marcados} pedido(s) como enviados` };
   }
-  
-  // Si la columna ya existe, actualizar
-  // Crear un mapa de IDs para búsqueda rápida
-  const idsMap = {};
-  pedidosIds.forEach(id => { idsMap[id] = true; });
-  
-  let marcados = 0;
-  for (let i = 1; i < values.length; i++) {
-    if (idsMap[values[i][idIndex]]) {
-      // Solo marcar si no está ya marcado
-      if (values[i][enviadoIndex] !== true) {
-        sheet.getRange(i + 1, enviadoIndex + 1).setValue(true);
+
+  var marcados = 0;
+  for (var k = 1; k < values.length; k++) {
+    if (idsMap[String(values[k][idIndex])]) {
+      if (values[k][enviadoIndex] !== true) {
+        values[k][enviadoIndex] = true;
         marcados++;
+      }
+      if (fechaIndex !== -1) {
+        var fechaMarcada = normalizeFecha(values[k][fechaIndex]);
+        if (fechaMarcada) fechas[fechaMarcada] = true;
       }
     }
   }
-  
-  return { success: true, marcados: marcados, mensaje: `Se marcaron ${marcados} pedido(s) como enviados` };
+
+  if (marcados > 0) {
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+  }
+  Object.keys(fechas).forEach(function(f) { invalidateServerCacheFecha(f); });
+
+  return { success: true, marcados: marcados, mensaje: 'Se marcaron ' + marcados + ' pedido(s) como enviados' };
 }
 
 // ========== RECEPCIÓN ==========
 
 function getRecepcion(fecha = null) {
-  const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const recepciones = [];
-  
-  // Normalizar la fecha de búsqueda
-  const fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
-  
-  // OPTIMIZACIÓN: Leer una vez y crear mapas
-  const productos = getProductos();
-  const proveedores = getProveedores();
-  
-  const productosMap = {};
-  productos.forEach(p => { productosMap[p.id] = p; });
-  
-  const proveedoresMap = {};
-  proveedores.forEach(p => { proveedoresMap[p.id] = p; });
-  
-  for (let i = 1; i < data.length; i++) {
-    // Filtrar por fecha temprano
+  var fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
+  if (fechaBusqueda) {
+    var scRec = serverCacheGet('sc:recepcion:' + fechaBusqueda);
+    if (scRec) return scRec;
+  }
+
+  var cached = readSheetValues(CONFIG.SHEETS.RECEPCION);
+  var headers = cached.headers;
+  var productosMap = getProductosMap();
+  var proveedoresList = getProveedoresList();
+  var proveedoresMap = {};
+  proveedoresList.forEach(function(p) { proveedoresMap[String(p.id)] = p; });
+  var fechaIdx = headers.indexOf('fecha');
+  if (fechaIdx === -1) fechaIdx = 1;
+  var recepciones = [];
+
+  cached.rows.forEach(function(row) {
     if (fechaBusqueda) {
-      const fechaRecepcion = normalizeFecha(data[i][1]);
-      if (fechaRecepcion !== fechaBusqueda) {
-        continue;
-      }
+      var fechaRecepcion = normalizeFecha(row[fechaIdx]);
+      if (fechaRecepcion !== fechaBusqueda) return;
     }
-    
-    const recepcion = {};
-    headers.forEach((header, index) => {
-      recepcion[header] = data[i][index];
+
+    var recepcion = {};
+    headers.forEach(function(header, index) {
+      recepcion[header] = row[index];
     });
-    
-    // Normalizar la fecha en la recepción para consistencia
+
     if (recepcion.fecha) {
       recepcion.fecha = normalizeFecha(recepcion.fecha);
     }
     recepcion.precio_real = normalizeAmount(recepcion.precio_real);
-    
-    // Búsqueda O(1)
-    const producto = productosMap[recepcion.producto_id];
-    recepcion.producto_nombre = producto ? producto.nombre : '';
-    
-    const proveedor = proveedoresMap[recepcion.proveedor_id];
-    recepcion.proveedor_nombre = proveedor ? proveedor.nombre : '';
-    
+
+    var producto = findInIdMap(productosMap, recepcion.producto_id);
+    recepcion.producto_nombre = producto ? producto.nombre : (recepcion.producto_nombre || '');
+
+    var proveedor = findInIdMap(proveedoresMap, recepcion.proveedor_id);
+    if (!proveedor && producto && producto.proveedor_default) {
+      proveedor = findInIdMap(proveedoresMap, producto.proveedor_default);
+    }
+    recepcion.proveedor_nombre = proveedor ? proveedor.nombre : (recepcion.proveedor_nombre || '');
+
     recepciones.push(recepcion);
+  });
+
+  if (fechaBusqueda) {
+    serverCacheSet('sc:recepcion:' + fechaBusqueda, recepciones, SERVER_CACHE_TTL.fecha);
   }
-  
   return recepciones;
 }
 
 function saveRecepcion(data) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
-  
-  // Primero, obtener pedidos del día para crear recepciones si no existen
+
   const pedidos = getPedidos(data.fecha);
-  const productos = getProductos();
-  
-  // Agrupar pedidos por producto (una sola pasada)
   const pedidosPorProducto = {};
   pedidos.forEach(pedido => {
-    if (!pedidosPorProducto[pedido.producto_id]) {
-      pedidosPorProducto[pedido.producto_id] = 0;
-    }
+    if (!pedidosPorProducto[pedido.producto_id]) pedidosPorProducto[pedido.producto_id] = 0;
     pedidosPorProducto[pedido.producto_id] += pedido.cantidad || 0;
   });
-  
-  // Leer todas las recepciones UNA sola vez y construir un índice por (fecha, producto_id)
+
   const fechaNormalizada = normalizeFecha(data.fecha);
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
+
+  // Leer headers para no depender de índices hardcodeados
+  const headers = values.length > 0 ? values[0] : [];
+  const fechaCol     = headers.indexOf('fecha')      !== -1 ? headers.indexOf('fecha')      : 1;
+  const productoCol  = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 2;
+  const llegoCol     = headers.indexOf('llego')       !== -1 ? headers.indexOf('llego')       : 5;
+  const precioCol    = headers.indexOf('precio_real') !== -1 ? headers.indexOf('precio_real') : 6;
+
   const recepcionIndex = {};
-  
   for (let i = 1; i < values.length; i++) {
-    const fechaRecepcion = normalizeFecha(values[i][1]);
-    const productoId = values[i][2];
+    const fechaRecepcion = normalizeFecha(values[i][fechaCol]);
+    const productoId = values[i][productoCol];
     if (fechaRecepcion === fechaNormalizada) {
-      const key = fechaNormalizada + '|' + productoId;
-      // Guardar el índice de fila real en la hoja (i + 1)
-      recepcionIndex[key] = i + 1;
+      recepcionIndex[fechaNormalizada + '|' + String(productoId)] = i;
     }
   }
-  
-  // Actualizar o crear recepciones en una sola pasada por los ítems
+
+  var rowsToAppend = [];
   if (data.items && data.items.length > 0) {
-    data.items.forEach(item => {
-      const producto = productos.find(p => p.id === item.producto_id);
+    var productosMap = getProductosMap();
+    var faltantes = data.items.filter(function(item) {
+      return !findInIdMap(productosMap, item.producto_id);
+    });
+    if (faltantes.length > 0) {
+      throw new Error('Hay productos del pedido que ya no están en el catálogo. Actualizá la página antes de guardar la recepción.');
+    }
+
+    data.items.forEach(function(item) {
+      var producto = findInIdMap(productosMap, item.producto_id);
       if (!producto) return;
-      
-      const key = fechaNormalizada + '|' + item.producto_id;
-      const rowIndex = recepcionIndex[key] || null;
-      
-      if (rowIndex) {
-        // Actualizar fila existente
-        sheet.getRange(rowIndex, 6).setValue(item.llego || 0);
-        sheet.getRange(rowIndex, 7).setValue(normalizeAmount(item.precio_real));
+
+      var key = fechaNormalizada + '|' + item.producto_id;
+      var rowIdx = recepcionIndex[key];
+      if (rowIdx !== undefined) {
+        values[rowIdx][llegoCol]  = item.llego || 0;
+        values[rowIdx][precioCol] = normalizeAmount(item.precio_real);
       } else {
-        // Crear nueva fila
-        const id = generateId();
-        const newRow = [
-          id,
+        rowsToAppend.push([
+          generateId(),
           data.fecha,
           item.producto_id,
           producto.proveedor_default || '',
@@ -1174,105 +1684,206 @@ function saveRecepcion(data) {
           item.llego || 0,
           normalizeAmount(item.precio_real),
           false
-        ];
-        sheet.appendRow(newRow);
+        ]);
       }
     });
+
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    if (rowsToAppend.length > 0) {
+      var startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+    }
   }
-  
+
+  invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheFecha(fechaNormalizada);
   return { success: true };
 }
 
 function findRecepcion(fecha, productoId) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
   const data = sheet.getDataRange().getValues();
-  
-  // Normalizar la fecha de búsqueda
+  if (data.length < 2) return null;
+
+  const headers = data[0];
+  const fechaCol    = headers.indexOf('fecha')      !== -1 ? headers.indexOf('fecha')      : 1;
+  const productoCol = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 2;
+  const confirmadoCol = headers.indexOf('confirmado') !== -1 ? headers.indexOf('confirmado') : headers.length - 1;
+
   const fechaBusqueda = normalizeFecha(fecha);
-  
+
   for (let i = 1; i < data.length; i++) {
-    const fechaRecepcion = normalizeFecha(data[i][1]);
-    if (fechaRecepcion === fechaBusqueda && data[i][2] === productoId) {
-      return { rowIndex: i + 1, data: data[i] };
+    const fechaRecepcion = normalizeFecha(data[i][fechaCol]);
+    if (fechaRecepcion === fechaBusqueda && idsMatch(data[i][productoCol], productoId)) {
+      return { rowIndex: i + 1, data: data[i], confirmadoCol: confirmadoCol };
     }
   }
-  
+
   return null;
+}
+
+function recepcionProductoConfirmada(rec) {
+  if (!rec) return false;
+  var confirmado = rec.confirmado === true || rec.confirmado === 'true' ||
+    rec.confirmado === 1 || rec.confirmado === '1';
+  if (!confirmado) return false;
+  if (rec.llego === null || rec.llego === '') return false;
+  var llego = Number(rec.llego) || 0;
+  if (llego > 0 && !normalizeAmount(rec.precio_real)) return false;
+  return true;
+}
+
+/**
+ * Confirma la recepción de un solo producto (guarda cantidad/precio y marca confirmado).
+ */
+function confirmarRecepcionItem(data) {
+  if (!data || !data.fecha || !data.producto_id) {
+    throw new Error('fecha y producto_id son requeridos');
+  }
+
+  var llego = parseInt(data.llego, 10);
+  if (isNaN(llego) || llego < 0) {
+    throw new Error('Cantidad recibida inválida');
+  }
+
+  var precioReal = normalizeAmount(data.precio_real);
+  if (llego > 0 && !precioReal) {
+    throw new Error('Ingresá el precio real cuando llegó mercadería');
+  }
+
+  saveRecepcion({
+    fecha: data.fecha,
+    items: [{
+      producto_id: data.producto_id,
+      llego: llego,
+      precio_real: precioReal
+    }]
+  });
+
+  var found = findRecepcion(data.fecha, data.producto_id);
+  if (!found) {
+    throw new Error('No se encontró la recepción del producto');
+  }
+
+  var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
+  sheet.getRange(found.rowIndex, found.confirmadoCol + 1).setValue(true);
+  invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheFecha(normalizeFecha(data.fecha));
+
+  return { success: true, producto_id: data.producto_id };
+}
+
+function desconfirmarRecepcionItem(data) {
+  if (!data || !data.fecha || !data.producto_id) {
+    throw new Error('fecha y producto_id son requeridos');
+  }
+
+  var found = findRecepcion(data.fecha, data.producto_id);
+  if (!found) {
+    throw new Error('No se encontró la recepción del producto');
+  }
+
+  var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
+  sheet.getRange(found.rowIndex, found.confirmadoCol + 1).setValue(false);
+  invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheFecha(normalizeFecha(data.fecha));
+
+  return { success: true, producto_id: data.producto_id };
+}
+
+function deleteRecepcionItem(data) {
+  if (!data || !data.fecha || !data.producto_id) {
+    throw new Error('fecha y producto_id son requeridos');
+  }
+
+  var found = findRecepcion(data.fecha, data.producto_id);
+  if (!found) {
+    throw new Error('No se encontró la recepción del producto');
+  }
+
+  var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
+  sheet.deleteRow(found.rowIndex);
+  invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheFecha(normalizeFecha(data.fecha));
+
+  return { success: true, producto_id: data.producto_id };
 }
 
 function confirmarRecepcion(fecha) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
   const data = sheet.getDataRange().getValues();
-  
-  // Normalizar la fecha de búsqueda
+  if (data.length < 2) return { success: true };
+
+  const headers = data[0];
+  const fechaCol = headers.indexOf('fecha') !== -1 ? headers.indexOf('fecha') : 1;
+  const confirmadoCol = headers.indexOf('confirmado') !== -1 ? headers.indexOf('confirmado') : headers.length - 1;
+
   const fechaBusqueda = normalizeFecha(fecha);
-  
+
   for (let i = 1; i < data.length; i++) {
-    const fechaRecepcion = normalizeFecha(data[i][1]);
+    const fechaRecepcion = normalizeFecha(data[i][fechaCol]);
     if (fechaRecepcion === fechaBusqueda) {
-      sheet.getRange(i + 1, 8).setValue(true);
+      sheet.getRange(i + 1, confirmadoCol + 1).setValue(true);
     }
   }
-  
+
   return { success: true };
 }
 
 // ========== PRECIOS CLIENTE ==========
 
 function getPreciosCliente(fecha = null) {
-  const sheet = getSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const precios = [];
-  
-  // Normalizar la fecha de búsqueda
-  const fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
-  
-  // OPTIMIZACIÓN: Crear mapas
-  const clientes = getClientes();
-  const productos = getProductos();
-  
-  const clientesMap = {};
-  clientes.forEach(c => { clientesMap[c.id] = c; });
-  
-  const productosMap = {};
-  productos.forEach(p => { productosMap[p.id] = p; });
-  
-  for (let i = 1; i < data.length; i++) {
-    // Filtrar por fecha temprano
-    if (fechaBusqueda) {
-      const fechaPrecio = normalizeFecha(data[i][1]);
-      if (fechaPrecio !== fechaBusqueda) {
-        continue;
-      }
-    }
-    
-    const precio = {};
-    headers.forEach((header, index) => {
-      precio[header] = data[i][index];
-    });
-    
-    // Normalizar la fecha en el precio para consistencia
-    if (precio.fecha) {
-      precio.fecha = normalizeFecha(precio.fecha);
-    }
-    precio.precio_cliente = normalizeAmount(precio.precio_cliente);
-    
-    // Búsqueda O(1)
-    const cliente = clientesMap[precio.cliente_id];
-    precio.cliente_nombre = cliente ? cliente.nombre : '';
-    
-    const producto = productosMap[precio.producto_id];
-    precio.producto_nombre = producto ? producto.nombre : '';
-    
-    precios.push(precio);
+  var fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
+  if (fechaBusqueda) {
+    var scPrec = serverCacheGet('sc:precios:' + fechaBusqueda);
+    if (scPrec) return scPrec;
   }
-  
+
+  var cached = readSheetValues(CONFIG.SHEETS.PRECIOS_CLIENTE);
+  var headers = cached.headers;
+  var clientesMap = getClientesMap();
+  var productosMap = getProductosMap();
+  var precios = [];
+  var fechaIdx = headers.indexOf('fecha');
+  if (fechaIdx === -1) fechaIdx = 1;
+
+  cached.rows.forEach(function(row) {
+    if (fechaBusqueda) {
+      var fechaPrecio = normalizeFecha(row[fechaIdx]);
+      if (fechaPrecio !== fechaBusqueda) return;
+    }
+
+    var precio = {};
+    headers.forEach(function(header, index) {
+      precio[header] = row[index];
+    });
+
+    if (precio.fecha) precio.fecha = normalizeFecha(precio.fecha);
+    precio.precio_cliente = normalizeAmount(precio.precio_cliente);
+    precio.comision_unitaria = normalizeAmount(precio.comision_unitaria);
+
+    var cliente = findInIdMap(clientesMap, precio.cliente_id);
+    precio.cliente_nombre = cliente ? cliente.nombre : '';
+
+    var producto = findInIdMap(productosMap, precio.producto_id);
+    precio.producto_nombre = producto ? producto.nombre : '';
+
+    precios.push(precio);
+  });
+
+  if (fechaBusqueda) {
+    serverCacheSet('sc:precios:' + fechaBusqueda, precios, SERVER_CACHE_TTL.fecha);
+  }
   return precios;
 }
 
 function savePreciosCliente(data) {
   const sheet = getSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
+  ensureColumn(sheet, 'comision_unitaria');
   
   // Normalizar fecha una sola vez
   const fechaNormalizada = normalizeFecha(data.fecha);
@@ -1280,41 +1891,64 @@ function savePreciosCliente(data) {
   // Leer todos los precios existentes y construir un índice por (fecha, cliente_id, producto_id)
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
+  const headers = values[0] || [];
+  const fechaIdx = headers.indexOf('fecha') !== -1 ? headers.indexOf('fecha') : 1;
+  const clienteIdx = headers.indexOf('cliente_id') !== -1 ? headers.indexOf('cliente_id') : 2;
+  const productoIdx = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 3;
+  const cantidadIdx = headers.indexOf('cantidad') !== -1 ? headers.indexOf('cantidad') : 4;
+  const precioIdx = headers.indexOf('precio_cliente') !== -1 ? headers.indexOf('precio_cliente') : 5;
+  const comisionIdx = headers.indexOf('comision_unitaria');
   const preciosIndex = {};
   
   for (let i = 1; i < values.length; i++) {
-    const fechaPrecio = normalizeFecha(values[i][1]);
-    const clienteId = values[i][2];
-    const productoId = values[i][3];
-    
-    const key = fechaPrecio + '|' + clienteId + '|' + productoId;
-    preciosIndex[key] = i + 1; // índice de fila real
+    const fechaPrecio = normalizeFecha(values[i][fechaIdx]);
+    const clienteId = values[i][clienteIdx];
+    const productoId = values[i][productoIdx];
+    preciosIndex[fechaPrecio + '|' + clienteId + '|' + productoId] = i;
   }
   
-  // Procesar todos los items en una sola pasada
-  data.items.forEach(item => {
-    const key = fechaNormalizada + '|' + item.cliente_id + '|' + item.producto_id;
-    const rowIndex = preciosIndex[key] || null;
-    const precioCliente = normalizeAmount(item.precio_cliente);
-    
-    if (rowIndex) {
-      // Actualizar precio existente
-      sheet.getRange(rowIndex, 6).setValue(precioCliente);
+  var comisionDia = normalizeAmount(data.comision_por_unidad);
+  var rowsToAppend = [];
+  data.items.forEach(function(item) {
+    var key = fechaNormalizada + '|' + item.cliente_id + '|' + item.producto_id;
+    var rowIdx = preciosIndex[key];
+    var precioCliente = normalizeAmount(item.precio_cliente);
+    var comision = item.comision_unitaria !== undefined && item.comision_unitaria !== null && item.comision_unitaria !== ''
+      ? normalizeAmount(item.comision_unitaria)
+      : comisionDia;
+
+    if (rowIdx !== undefined) {
+      values[rowIdx][precioIdx] = precioCliente;
+      if (cantidadIdx !== -1 && item.cantidad !== undefined) values[rowIdx][cantidadIdx] = item.cantidad || 0;
+      if (comisionIdx !== -1) values[rowIdx][comisionIdx] = comision;
     } else {
-      // Crear nuevo registro
-      const id = generateId();
-      const newRow = [
-        id,
-        data.fecha,
-        item.cliente_id,
-        item.producto_id,
-        item.cantidad || 0,
-        precioCliente
-      ];
-      sheet.appendRow(newRow);
+      var newRow = [];
+      for (var c = 0; c < headers.length; c++) newRow.push('');
+      var idIdx = headers.indexOf('id');
+      if (idIdx === -1) idIdx = 0;
+      newRow[idIdx] = generateId();
+      newRow[fechaIdx] = data.fecha;
+      newRow[clienteIdx] = item.cliente_id;
+      newRow[productoIdx] = item.producto_id;
+      newRow[cantidadIdx] = item.cantidad || 0;
+      newRow[precioIdx] = precioCliente;
+      if (comisionIdx !== -1) newRow[comisionIdx] = comision;
+      rowsToAppend.push(newRow);
     }
   });
-  
+
+  if (data.items.length > 0) {
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    if (rowsToAppend.length > 0) {
+      var startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+    }
+  }
+
+  invalidateSheetCache(CONFIG.SHEETS.PRECIOS_CLIENTE);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
+  invalidateServerCacheFecha(fechaNormalizada);
+  sincronizarCobranzasConPrecios(fechaNormalizada);
   return { success: true };
 }
 
@@ -1357,15 +1991,26 @@ function cerrarDia(fecha) {
     const precios = getPreciosCliente(fecha);
     Logger.log('✅ [CIERRE] Precios obtenidos: ' + precios.length);
     
-    // Validar recepciones
+    // Validar recepciones (todos los productos del pedido deben estar confirmados)
     Logger.log('🔍 [CIERRE] Validando recepciones...');
-    const recepcionesIncompletas = recepciones.filter(r => 
-      !r.confirmado || !r.precio_real || r.llego === null
-    );
-    
-    if (recepcionesIncompletas.length > 0) {
-      Logger.log('❌ [CIERRE] Recepciones incompletas encontradas: ' + recepcionesIncompletas.length);
-      throw new Error('Hay recepciones sin confirmar o incompletas');
+    var pedidosParaRecepcion = getPedidos(fecha);
+    var productosPedidosIds = {};
+    pedidosParaRecepcion.forEach(function(p) {
+      productosPedidosIds[p.producto_id] = true;
+    });
+
+    var recepcionMapCierre = {};
+    recepciones.forEach(function(r) {
+      recepcionMapCierre[r.producto_id] = r;
+    });
+
+    var productosSinConfirmar = Object.keys(productosPedidosIds).filter(function(productoId) {
+      return !recepcionProductoConfirmada(recepcionMapCierre[productoId]);
+    });
+
+    if (productosSinConfirmar.length > 0) {
+      Logger.log('❌ [CIERRE] Productos sin recepción confirmada: ' + productosSinConfirmar.length);
+      throw new Error('Hay productos sin recepción confirmada. Confirmá cada producto en Recepción.');
     }
     Logger.log('✅ [CIERRE] Todas las recepciones están completas');
     
@@ -1384,48 +2029,40 @@ function cerrarDia(fecha) {
       throw new Error('Faltan precios cliente para algunos productos');
     }
     Logger.log('✅ [CIERRE] Todos los precios están completos');
-    
-    // Generar cobranzas por cliente
+
+    // Nada se escribe antes de esta validación. Si el cierre quedó a medias, se retoma.
+    var cierreInfo = findCierreRow(fecha);
+    if (cierreInfo.row && cierreInfo.estado === 'cerrado') {
+      return { success: true, alreadyClosed: true, message: 'Día cerrado correctamente' };
+    }
+
+    if (!cierreInfo.row) {
+      var cierreId = generateId();
+      cierreInfo.sheet.appendRow([cierreId, fecha, 'cerrando', '']);
+      cierreInfo.row = cierreInfo.sheet.getLastRow();
+      cierreInfo.estadoIdx = 2;
+      cierreInfo.notasIdx = 3;
+      cierreInfo.notas = '';
+      cierreInfo.estado = 'cerrando';
+    }
+
+    Logger.log('📦 [CIERRE] Actualizando stock de bebidas (entra lo recibido, sale lo vendido)...');
+    aplicarStockCierre(fecha, cierreInfo);
+    Logger.log('✅ [CIERRE] Stock actualizado');
+
     Logger.log('💵 [CIERRE] Generando cobranzas...');
-    try {
-      generarCobranzas(fecha);
-      Logger.log('✅ [CIERRE] Cobranzas generadas');
-    } catch (cobranzasError) {
-      Logger.log('❌ [CIERRE] Error generando cobranzas: ' + cobranzasError.toString());
-      throw new Error('Error al generar cobranzas: ' + cobranzasError.toString());
-    }
-    
-    // Actualizar stock de bebidas
-    Logger.log('📦 [CIERRE] Actualizando stock de bebidas...');
-    try {
-      actualizarStockBebidas(fecha);
-      Logger.log('✅ [CIERRE] Stock actualizado');
-    } catch (stockError) {
-      Logger.log('❌ [CIERRE] Error actualizando stock: ' + stockError.toString());
-      throw new Error('Error al actualizar stock: ' + stockError.toString());
-    }
-    
-    // Registrar cierre
-    Logger.log('📝 [CIERRE] Registrando cierre...');
-    try {
-      const sheet = getSheet(CONFIG.SHEETS.CIERRE_DIA);
-      const id = generateId();
-      sheet.appendRow([id, fecha, 'cerrado', '']);
-      Logger.log('✅ [CIERRE] Cierre registrado con ID: ' + id);
-    } catch (cierreError) {
-      Logger.log('❌ [CIERRE] Error registrando cierre: ' + cierreError.toString());
-      throw new Error('Error al registrar cierre: ' + cierreError.toString());
-    }
-    
-    // Registrar movimientos de caja
-    Logger.log('💰 [CIERRE] Registrando movimientos de caja...');
-    try {
-      registrarMovimientosCaja(fecha);
-      Logger.log('✅ [CIERRE] Movimientos de caja registrados');
-    } catch (cajaError) {
-      Logger.log('❌ [CIERRE] Error registrando movimientos de caja: ' + cajaError.toString());
-      // No lanzar error aquí, es opcional
-    }
+    generarCobranzas(fecha);
+    Logger.log('✅ [CIERRE] Cobranzas generadas');
+
+    cierreInfo.sheet.getRange(cierreInfo.row, cierreInfo.estadoIdx + 1).setValue('cerrado');
+    cierreInfo.sheet.getRange(cierreInfo.row, cierreInfo.notasIdx + 1).setValue('stock_ok');
+    invalidateSheetCache(CONFIG.SHEETS.CIERRE_DIA);
+    invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+    invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.CIERRE_DIA);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
+    invalidateServerCacheFecha(normalizeFecha(fecha));
     
     const elapsed = ((new Date().getTime() - startTime) / 1000).toFixed(2);
     Logger.log('🎉 [CIERRE] Cierre del día completado exitosamente en ' + elapsed + ' segundos');
@@ -1444,6 +2081,11 @@ function generarCobranzas(fecha) {
   const precios = getPreciosCliente(fecha);
   const clientes = getClientes();
   const sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+
+  // Verificar cuáles clientes ya tienen cobranza para esta fecha (creadas desde el paso previo)
+  const existentes = getCobranzas(fecha);
+  const existentesMap = {};
+  existentes.forEach(function(c) { existentesMap[String(c.cliente_id)] = true; });
   
   // Agrupar por cliente
   const cobranzasPorCliente = {};
@@ -1455,13 +2097,12 @@ function generarCobranzas(fecha) {
         total: 0
       };
     }
-    const cantidad = parseFloat(precio.cantidad) || 0;
-    const precioCliente = normalizeAmount(precio.precio_cliente);
-    cobranzasPorCliente[precio.cliente_id].total += Math.round(cantidad * precioCliente);
+    cobranzasPorCliente[precio.cliente_id].total += totalPrecioClienteLinea(precio);
   });
   
-  // Crear cobranzas
+  // Crear cobranzas solo para clientes que no tienen una aún
   Object.keys(cobranzasPorCliente).forEach(clienteId => {
+    if (existentesMap[String(clienteId)]) return; // ya existe, no duplicar
     const cobranza = cobranzasPorCliente[clienteId];
     const id = generateId();
     sheet.appendRow([
@@ -1476,50 +2117,128 @@ function generarCobranzas(fecha) {
   });
 }
 
-function actualizarStockBebidas(fecha) {
-  const recepciones = getRecepcion(fecha);
-  const productos = getProductos();
-  const stockSheet = getSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
-  
-  // Leer stock actual UNA sola vez y construir un índice por producto_id
-  const stockData = stockSheet.getDataRange().getValues();
-  const stockIndex = {};
-  
-  for (let i = 1; i < stockData.length; i++) {
-    const productoId = stockData[i][0];
-    stockIndex[productoId] = {
-      rowIndex: i + 1,
-      stockActual: stockData[i][1] || 0,
-      minimo: stockData[i][2] || 10
-    };
+function findCierreRow(fecha) {
+  var sheet = getSheet(CONFIG.SHEETS.CIERRE_DIA);
+  var data = sheet.getDataRange().getValues();
+  var headers = data.length ? data[0] : [];
+  var fechaIdx = headers.indexOf('fecha');
+  var estadoIdx = headers.indexOf('estado');
+  var notasIdx = headers.indexOf('notas');
+  if (fechaIdx === -1) fechaIdx = 1;
+  if (estadoIdx === -1) estadoIdx = 2;
+  if (notasIdx === -1) notasIdx = 3;
+  var fechaNorm = normalizeFecha(fecha);
+
+  for (var i = 1; i < data.length; i++) {
+    if (normalizeFecha(data[i][fechaIdx]) === fechaNorm) {
+      return {
+        sheet: sheet,
+        row: i + 1,
+        estado: String(data[i][estadoIdx] || ''),
+        notas: String(data[i][notasIdx] || ''),
+        estadoIdx: estadoIdx,
+        notasIdx: notasIdx
+      };
+    }
   }
-  
-  recepciones.forEach(recepcion => {
-    const producto = productos.find(p => p.id === recepcion.producto_id);
-    if (producto && producto.tipo === 'bebida' && recepcion.confirmado) {
-      const productoId = recepcion.producto_id;
-      const cantidadLlego = recepcion.llego || 0;
-      
-      if (stockIndex[productoId]) {
-        // Actualizar stock existente sin volver a leer toda la hoja
-        const info = stockIndex[productoId];
-        const nuevoStock = info.stockActual + cantidadLlego;
-        stockSheet.getRange(info.rowIndex, 2).setValue(nuevoStock);
-        // Actualizar cache local por si hay varias recepciones del mismo producto
-        info.stockActual = nuevoStock;
-      } else {
-        // Crear registro nuevo para este producto
-        stockSheet.appendRow([productoId, cantidadLlego, 10]);
-        // También actualizar índice local
-        const lastRow = stockSheet.getLastRow();
-        stockIndex[productoId] = {
-          rowIndex: lastRow,
-          stockActual: cantidadLlego,
-          minimo: 10
-        };
-      }
+
+  return { sheet: sheet, row: null, estado: '', notas: '', estadoIdx: estadoIdx, notasIdx: notasIdx };
+}
+
+function calcularDeltaStockBebidas(fecha) {
+  var recepciones = getRecepcion(fecha);
+  var precios = getPreciosCliente(fecha);
+  var productosMap = getProductosMap();
+  var delta = {};
+
+  function add(id, qty) {
+    var key = String(id);
+    delta[key] = (delta[key] || 0) + qty;
+  }
+
+  recepciones.forEach(function(recepcion) {
+    var producto = findInIdMap(productosMap, recepcion.producto_id);
+    var confirmado = recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1;
+    if (producto && producto.tipo === 'bebida' && confirmado) {
+      add(recepcion.producto_id, parseFloat(recepcion.llego) || 0);
     }
   });
+
+  precios.forEach(function(precio) {
+    var producto = findInIdMap(productosMap, precio.producto_id);
+    if (producto && producto.tipo === 'bebida') {
+      add(precio.producto_id, -(parseFloat(precio.cantidad) || 0));
+    }
+  });
+
+  return delta;
+}
+
+function leerStockMap(sheet) {
+  var data = sheet.getDataRange().getValues();
+  var map = {};
+  for (var i = 1; i < data.length; i++) {
+    if (!data[i][0]) continue;
+    map[String(data[i][0])] = {
+      rowIndex: i + 1,
+      stock: parseFloat(data[i][1]) || 0,
+      minimo: data[i][2] || 10
+    };
+  }
+  return map;
+}
+
+function escribirStockDesdeBase(sheet, base, delta) {
+  var map = leerStockMap(sheet);
+  Object.keys(delta).forEach(function(productoId) {
+    var baseQty = base && base[productoId] !== undefined ? Number(base[productoId]) : 0;
+    var nuevo = Math.max(0, Math.round((baseQty + Number(delta[productoId] || 0)) * 1000) / 1000);
+    if (map[productoId]) {
+      sheet.getRange(map[productoId].rowIndex, 2).setValue(nuevo);
+    } else {
+      sheet.appendRow([productoId, nuevo, 10]);
+    }
+  });
+}
+
+function aplicarStockCierre(fecha, cierreInfo) {
+  var notas = String(cierreInfo.notas || '');
+  if (notas === 'stock_ok') return;
+
+  var stockSheet = getSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
+  var delta = calcularDeltaStockBebidas(fecha);
+  var base = null;
+
+  if (notas.indexOf('stock_before:') === 0) {
+    try {
+      base = JSON.parse(notas.substring('stock_before:'.length));
+    } catch (error) {
+      base = null;
+    }
+  }
+
+  if (!base) {
+    var actual = leerStockMap(stockSheet);
+    base = {};
+    Object.keys(actual).forEach(function(key) { base[key] = actual[key].stock; });
+    Object.keys(delta).forEach(function(key) {
+      if (base[key] === undefined) base[key] = 0;
+    });
+    cierreInfo.sheet.getRange(cierreInfo.row, cierreInfo.notasIdx + 1).setValue('stock_before:' + JSON.stringify(base));
+    cierreInfo.notas = 'stock_before:' + JSON.stringify(base);
+  }
+
+  escribirStockDesdeBase(stockSheet, base, delta);
+  cierreInfo.sheet.getRange(cierreInfo.row, cierreInfo.notasIdx + 1).setValue('stock_ok');
+  cierreInfo.notas = 'stock_ok';
+}
+
+function actualizarStockBebidas(fecha) {
+  var cierreInfo = findCierreRow(fecha);
+  if (!cierreInfo.row) {
+    throw new Error('No hay un cierre en curso para aplicar stock');
+  }
+  aplicarStockCierre(fecha, cierreInfo);
 }
 
 function registrarMovimientosCaja(fecha) {
@@ -1546,58 +2265,42 @@ function getCierres() {
 // ========== COBRANZAS ==========
 
 function getCobranzas(fecha = null, clienteId = null) {
-  const sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const cobranzas = [];
-  
-  // Normalizar la fecha de búsqueda
-  const fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
-  
-  // OPTIMIZACIÓN: Crear mapa
-  const clientes = getClientes();
-  const clientesMap = {};
-  clientes.forEach(c => { clientesMap[c.id] = c; });
-  
-  for (let i = 1; i < data.length; i++) {
-    // Filtrar temprano
-    let cumpleFiltros = true;
-    
-    if (fechaBusqueda) {
-      const fechaCobranza = normalizeFecha(data[i][1]);
-      if (fechaCobranza !== fechaBusqueda) {
-        cumpleFiltros = false;
-      }
+  var cached = readSheetValues(CONFIG.SHEETS.COBRANZAS);
+  var headers = cached.headers;
+  var fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
+
+  var clientes = getClientes();
+  var clientesMap = {};
+  clientes.forEach(function(c) { clientesMap[c.id] = c; });
+
+  var cobranzas = [];
+
+  cached.rows.forEach(function(row) {
+    if (fechaBusqueda && normalizeFecha(row[1]) !== fechaBusqueda) {
+      return;
     }
-    
-    if (clienteId && data[i][2] !== clienteId) {
-      cumpleFiltros = false;
+    if (clienteId && row[2] !== clienteId) {
+      return;
     }
-    
-    if (!cumpleFiltros) {
-      continue;
-    }
-    
-    const cobranza = {};
-    headers.forEach((header, index) => {
-      cobranza[header] = data[i][index];
+
+    var cobranza = {};
+    headers.forEach(function(header, index) {
+      cobranza[header] = row[index];
     });
-    
-    // Normalizar la fecha en la cobranza para consistencia
+
     if (cobranza.fecha) {
       cobranza.fecha = normalizeFecha(cobranza.fecha);
     }
     cobranza.total = normalizeAmount(cobranza.total);
     cobranza.pagado = normalizeAmount(cobranza.pagado);
     cobranza.saldo = normalizeAmount(cobranza.saldo);
-    
-    // Búsqueda O(1)
-    const cliente = clientesMap[cobranza.cliente_id];
+
+    var cliente = clientesMap[cobranza.cliente_id];
     cobranza.cliente_nombre = cliente ? cliente.nombre : '';
-    
+
     cobranzas.push(cobranza);
-  }
-  
+  });
+
   return cobranzas;
 }
 
@@ -1611,6 +2314,10 @@ function registrarCobro(data) {
     if (values[i][0] === data.cobranza_id) {
       const pagado = normalizeAmount(values[i][4]);
       const total = normalizeAmount(values[i][3]);
+      const saldoActual = total - pagado;
+      if (monto > saldoActual) {
+        throw new Error('El monto supera el saldo pendiente');
+      }
       const nuevoPagado = pagado + monto;
       const nuevoSaldo = total - nuevoPagado;
       
@@ -1640,6 +2347,173 @@ function registrarCobro(data) {
   throw new Error('Cobranza no encontrada');
 }
 
+/**
+ * Devuelve el total a cobrar por cliente para una fecha, calculado desde PreciosCliente.
+ * Incluye si ya existe cobranza (y cuánto se cobró).
+ */
+function getTotalesClientesHoy(fecha) {
+  var fechaNorm = normalizeFecha(fecha);
+  if (!fechaNorm) throw new Error('Fecha inválida');
+
+  var precios = getPreciosCliente(fechaNorm);
+  var cobranzas = getCobranzas(fechaNorm);
+
+  // Agrupar precios por cliente
+  var totalesPorCliente = {};
+  precios.forEach(function(p) {
+    var cid = String(p.cliente_id);
+    if (!totalesPorCliente[cid]) {
+      totalesPorCliente[cid] = {
+        cliente_id: p.cliente_id,
+        cliente_nombre: p.cliente_nombre || '',
+        total: 0,
+        items: []
+      };
+    }
+    var subtotal = totalPrecioClienteLinea(p);
+    totalesPorCliente[cid].total += subtotal;
+    totalesPorCliente[cid].items.push({
+      producto_nombre: p.producto_nombre || '',
+      cantidad: p.cantidad,
+      precio_cliente: normalizeAmount(p.precio_cliente),
+      subtotal: subtotal
+    });
+  });
+
+  // Enriquecer con datos de cobranza existente
+  var cobranzasMap = {};
+  cobranzas.forEach(function(c) { cobranzasMap[String(c.cliente_id)] = c; });
+
+  return Object.values(totalesPorCliente).map(function(t) {
+    var cob = cobranzasMap[String(t.cliente_id)];
+    var pagado = cob ? normalizeAmount(cob.pagado) : 0;
+    var saldo = Math.max(0, t.total - pagado);
+    var estado = 'sin_cobrar';
+    if (pagado > 0 && saldo <= 0) estado = 'pagado';
+    else if (pagado > 0) estado = 'parcial';
+    return {
+      cliente_id: t.cliente_id,
+      cliente_nombre: t.cliente_nombre,
+      total: t.total,
+      items: t.items,
+      cobranza_id: cob ? cob.id : null,
+      pagado: pagado,
+      saldo: saldo,
+      estado: estado
+    };
+  });
+}
+
+function sincronizarCobranzasConPrecios(fecha) {
+  var fechaNorm = normalizeFecha(fecha);
+  var precios = getPreciosCliente(fechaNorm);
+  var totales = {};
+  precios.forEach(function(p) {
+    var cid = String(p.cliente_id);
+    if (!totales[cid]) totales[cid] = 0;
+    totales[cid] += totalPrecioClienteLinea(p);
+  });
+
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  var headers = data[0];
+  var fechaCol = headers.indexOf('fecha') !== -1 ? headers.indexOf('fecha') : 1;
+  var clienteCol = headers.indexOf('cliente_id') !== -1 ? headers.indexOf('cliente_id') : 2;
+  var totalCol = headers.indexOf('total') !== -1 ? headers.indexOf('total') : 3;
+  var pagadoCol = headers.indexOf('pagado') !== -1 ? headers.indexOf('pagado') : 4;
+  var saldoCol = headers.indexOf('saldo') !== -1 ? headers.indexOf('saldo') : 5;
+  var estadoCol = headers.indexOf('estado') !== -1 ? headers.indexOf('estado') : 6;
+  var changed = false;
+
+  for (var i = 1; i < data.length; i++) {
+    if (normalizeFecha(data[i][fechaCol]) !== fechaNorm) continue;
+    var cid = String(data[i][clienteCol]);
+    if (totales[cid] === undefined) continue;
+    var total = totales[cid];
+    var pagado = normalizeAmount(data[i][pagadoCol]);
+    var saldo = Math.max(0, total - pagado);
+    var estado = pagado <= 0 ? 'pendiente' : (saldo <= 0 ? 'pagado' : 'parcial');
+    if (normalizeAmount(data[i][totalCol]) !== total || normalizeAmount(data[i][saldoCol]) !== saldo) {
+      sheet.getRange(i + 1, totalCol + 1).setValue(total);
+      sheet.getRange(i + 1, saldoCol + 1).setValue(saldo);
+      sheet.getRange(i + 1, estadoCol + 1).setValue(estado);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+  }
+}
+
+/**
+ * Crea la cobranza del día para un cliente (si no existe) y registra el cobro.
+ * data: { fecha, cliente_id, monto, metodo }
+ */
+function cobrarClienteHoy(data) {
+  if (!data.fecha || !data.cliente_id) throw new Error('fecha y cliente_id son requeridos');
+  var fechaNorm = normalizeFecha(data.fecha);
+  var monto = normalizeAmount(data.monto);
+  if (monto <= 0) throw new Error('El monto debe ser mayor a cero');
+
+  // Calcular total del cliente para el día
+  var precios = getPreciosCliente(fechaNorm);
+  var total = 0;
+  precios.forEach(function(p) {
+    if (String(p.cliente_id) === String(data.cliente_id)) {
+      total += totalPrecioClienteLinea(p);
+    }
+  });
+  if (total <= 0) throw new Error('No hay precios registrados para este cliente en la fecha indicada');
+
+  // Verificar si ya existe cobranza para esta fecha/cliente
+  var cobranzasExistentes = getCobranzas(fechaNorm, data.cliente_id);
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  var cobranzaId;
+  var saldoDisponible = total;
+
+  if (cobranzasExistentes.length === 0) {
+    // Crear cobranza
+    cobranzaId = generateId();
+    sheet.appendRow([cobranzaId, fechaNorm, data.cliente_id, total, 0, total, 'pendiente']);
+    invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+  } else {
+    cobranzaId = cobranzasExistentes[0].id;
+    var pagadoPrevio = normalizeAmount(cobranzasExistentes[0].pagado);
+    saldoDisponible = Math.max(0, total - pagadoPrevio);
+    if (normalizeAmount(cobranzasExistentes[0].total) !== total) {
+      var cobSheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+      var cobValues = cobSheet.getDataRange().getValues();
+      for (var r = 1; r < cobValues.length; r++) {
+        if (cobValues[r][0] === cobranzaId) {
+          cobSheet.getRange(r + 1, 4).setValue(total);
+          cobSheet.getRange(r + 1, 6).setValue(saldoDisponible);
+          invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+          invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+          break;
+        }
+      }
+    }
+  }
+
+  if (monto > saldoDisponible) {
+    throw new Error('El monto supera el saldo pendiente');
+  }
+
+  // Registrar el cobro
+  var resultado = registrarCobro({
+    cobranza_id: cobranzaId,
+    monto: monto,
+    fecha: fechaNorm
+  });
+
+  return { success: true, cobranza_id: cobranzaId, total: total, monto: monto };
+}
+
 // ========== PAGOS PROVEEDORES ==========
 
 function getPagosProveedores() {
@@ -1664,15 +2538,22 @@ function registrarPago(data) {
   const sheet = getSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
   const id = generateId();
   const monto = normalizeAmount(data.monto);
+  const saldoPendiente = calcularSaldoProveedor(data.proveedor_id);
+  const anticipo = data.anticipo === true || data.anticipo === 'true';
+  if (!anticipo && monto > saldoPendiente) {
+    throw new Error('El monto supera el saldo pendiente');
+  }
   
   sheet.appendRow([
     id,
-    data.fecha || new Date().toISOString().split('T')[0],
+    data.fecha || todayArgentina(),
     data.proveedor_id,
     monto,
     data.metodo || 'efectivo',
-    data.nota || ''
+    data.nota || (anticipo ? 'Pago al hacer el pedido' : '')
   ]);
+  invalidateSheetCache(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
   
   // Registrar en caja
   const cajaSheet = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
@@ -1692,24 +2573,23 @@ function registrarPago(data) {
 // ========== STOCK ==========
 
 function getStock() {
-  const sheet = getSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
-  const data = sheet.getDataRange().getValues();
-  const productosPorId = {};
-  getProductos().forEach(p => { productosPorId[p.id] = p; });
-  const stock = [];
-  
-  for (let i = 1; i < data.length; i++) {
-    const producto = productosPorId[data[i][0]];
+  var cached = readSheetValues(CONFIG.SHEETS.STOCK_BEBIDAS);
+  var productosPorId = {};
+  getProductos().forEach(function(p) { productosPorId[p.id] = p; });
+  var stock = [];
+
+  cached.rows.forEach(function(row) {
+    var producto = productosPorId[row[0]];
     if (producto) {
       stock.push({
-        producto_id: data[i][0],
+        producto_id: row[0],
         producto_nombre: producto.nombre,
-        stock_actual: data[i][1] || 0,
-        minimo: data[i][2] || 10
+        stock_actual: row[1] || 0,
+        minimo: row[2] || 10
       });
     }
-  }
-  
+  });
+
   return stock;
 }
 
@@ -1719,7 +2599,7 @@ function updateStock(data) {
   const values = dataRange.getValues();
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === data.producto_id) {
+    if (idsMatch(values[i][0], data.producto_id)) {
       sheet.getRange(i + 1, 2).setValue(data.cantidad);
       return { success: true };
     }
@@ -1736,7 +2616,7 @@ function deleteStock(productoId) {
   const values = dataRange.getValues();
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productoId) {
+    if (idsMatch(values[i][0], productoId)) {
       sheet.deleteRow(i + 1);
       return { success: true };
     }
@@ -1772,7 +2652,7 @@ function createCajaMovimiento(data) {
   
   sheet.appendRow([
     id,
-    data.fecha || new Date().toISOString().split('T')[0],
+    data.fecha || todayArgentina(),
     data.tipo,
     monto,
     data.nota || '',
@@ -1780,6 +2660,277 @@ function createCajaMovimiento(data) {
   ]);
   
   return { id: id, ...data, monto: monto };
+}
+
+// ========== FLUJO — DÍAS PENDIENTES ==========
+
+/**
+ * Días con pedidos que aún no fueron cerrados (pueden tener recepción al día siguiente).
+ * Optimizado: un solo scan de hojas, sin getPedidos() por cada fecha.
+ */
+function getDiasPendientes() {
+  var scDias = serverCacheGet('sc:dias');
+  if (scDias) return scDias;
+
+  var pedidosCached = readSheetValues(CONFIG.SHEETS.PEDIDOS);
+  var cierresCached = readSheetValues(CONFIG.SHEETS.CIERRE_DIA);
+  var recepcionCached = readSheetValues(CONFIG.SHEETS.RECEPCION);
+  var preciosCached = readSheetValues(CONFIG.SHEETS.PRECIOS_CLIENTE);
+
+  var headersP = pedidosCached.headers;
+  var fechaIdx = headersP.indexOf('fecha');
+  if (fechaIdx === -1) fechaIdx = 1;
+  var clienteIdx = headersP.indexOf('cliente_id');
+  var productoIdx = headersP.indexOf('producto_id');
+  if (clienteIdx === -1) clienteIdx = 2;
+  if (productoIdx === -1) productoIdx = 3;
+
+  var pedidosPorFecha = {};
+  pedidosCached.rows.forEach(function(row) {
+    var f = normalizeFecha(row[fechaIdx]);
+    if (!f) return;
+    if (!pedidosPorFecha[f]) pedidosPorFecha[f] = [];
+    pedidosPorFecha[f].push({
+      cliente_id: row[clienteIdx],
+      producto_id: row[productoIdx]
+    });
+  });
+
+  var cierreFechaIdx = cierresCached.headers.indexOf('fecha');
+  if (cierreFechaIdx === -1) cierreFechaIdx = 1;
+  var cierreEstadoIdx = cierresCached.headers.indexOf('estado');
+  var fechasCerradas = {};
+  cierresCached.rows.forEach(function(row) {
+    var f = normalizeFecha(row[cierreFechaIdx]);
+    var estado = cierreEstadoIdx !== -1 ? String(row[cierreEstadoIdx] || '') : 'cerrado';
+    if (f && estado !== 'cerrando') fechasCerradas[f] = true;
+  });
+
+  var recHeaders = recepcionCached.headers;
+  var recFechaIdx = recHeaders.indexOf('fecha');
+  if (recFechaIdx === -1) recFechaIdx = 1;
+  var recProdIdx = recHeaders.indexOf('producto_id');
+  var recLlegoIdx = recHeaders.indexOf('llego');
+  var recPrecioIdx = recHeaders.indexOf('precio_real');
+  var recConfirmIdx = recHeaders.indexOf('confirmado');
+  if (recProdIdx === -1) recProdIdx = 2;
+
+  var recepcionPorFecha = {};
+  recepcionCached.rows.forEach(function(row) {
+    var f = normalizeFecha(row[recFechaIdx]);
+    if (!f) return;
+    if (!recepcionPorFecha[f]) recepcionPorFecha[f] = {};
+    recepcionPorFecha[f][String(row[recProdIdx])] = {
+      producto_id: row[recProdIdx],
+      llego: recLlegoIdx !== -1 ? row[recLlegoIdx] : null,
+      precio_real: recPrecioIdx !== -1 ? row[recPrecioIdx] : 0,
+      confirmado: recConfirmIdx !== -1 ? row[recConfirmIdx] : false
+    };
+  });
+
+  var precHeaders = preciosCached.headers;
+  var prFechaIdx = precHeaders.indexOf('fecha');
+  var prClienteIdx = precHeaders.indexOf('cliente_id');
+  var prProductoIdx = precHeaders.indexOf('producto_id');
+  var prPrecioIdx = precHeaders.indexOf('precio_cliente');
+  if (prFechaIdx === -1) prFechaIdx = 1;
+
+  var preciosPorFecha = {};
+  preciosCached.rows.forEach(function(row) {
+    var f = normalizeFecha(row[prFechaIdx]);
+    if (!f) return;
+    if (!preciosPorFecha[f]) preciosPorFecha[f] = [];
+    preciosPorFecha[f].push({
+      cliente_id: prClienteIdx !== -1 ? row[prClienteIdx] : null,
+      producto_id: prProductoIdx !== -1 ? row[prProductoIdx] : null,
+      precio_cliente: prPrecioIdx !== -1 ? row[prPrecioIdx] : null
+    });
+  });
+
+  var hoy = todayArgentina();
+  var fechasAProcesar = Object.keys(pedidosPorFecha);
+  if (!fechasCerradas[hoy] && fechasAProcesar.indexOf(hoy) === -1) {
+    fechasAProcesar.push(hoy);
+    pedidosPorFecha[hoy] = [];
+  }
+
+  var resultado = [];
+
+  fechasAProcesar.forEach(function(fecha) {
+    var pedidos = pedidosPorFecha[fecha] || [];
+    var pedidosCount = pedidos.length;
+
+    if (fechasCerradas[fecha]) {
+      if (fecha === hoy) {
+        resultado.push({
+          fecha: fecha,
+          pedidos_count: pedidosCount,
+          recepcion_confirmada: true,
+          precios_completos: true,
+          recepcion_confirmados: 0,
+          recepcion_total: 0,
+          estado: 'cerrado'
+        });
+      }
+      return;
+    }
+
+    if (pedidosCount === 0 && fecha !== hoy) return;
+
+    var estadoDia = calcularEstadoDiaDesdeCache(
+      pedidos,
+      recepcionPorFecha[fecha] || {},
+      preciosPorFecha[fecha] || []
+    );
+
+    resultado.push({
+      fecha: fecha,
+      pedidos_count: pedidosCount,
+      recepcion_confirmada: estadoDia.recepcionOk,
+      precios_completos: estadoDia.preciosOk,
+      recepcion_confirmados: estadoDia.recepcion_confirmados || 0,
+      recepcion_total: estadoDia.recepcion_total || 0,
+      estado: estadoDia.estado
+    });
+  });
+
+  resultado.sort(function(a, b) {
+    return a.fecha.localeCompare(b.fecha);
+  });
+
+  serverCacheSet('sc:dias', resultado, SERVER_CACHE_TTL.dias);
+  return resultado;
+}
+
+/**
+ * Pedidos + recepción + precios del día en una sola ejecución (flujo operativo).
+ */
+function getFlujoDia(fecha) {
+  var fechaNorm = fecha ? normalizeFecha(fecha) : todayArgentina();
+  var scKey = 'sc:flujo:' + fechaNorm;
+  var sc = serverCacheGet(scKey);
+  if (sc) return sc;
+
+  var result = {
+    fecha: fechaNorm,
+    pedidos: getPedidos(fechaNorm),
+    recepcion: getRecepcion(fechaNorm),
+    precios: getPreciosCliente(fechaNorm)
+  };
+  serverCacheSet(scKey, result, SERVER_CACHE_TTL.flujo);
+  return result;
+}
+
+function calcularEstadoDiaDesdeCache(pedidos, recepcionMap, preciosList) {
+  if (!pedidos || pedidos.length === 0) {
+    return {
+      recepcionOk: false,
+      preciosOk: false,
+      estado: 'nuevo',
+      recepcion_confirmados: 0,
+      recepcion_total: 0
+    };
+  }
+
+  var productosPedidos = {};
+  pedidos.forEach(function(p) {
+    productosPedidos[String(p.producto_id)] = true;
+  });
+
+  var totalProductos = Object.keys(productosPedidos).length;
+  var confirmados = 0;
+  var recepcionOk = true;
+
+  Object.keys(productosPedidos).forEach(function(productoId) {
+    var rec = recepcionMap[productoId];
+    if (!rec) {
+      Object.keys(recepcionMap).forEach(function(k) {
+        if (idsMatch(k, productoId)) rec = recepcionMap[k];
+      });
+    }
+    if (recepcionProductoConfirmada(rec)) {
+      confirmados++;
+    } else {
+      recepcionOk = false;
+    }
+  });
+
+  var preciosOk = pedidos.every(function(p) {
+    return preciosList.some(function(pr) {
+      return idsMatch(pr.cliente_id, p.cliente_id) &&
+        idsMatch(pr.producto_id, p.producto_id) &&
+        pr.precio_cliente;
+    });
+  });
+
+  var estado = 'recepcion_pendiente';
+  if (recepcionOk && !preciosOk) estado = 'precios_pendiente';
+  if (recepcionOk && preciosOk) estado = 'listo_cierre';
+
+  return {
+    recepcionOk: recepcionOk,
+    preciosOk: preciosOk,
+    estado: estado,
+    recepcion_confirmados: confirmados,
+    recepcion_total: totalProductos
+  };
+}
+
+function calcularEstadoDia(fecha, pedidos) {
+  if (!pedidos || pedidos.length === 0) {
+    return {
+      recepcionOk: false,
+      preciosOk: false,
+      estado: 'nuevo',
+      recepcion_confirmados: 0,
+      recepcion_total: 0
+    };
+  }
+
+  var recepciones = getRecepcion(fecha);
+  var recepcionMap = {};
+  recepciones.forEach(function(r) {
+    recepcionMap[r.producto_id] = r;
+  });
+
+  var productosPedidos = {};
+  pedidos.forEach(function(p) {
+    productosPedidos[p.producto_id] = true;
+  });
+
+  var totalProductos = Object.keys(productosPedidos).length;
+  var confirmados = 0;
+  var recepcionOk = true;
+
+  Object.keys(productosPedidos).forEach(function(productoId) {
+    var rec = recepcionMap[productoId];
+    if (recepcionProductoConfirmada(rec)) {
+      confirmados++;
+    } else {
+      recepcionOk = false;
+    }
+  });
+
+  var precios = getPreciosCliente(fecha);
+  var preciosOk = pedidos.every(function(p) {
+    return precios.some(function(pr) {
+      return pr.cliente_id === p.cliente_id &&
+        pr.producto_id === p.producto_id &&
+        pr.precio_cliente;
+    });
+  });
+
+  var estado = 'recepcion_pendiente';
+  if (recepcionOk && !preciosOk) estado = 'precios_pendiente';
+  if (recepcionOk && preciosOk) estado = 'listo_cierre';
+
+  return {
+    recepcionOk: recepcionOk,
+    preciosOk: preciosOk,
+    estado: estado,
+    recepcion_confirmados: confirmados,
+    recepcion_total: totalProductos
+  };
 }
 
 // ========== HISTORIAL ==========
@@ -1894,6 +3045,213 @@ function ejecutarConReintentos(fn, maxIntentos, pausaMs) {
   }
   
   throw ultimoError;
+}
+
+// ========== WHATSAPP (META API + BRIDGE) ==========
+
+function getWhatsAppConfig() {
+  const config = getConfiguracionNotificaciones();
+  const autoEnvio = config.whatsapp_auto_envio === true || config.whatsapp_auto_envio === 'true';
+  const modo = String(config.whatsapp_modo || 'manual').trim().toLowerCase();
+
+  return {
+    autoEnvio: autoEnvio,
+    modo: modo,
+    token: String(config.whatsapp_token || '').trim(),
+    phoneId: String(config.whatsapp_phone_id || '').trim(),
+    bridgeUrl: String(config.whatsapp_bridge_url || '').trim().replace(/\/$/, ''),
+    bridgeKey: String(config.whatsapp_bridge_key || '').trim()
+  };
+}
+
+function normalizeWhatsAppPhone(telefono) {
+  if (!telefono) {
+    throw new Error('Teléfono no proporcionado');
+  }
+
+  let digits = String(telefono).trim();
+
+  if (digits.indexOf('+') === 0) {
+    digits = digits.slice(1).replace(/\D/g, '');
+  } else {
+    digits = digits.replace(/\D/g, '');
+    if (digits.indexOf('00') === 0) {
+      digits = digits.slice(2);
+    } else if (digits.indexOf('0') === 0) {
+      digits = digits.slice(1);
+    }
+
+    if (digits.length >= 10 && digits.length <= 11 && digits.indexOf('54') !== 0) {
+      digits = '54' + digits;
+    }
+  }
+
+  if (digits.length < 10 || digits.length > 15) {
+    throw new Error('Teléfono inválido para WhatsApp: ' + telefono);
+  }
+
+  return digits;
+}
+
+function getWhatsAppStatus() {
+  const waConfig = getWhatsAppConfig();
+
+  if (!waConfig.autoEnvio) {
+    return { autoEnvioActivo: false, modo: waConfig.modo };
+  }
+
+  if (waConfig.modo === 'meta' && waConfig.token && waConfig.phoneId) {
+    return { autoEnvioActivo: true, modo: 'meta' };
+  }
+
+  if (waConfig.modo === 'bridge' && waConfig.bridgeUrl && waConfig.bridgeKey) {
+    try {
+      const response = UrlFetchApp.fetch(waConfig.bridgeUrl + '/api/status', {
+        method: 'get',
+        headers: { 'X-API-Key': waConfig.bridgeKey },
+        muteHttpExceptions: true
+      });
+
+      const body = JSON.parse(response.getContentText() || '{}');
+      const connected = body.connected === true;
+
+      return {
+        autoEnvioActivo: connected,
+        modo: 'bridge',
+        bridgeConectado: connected,
+        bridgeEsperandoQr: body.waitingForQr === true
+      };
+    } catch (error) {
+      Logger.log('Error consultando WhatsApp Bridge: ' + error.toString());
+      return {
+        autoEnvioActivo: false,
+        modo: 'bridge',
+        bridgeConectado: false,
+        error: 'No se pudo conectar al WhatsApp Bridge'
+      };
+    }
+  }
+
+  return { autoEnvioActivo: false, modo: waConfig.modo };
+}
+
+function enviarMensajeWhatsAppBridge(telefono, mensaje, waConfig) {
+  if (!waConfig.bridgeUrl || !waConfig.bridgeKey) {
+    throw new Error(
+      'WhatsApp Bridge no configurado. Agregue whatsapp_bridge_url y whatsapp_bridge_key en Configuracion.'
+    );
+  }
+
+  const response = UrlFetchApp.fetch(waConfig.bridgeUrl + '/api/send', {
+    method: 'post',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': waConfig.bridgeKey
+    },
+    payload: JSON.stringify({
+      phone: telefono,
+      message: String(mensaje)
+    }),
+    muteHttpExceptions: true
+  });
+
+  const statusCode = response.getResponseCode();
+  const responseText = response.getContentText();
+  let body = {};
+
+  try {
+    body = JSON.parse(responseText);
+  } catch (err) {
+    throw new Error('Respuesta inválida del WhatsApp Bridge');
+  }
+
+  if (statusCode >= 400 || body.success === false) {
+    throw new Error(body.error || ('WhatsApp Bridge error HTTP ' + statusCode));
+  }
+
+  return {
+    success: true,
+    messageId: body.messageId || null,
+    provider: 'bridge'
+  };
+}
+
+/**
+ * Envía un mensaje de texto vía WhatsApp Business Cloud API (Meta).
+ */
+function enviarMensajeWhatsAppMeta(telefono, mensaje, waConfig) {
+  if (!waConfig.token || !waConfig.phoneId) {
+    throw new Error(
+      'WhatsApp Meta API no configurada. Agregue whatsapp_token y whatsapp_phone_id en Configuracion.'
+    );
+  }
+
+  const url = 'https://graph.facebook.com/v21.0/' + waConfig.phoneId + '/messages';
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: telefono,
+    type: 'text',
+    text: {
+      preview_url: false,
+      body: String(mensaje)
+    }
+  };
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    headers: {
+      Authorization: 'Bearer ' + waConfig.token,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const statusCode = response.getResponseCode();
+  const responseText = response.getContentText();
+  let body = {};
+
+  try {
+    body = JSON.parse(responseText);
+  } catch (err) {
+    throw new Error('Respuesta inválida de WhatsApp API');
+  }
+
+  if (statusCode >= 400) {
+    const apiMessage = body.error && body.error.message ? body.error.message : responseText;
+    throw new Error('WhatsApp API: ' + apiMessage);
+  }
+
+  return {
+    success: true,
+    messageId: body.messages && body.messages[0] ? body.messages[0].id : null,
+    provider: 'meta'
+  };
+}
+
+/**
+ * Envía un mensaje según el modo configurado (bridge | meta).
+ */
+function enviarMensajeWhatsApp(telefono, mensaje) {
+  if (!mensaje || !String(mensaje).trim()) {
+    throw new Error('Mensaje vacío');
+  }
+
+  const waConfig = getWhatsAppConfig();
+  const phone = normalizeWhatsAppPhone(telefono);
+
+  if (waConfig.modo === 'bridge') {
+    return enviarMensajeWhatsAppBridge(phone, mensaje, waConfig);
+  }
+
+  if (waConfig.modo === 'meta') {
+    return enviarMensajeWhatsAppMeta(phone, mensaje, waConfig);
+  }
+
+  throw new Error(
+    'Envío automático desactivado. Configure whatsapp_modo=bridge o whatsapp_modo=meta en Configuracion.'
+  );
 }
 
 /**
@@ -2165,6 +3523,49 @@ function testNotificaciones() {
 // ========== ESTADÍSTICAS ==========
 
 /**
+ * Resumen del dashboard en una sola llamada (pedidos, cobranzas, stock, top productos).
+ */
+function getDashboardResumen(fecha, dias, limite) {
+  var fechaNorm = fecha ? normalizeFecha(fecha) : todayArgentina();
+  return {
+    fecha: fechaNorm,
+    pedidos: getPedidos(fechaNorm),
+    cobranzas: getCobranzas(),
+    stock: getStock(),
+    topProductos: getTopProductosVendidos(dias || 7, limite || 5)
+  };
+}
+
+/**
+ * Bootstrap: catálogo + dashboard en una sola ejecución GAS (comparte caché de hojas).
+ */
+function getAppBootstrap(fecha, dias, limite) {
+  var fechaNorm = fecha ? normalizeFecha(fecha) : todayArgentina();
+  var cacheKey = 'sc:boot:' + fechaNorm;
+  var cached = serverCacheGet(cacheKey);
+  if (cached) return cached;
+
+  var cobranzas = getCobranzas().filter(function(c) {
+    return normalizeAmount(c.saldo) > 0;
+  });
+  var result = {
+    clientes: getClientes(),
+    productos: getProductos(),
+    proveedores: getProveedores(),
+    diasPendientes: getDiasPendientes(),
+    dashboard: {
+      fecha: fechaNorm,
+      pedidos: getPedidos(fechaNorm),
+      cobranzas: cobranzas,
+      stock: getStock(),
+      topProductos: getTopProductosVendidos(dias || 7, limite || 5)
+    }
+  };
+  serverCacheSet(cacheKey, result, 90);
+  return result;
+}
+
+/**
  * Obtiene los productos más vendidos en los últimos X días
  * @param {number} dias - Número de días a analizar (por defecto 7)
  * @param {number} limite - Cantidad de productos a retornar (por defecto 5)
@@ -2172,57 +3573,44 @@ function testNotificaciones() {
  */
 function getTopProductosVendidos(dias = 7, limite = 5) {
   try {
-    const sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
-    const data = sheet.getDataRange().getValues();
-    const headers = data[0];
-    
-    // Calcular fecha límite (hace X días)
-    const fechaLimite = new Date();
+    var cached = readSheetValues(CONFIG.SHEETS.PEDIDOS);
+    var headers = cached.headers;
+
+    var fechaLimite = new Date();
     fechaLimite.setDate(fechaLimite.getDate() - dias);
-    
-    // Obtener productos para los nombres
-    const productos = getProductos();
-    const productosMap = {};
-    productos.forEach(p => { productosMap[p.id] = p; });
-    
-    // Encontrar índices de las columnas necesarias
-    const productoIdIndex = headers.indexOf('producto_id');
-    const cantidadIndex = headers.indexOf('cantidad');
-    const fechaIndex = headers.indexOf('fecha');
-    
-    // Contador de productos vendidos
-    const contadorProductos = {};
-    
-    // Recorrer todos los pedidos
-    for (let i = 1; i < data.length; i++) {
-      const fechaPedido = data[i][fechaIndex];
-      
-      // Verificar si el pedido está dentro del rango de fechas
-      let fechaPedidoDate;
+
+    var productos = getProductos();
+    var productosMap = {};
+    productos.forEach(function(p) { productosMap[p.id] = p; });
+
+    var productoIdIndex = headers.indexOf('producto_id');
+    var cantidadIndex = headers.indexOf('cantidad');
+    var fechaIndex = headers.indexOf('fecha');
+
+    var contadorProductos = {};
+
+    cached.rows.forEach(function(row) {
+      var fechaPedido = row[fechaIndex];
+      var fechaPedidoDate;
       if (typeof fechaPedido === 'string') {
-        // Formato 'YYYY-MM-DD'
-        const partes = fechaPedido.split('-');
+        var partes = fechaPedido.split('-');
         fechaPedidoDate = new Date(partes[0], partes[1] - 1, partes[2]);
       } else {
         fechaPedidoDate = new Date(fechaPedido);
       }
-      
-      if (fechaPedidoDate >= fechaLimite) {
-        const productoId = data[i][productoIdIndex];
-        if (!productoId || !productosMap[productoId]) continue;
 
-        const cantidad = parseFloat(data[i][cantidadIndex]) || 0;
-        if (!contadorProductos[productoId]) {
-          contadorProductos[productoId] = 0;
-        }
-        contadorProductos[productoId] += cantidad;
+      if (fechaPedidoDate >= fechaLimite) {
+        var productoId = row[productoIdIndex];
+        if (!productoId || !productosMap[productoId]) return;
+
+        var cantidad = parseFloat(row[cantidadIndex]) || 0;
+        contadorProductos[productoId] = (contadorProductos[productoId] || 0) + cantidad;
       }
-    }
-    
-    // Convertir a array y ordenar por cantidad
-    const productosArray = [];
-    for (let productoId in contadorProductos) {
-      const producto = productosMap[productoId];
+    });
+
+    var productosArray = [];
+    for (var productoId in contadorProductos) {
+      var producto = productosMap[productoId];
       if (producto) {
         productosArray.push({
           id: productoId,
@@ -2231,12 +3619,10 @@ function getTopProductosVendidos(dias = 7, limite = 5) {
         });
       }
     }
-    
-    // Ordenar descendente por cantidad y tomar los primeros 'limite'
-    productosArray.sort((a, b) => b.cantidad - a.cantidad);
-    
+
+    productosArray.sort(function(a, b) { return b.cantidad - a.cantidad; });
     return productosArray.slice(0, limite);
-    
+
   } catch (error) {
     Logger.log('❌ Error en getTopProductosVendidos: ' + error.toString());
     throw error;

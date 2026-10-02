@@ -3,14 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Luciano Cargas - Sistema de Gestión</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20261001enviados">
 </head>
 <body>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
     <!-- Indicador de carga global -->
-    <div id="global-loader" class="global-loader" style="display: none;">
-        <div class="loader-spinner"></div>
-        <p>Cargando...</p>
+    <div id="global-loader" class="global-loader" style="display: none;" aria-busy="true" aria-label="Cargando">
+        <div class="app-loader-spinner app-loader-spinner--lg"></div>
+        <p class="app-loader-label">Cargando...</p>
     </div>
 
     <!-- Navegación lateral -->
@@ -40,42 +44,50 @@
                             <span class="nav-flow-label">Pedidos del día</span>
                         </a>
                     </li>
+                    <li class="nav-flow-phase"><span>Cuando llegue</span></li>
                     <li class="nav-flow-item">
-                        <a href="#" data-page="proveedores-pedido" class="nav-link nav-flow-link">
+                        <a href="#" data-page="recepcion" class="nav-link nav-flow-link">
                             <span class="nav-flow-badge" aria-hidden="true">2</span>
-                            <span class="nav-flow-label">Pedido a proveedores</span>
+                            <span class="nav-flow-label">Confirmar recepción</span>
+                            <span class="nav-pendiente-badge" id="nav-badge-recepcion" hidden>0</span>
                         </a>
                     </li>
                     <li class="nav-flow-phase"><span>Fase 2</span></li>
                     <li class="nav-flow-item">
-                        <a href="#" data-page="recepcion" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">3</span>
-                            <span class="nav-flow-label">Confirmar recepción</span>
-                        </a>
-                    </li>
-                    <li class="nav-flow-item">
                         <a href="#" data-page="precios" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">4</span>
+                            <span class="nav-flow-badge" aria-hidden="true">3</span>
                             <span class="nav-flow-label">Precios al cliente</span>
                         </a>
                     </li>
-                    <li class="nav-flow-phase"><span>Fase 3</span></li>
                     <li class="nav-flow-item">
-                        <a href="#" data-page="cierre" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">5</span>
-                            <span class="nav-flow-label">Cerrar el día</span>
-                        </a>
-                    </li>
-                    <li class="nav-flow-item">
-                        <a href="#" data-page="cobranzas" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">6</span>
-                            <span class="nav-flow-label">Cobranzas pendientes</span>
+                        <a href="#" data-page="cobros-hoy" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">4</span>
+                            <span class="nav-flow-label">Cobranza al cliente</span>
                         </a>
                     </li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="pagos" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">5</span>
+                            <span class="nav-flow-label">Pagar al proveedor</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-phase"><span>Fase 3</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cobranzas" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">6</span>
+                            <span class="nav-flow-label">Cobranzas a clientes <span class="nav-flow-note">(pendientes)</span></span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="pagos-pendientes" class="nav-link nav-flow-link">
                             <span class="nav-flow-badge" aria-hidden="true">7</span>
-                            <span class="nav-flow-label">Pagos a proveedores</span>
+                            <span class="nav-flow-label">Pagos a proveedores <span class="nav-flow-note">(pendientes)</span></span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cierre" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">8</span>
+                            <span class="nav-flow-label">Cerrar el día</span>
                         </a>
                     </li>
                 </ul>
@@ -90,9 +102,10 @@
                 </a>
                 <ul class="nav-submenu">
                     <li><a href="#" data-page="clientes" class="nav-link">Clientes</a></li>
-                    <li><a href="#" data-page="productos" class="nav-link">Productos</a></li>
                     <li><a href="#" data-page="proveedores" class="nav-link">Proveedores</a></li>
+                    <li><a href="#" data-page="productos" class="nav-link">Productos</a></li>
                     <li><a href="#" data-page="stock" class="nav-link">Stock de Bebidas</a></li>
+                    <li><a href="#" data-page="mantenimiento" class="nav-link nav-link-danger">Limpiar datos</a></li>
                 </ul>
             </li>
             
@@ -105,6 +118,7 @@
                 </a>
                 <ul class="nav-submenu">
                     <li><a href="#" data-page="historial" class="nav-link">Historial de Días</a></li>
+                    <li><a href="#" data-page="caja" class="nav-link">Caja</a></li>
                 </ul>
             </li>
         </ul>
@@ -114,6 +128,7 @@
     <main class="main-content">
         <header class="header">
             <div class="header-left">
+                <button type="button" class="btn-menu" id="btn-menu" aria-label="Abrir menú">☰</button>
                 <h1 class="header-title">Luciano Cargas</h1>
                 <span class="header-subtitle" id="page-title">Dashboard</span>
             </div>
@@ -127,6 +142,7 @@
 
         <!-- Dashboard -->
         <div id="dashboard" class="page active">
+            <div id="dashboard-pendientes-banner" class="pendientes-banner" hidden></div>
             <!-- Gráfico de métricas -->
             <div class="metrics-section">
                 <div class="metrics-card">
@@ -145,14 +161,14 @@
                     <p class="card-label">Total</p>
                 </div>
                 <div class="dashboard-card" onclick="Navigation.navigateTo('cobranzas')">
-                    <h3>💵 Cobranzas pendientes</h3>
+                    <h3>💵 Cobranzas a clientes</h3>
                     <div class="card-value" id="dashboard-cobranzas-count">$0</div>
                     <p class="card-label">Por cobrar</p>
                 </div>
-                <div class="dashboard-card" onclick="Navigation.navigateTo('pagos')">
-                    <h3>💳 Proveedores a pagar</h3>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('pagos-pendientes')">
+                    <h3>💳 Pagos a proveedores</h3>
                     <div class="card-value" id="dashboard-pagos-count">$0</div>
-                    <p class="card-label">Saldo total</p>
+                    <p class="card-label">Por pagar</p>
                 </div>
                 <div class="dashboard-card" onclick="Navigation.navigateTo('stock')">
                     <h3>📦 Stock bajo</h3>
@@ -221,6 +237,7 @@
                         <tr>
                             <th>Nombre</th>
                             <th>Rubro</th>
+                            <th>Teléfono</th>
                             <th>Estado</th>
                             <th>Acciones</th>
                         </tr>
@@ -238,6 +255,15 @@
                 <h2>Pedidos del día</h2>
                 <button class="btn btn-primary" id="btn-agregar-pedido">Agregar pedido</button>
             </div>
+            <div class="dia-operativo-bar" data-dia-page="pedidos">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="pedidos-fecha-select">Pedido del día:</label>
+                    <select id="pedidos-fecha-select" class="form-control dia-operativo-select"></select>
+                    <span class="dia-operativo-estado" id="pedidos-estado-dia"></span>
+                </div>
+                <p class="dia-operativo-hint">Los pedidos se guardan con la fecha seleccionada. Podés trabajar pedidos de ayer si la mercadería llegó hoy.</p>
+            </div>
+            <div id="pedidos-envio-resumen" class="pedidos-envio-resumen" hidden></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -246,6 +272,8 @@
                             <th>Producto</th>
                             <th>Tipo</th>
                             <th>Cantidad</th>
+                            <th>Proveedor seleccionado</th>
+                            <th>Pedido a proveedor</th>
                             <th>Acciones</th>
                         </tr>
                     </thead>
@@ -255,21 +283,8 @@
                 </table>
             </div>
             <div class="page-actions">
-                <button class="btn btn-primary" id="btn-guardar-pedidos">Guardar</button>
-            </div>
-        </div>
-
-        <!-- Pedido a proveedores -->
-        <div id="proveedores-pedido" class="page">
-            <div class="page-header">
-                <h2>Pedido a proveedores</h2>
-            </div>
-            <div id="proveedores-pedido-container">
-                <!-- Se llena dinámicamente -->
-            </div>
-            <div class="page-actions">
-                <button class="btn btn-secondary" id="btn-imprimir-pedido">Imprimir</button>
-                <button class="btn btn-primary" id="btn-marcar-pedido">Marcar pedido</button>
+                <button class="btn btn-primary" id="btn-guardar-pedidos">Enviar pendientes a proveedores</button>
+                <button class="btn btn-secondary" id="btn-seguir-recepcion" type="button">Seguir a recepción</button>
             </div>
         </div>
 
@@ -278,6 +293,15 @@
             <div class="page-header">
                 <h2>Confirmación de lo que llegó</h2>
             </div>
+            <div class="dia-operativo-bar" data-dia-page="recepcion">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="recepcion-fecha-select">Pedido del día:</label>
+                    <select id="recepcion-fecha-select" class="form-control dia-operativo-select"></select>
+                    <span class="dia-operativo-estado" id="recepcion-estado-dia"></span>
+                </div>
+                <p class="dia-operativo-hint">Confirmá <strong>cada producto</strong> cuando llegue. Al confirmar se arma la lista de precios al cliente con lo que llegó. Los que falten podés confirmarlos otro día (poné 0 en "Llegó" si no vino).</p>
+                <p class="dia-operativo-hint">En <strong>Precio real</strong> poné lo que te cobró el proveedor <strong>por cada unidad del producto</strong> (caja, kg, etc.). Si pediste 10 cajas y llegaron 9, cargá el costo de <strong>una</strong> caja, no el total. No es el precio al cliente.</p>
+            </div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -285,8 +309,9 @@
                             <th>Producto</th>
                             <th>Pedido</th>
                             <th>Llegó</th>
-                            <th>Precio real</th>
+                            <th title="Costo por unidad que te cobró el proveedor">Precio real <span class="th-hint">(costo / u)</span></th>
                             <th>Proveedor</th>
+                            <th>Acción</th>
                         </tr>
                     </thead>
                     <tbody id="recepcion-tbody">
@@ -295,8 +320,9 @@
                 </table>
             </div>
             <div class="page-actions">
-                <button class="btn btn-secondary" id="btn-guardar-recepcion">Guardar</button>
-                <button class="btn btn-primary" id="btn-confirmar-recepcion">Confirmar</button>
+                <button class="btn btn-secondary" id="btn-guardar-recepcion">Guardar borrador</button>
+                <button class="btn btn-primary" id="btn-confirmar-recepcion-todo" type="button">Confirmar todos los completos</button>
+                <button class="btn btn-secondary" id="btn-seguir-precios" type="button">Seguir a precios</button>
             </div>
         </div>
 
@@ -304,6 +330,14 @@
         <div id="precios" class="page">
             <div class="page-header">
                 <h2>Precios al cliente</h2>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="precios">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="precios-fecha-select">Pedido del día:</label>
+                    <select id="precios-fecha-select" class="form-control dia-operativo-select"></select>
+                    <span class="dia-operativo-estado" id="precios-estado-dia"></span>
+                </div>
+                <p class="dia-operativo-hint">Asigná precios al cliente para el día del pedido, después de confirmar la recepción.</p>
             </div>
             
             <!-- Controles de filtro y comisión -->
@@ -315,7 +349,7 @@
                     </select>
                 </div>
                 <div class="form-group" style="flex: 1; min-width: 200px;">
-                    <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión por unidad:</label>
+                    <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión de reparto por unidad</label>
                     <input type="text" id="precios-comision" class="form-control" value="350" data-price-input="true" inputmode="numeric" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
                 </div>
                 <div class="form-group" style="display: flex; gap: 10px;">
@@ -336,6 +370,10 @@
                         <span id="resumen-total-productos">$0</span>
                     </div>
                     <div>
+                        <strong>Ganancia:</strong>
+                        <span id="resumen-ganancia">$0</span>
+                    </div>
+                    <div>
                         <strong>Comisión:</strong>
                         <span id="resumen-comision">$0</span>
                     </div>
@@ -353,8 +391,8 @@
                             <th>Cliente</th>
                             <th>Producto</th>
                             <th>Cant.</th>
-                            <th>Precio real</th>
-                            <th>Precio cliente</th>
+                            <th title="Lo que te cobró el proveedor por cada unidad">Precio real <span class="th-hint">c/u</span></th>
+                            <th title="Lo que le cobrás al cliente por cada unidad">Precio cliente <span class="th-hint">c/u</span></th>
                             <th>Ganancia</th>
                             <th>Total</th>
                         </tr>
@@ -367,10 +405,46 @@
                     </tfoot>
                 </table>
             </div>
+            <div class="page-actions precios-acciones">
+                <button class="btn btn-secondary" id="btn-generar-lista-precios" type="button" title="Arma la lista con lo que ya confirmaste que llegó">Armar lista</button>
+                <button class="btn btn-primary" id="btn-guardar-precios" type="button">Guardar precios</button>
+                <button class="btn btn-whatsapp" id="btn-enviar-whatsapp-precios" type="button">WhatsApp</button>
+                <button class="btn btn-secondary" id="btn-exportar-pdf-precios" type="button">PDF</button>
+                <button class="btn btn-secondary" id="btn-seguir-cobros" type="button">Seguir a cobranza</button>
+            </div>
+        </div>
+
+        <!-- Cobranza al cliente -->
+        <div id="cobros-hoy" class="page">
+            <div class="page-header">
+                <h2>Cobranza al cliente</h2>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="cobros-hoy">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label">Pedido del día:</label>
+                    <span class="dia-operativo-fecha" id="cobros-hoy-fecha"></span>
+                </div>
+                <p class="dia-operativo-hint">Registrá el cobro de cada cliente y seguí con el pago al proveedor. Lo que no se cobre queda en Cobranzas a clientes (pendientes).</p>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Total del día</th>
+                            <th>Cobrado</th>
+                            <th>Saldo</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cobros-hoy-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
             <div class="page-actions">
-                <button class="btn btn-secondary" id="btn-generar-lista-precios">Generar lista</button>
-                <button class="btn btn-primary" id="btn-guardar-precios">Guardar</button>
-                <button class="btn btn-success" id="btn-exportar-pdf-precios">Exportar PDF</button>
+                <button class="btn btn-secondary" id="btn-seguir-cobranzas" type="button">Seguir a pagar al proveedor</button>
             </div>
         </div>
 
@@ -379,18 +453,29 @@
             <div class="page-header">
                 <h2>Cierre del día</h2>
             </div>
+            <div class="dia-operativo-bar" data-dia-page="cierre">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="cierre-fecha-select">Pedido del día:</label>
+                    <select id="cierre-fecha-select" class="form-control dia-operativo-select"></select>
+                    <span class="dia-operativo-estado" id="cierre-estado-dia"></span>
+                </div>
+                    <p class="dia-operativo-hint">Último paso del día. Acá ves el resumen de lo que ya hiciste (recepción, precios, cobros y pagos) y recién ahí cerrás.</p>
+            </div>
             <div class="cierre-container">
                 <div class="cierre-panel">
-                    <h3>Resumen del cierre</h3>
-                    <ul id="cierre-resumen">
-                        <li>Cobranzas</li>
-                        <li>Proveedores</li>
-                        <li>Stock</li>
-                    </ul>
+                    <h3>Resumen de lo que ya hiciste</h3>
+                    <div class="cierre-resumen-wrap">
+                        <ul id="cierre-resumen">
+                            <li>Cobranzas del día</li>
+                            <li>Cobranzas pendientes</li>
+                            <li>Proveedores</li>
+                            <li>Stock</li>
+                        </ul>
+                    </div>
                 </div>
             </div>
             <div class="page-actions">
-                <button class="btn btn-secondary" id="btn-volver-cierre">Volver</button>
+                <button class="btn btn-secondary" id="btn-volver-cierre">Volver a pagos</button>
                 <button class="btn btn-primary" id="btn-cerrar-dia">Cerrar día</button>
             </div>
         </div>
@@ -398,7 +483,7 @@
         <!-- Cobranzas -->
         <div id="cobranzas" class="page">
             <div class="page-header">
-                <h2>Cobranzas pendientes</h2>
+                <h2>Cobranzas a clientes (pendientes)</h2>
             </div>
             <div class="table-container">
                 <table class="data-table">
@@ -419,20 +504,24 @@
             <div class="page-actions">
                 <button class="btn btn-secondary" id="btn-ver-cobranza">Ver</button>
                 <button class="btn btn-primary" id="btn-registrar-cobro">Registrar cobro</button>
+                <button class="btn btn-secondary" id="btn-seguir-pagos" type="button">Seguir a pagos pendientes</button>
             </div>
         </div>
 
         <!-- Pagos -->
         <div id="pagos" class="page">
             <div class="page-header">
-                <h2>Proveedores (saldos)</h2>
+                <h2 id="pagos-titulo">Pagar al proveedor</h2>
             </div>
+            <p class="dia-operativo-hint" id="pagos-hint">Pagá lo de hoy. Si queda saldo, lo vas a ver en Pagos a proveedores (pendientes).</p>
+            <div id="pagos-resumen" class="pagos-resumen" hidden></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
                         <tr>
                             <th>Proveedor</th>
-                            <th>Saldo</th>
+                            <th>Le debés</th>
+                            <th>Mercadería de hoy</th>
                             <th>Estado</th>
                             <th>Acciones</th>
                         </tr>
@@ -443,7 +532,7 @@
                 </table>
             </div>
             <div class="page-actions">
-                <button class="btn btn-primary" id="btn-registrar-pago">Registrar pago</button>
+                <button class="btn btn-secondary" id="btn-seguir-cierre" type="button">Seguir a cerrar el día</button>
             </div>
         </div>
 
@@ -474,6 +563,30 @@
             </div>
         </div>
 
+        <!-- Mantenimiento / Limpiar datos -->
+        <div id="mantenimiento" class="page">
+            <div class="page-header">
+                <h2>Limpiar todos los datos</h2>
+            </div>
+            <div class="danger-panel">
+                <div class="danger-panel-icon">⚠️</div>
+                <div class="danger-panel-body">
+                    <h3>Zona peligrosa</h3>
+                    <p>Esta acción <strong>elimina permanentemente</strong> todos los datos del sistema:</p>
+                    <ul class="danger-panel-list">
+                        <li>Clientes, productos y proveedores</li>
+                        <li>Pedidos, recepciones y precios</li>
+                        <li>Cobranzas, pagos, cierres e historial</li>
+                        <li>Stock y movimientos de caja</li>
+                        <li>Caché local del navegador (excepto tu sesión)</li>
+                        <li>Google Sheets — todas las hojas vuelven a quedar vacías con solo encabezados</li>
+                    </ul>
+                    <p class="danger-panel-warning">No se puede deshacer. Usalo solo para pruebas o empezar de cero.</p>
+                    <button type="button" class="btn btn-danger" id="btn-reset-todos-datos">Eliminar todos los datos</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Historial -->
         <div id="historial" class="page">
             <div class="page-header">
@@ -493,8 +606,41 @@
                     </tbody>
                 </table>
             </div>
+            <div id="historial-detalle" class="historial-detalle" hidden></div>
             <div class="page-actions">
                 <button class="btn btn-primary" id="btn-ver-dia">Ver día</button>
+            </div>
+        </div>
+
+        <div id="caja" class="page">
+            <div class="page-header">
+                <h2>Caja</h2>
+            </div>
+            <div class="dia-operativo-bar">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="caja-fecha">Fecha</label>
+                    <input type="date" id="caja-fecha" class="form-control">
+                </div>
+                <p class="dia-operativo-hint">Ingresos de cobranzas y egresos de pagos a proveedores.</p>
+            </div>
+            <div class="dashboard-grid caja-resumen">
+                <div class="dashboard-card"><h3>Ingresos del día</h3><div class="card-value money" id="caja-ingresos">$0</div></div>
+                <div class="dashboard-card"><h3>Egresos del día</h3><div class="card-value money money-alert" id="caja-egresos">$0</div></div>
+                <div class="dashboard-card"><h3>Saldo del día</h3><div class="card-value money" id="caja-saldo-dia">$0</div></div>
+                <div class="dashboard-card"><h3>Saldo acumulado</h3><div class="card-value money" id="caja-saldo-total">$0</div></div>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Tipo</th>
+                            <th>Detalle</th>
+                            <th>Monto</th>
+                            <th>Referencia</th>
+                        </tr>
+                    </thead>
+                    <tbody id="caja-tbody"></tbody>
+                </table>
             </div>
         </div>
     </main>
@@ -550,8 +696,19 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script src="auth.js"></script>
-    <script src="app.js"></script>
+    <nav class="bottom-nav" aria-label="Flujo del día">
+        <a href="#" data-page="pedidos" class="nav-link"><span>1</span>Pedidos</a>
+        <a href="#" data-page="recepcion" class="nav-link"><span>2</span>Recepción</a>
+        <a href="#" data-page="precios" class="nav-link"><span>3</span>Precios</a>
+        <a href="#" data-page="cobros-hoy" class="nav-link"><span>4</span>Cobro</a>
+        <a href="#" data-page="pagos" class="nav-link"><span>5</span>Pago</a>
+        <a href="#" data-page="cierre" class="nav-link"><span>6</span>Cierre</a>
+    </nav>
+    <script src="auth.js?v=20261002carga"></script>
+    <script src="services/whatsapp.js?v=20260927sinboton"></script>
+    <script src="services/pedidoProveedorService.js?v=20260927envio"></script>
+    <script src="services/precioClienteService.js?v=20260928manual"></script>
+    <script src="app.js?v=20261002carga"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {
