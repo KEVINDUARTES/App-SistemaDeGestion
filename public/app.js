@@ -29,8 +29,8 @@ const CacheManager = {
     cache: {},
     timestamps: {},
     DEBUG: false,
-    STORAGE_KEY: 'sg_cache_v4',
-    CATALOG_STORAGE_KEY: 'sg_catalog_v2',
+    STORAGE_KEY: 'sg_cache_v5',
+    CATALOG_STORAGE_KEY: 'sg_catalog_v3',
     _persistTimer: null,
 
     TTL: {
@@ -8306,27 +8306,31 @@ const Mantenimiento = {
         }, 'Eliminar todo');
     },
 
+    async _despuesDeBorrar() {
+        this.limpiarDatosLocales();
+        CacheManager.clear();
+        await DiaOperativo.refresh();
+        Utils.showSuccess('Todos los datos fueron eliminados. El sistema quedó limpio.');
+        Navigation.navigateTo('dashboard');
+    },
+
     async ejecutarReset() {
         Utils.showLoader();
         try {
             await API.resetAllDatos(this.CONFIRM_PHRASE);
-            this.limpiarDatosLocales();
-            await DiaOperativo.refresh();
-            Utils.showSuccess('Todos los datos fueron eliminados. El sistema quedó limpio.');
-            Navigation.navigateTo('dashboard');
+            await this._despuesDeBorrar();
         } catch (error) {
             const mensaje = String(error.message || '');
-            if (mensaje.includes('No se pudo conectar')) {
+            const puedeHaberBorrado = mensaje.includes('No se pudo conectar') || mensaje.includes('tardó más de');
+            if (puedeHaberBorrado) {
                 try {
+                    CacheManager.clear();
                     const [clientes, productos] = await Promise.all([
                         API.request('clientes', 'GET'),
                         API.request('productos', 'GET')
                     ]);
                     if ((clientes || []).length === 0 && (productos || []).length === 0) {
-                        this.limpiarDatosLocales();
-                        await DiaOperativo.refresh();
-                        Utils.showSuccess('Todos los datos fueron eliminados. El sistema quedó limpio.');
-                        Navigation.navigateTo('dashboard');
+                        await this._despuesDeBorrar();
                         return;
                     }
                 } catch (verifyError) {

@@ -670,9 +670,9 @@ function findInIdMap(map, id) {
 }
 
 /**
- * Vacía las filas de datos de una hoja y conserva el encabezado.
- * Sheets no deja borrar todas las filas que no están inmovilizadas,
- * así que se limpia el contenido y se deja una fila vacía debajo del título.
+ * Vacía el contenido de una hoja y conserva el encabezado.
+ * No borra las filas del fondo: Sheets no deja eliminar todas las que no
+ * están inmovilizadas, y sacarlas deja la hoja en dos filas.
  */
 function clearSheetDataRows(sheetName) {
   var sheet = getSheet(sheetName);
@@ -681,17 +681,48 @@ function clearSheetDataRows(sheetName) {
   if (lastRow > 1) {
     sheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
   }
-
-  var frozen = sheet.getFrozenRows();
-  var keep = Math.max(frozen + 1, 2);
-  var maxRow = sheet.getMaxRows();
-  if (maxRow > keep) {
-    sheet.deleteRows(keep + 1, maxRow - keep);
-  }
-  if (sheet.getLastRow() >= keep) {
-    sheet.getRange(keep, 1, 1, lastCol).clearContent();
+  var minimo = 100;
+  if (sheet.getMaxRows() < minimo) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), minimo - sheet.getMaxRows());
   }
   initializeSheet(sheet, sheetName);
+}
+
+function fechasDeHoja_(sheetName) {
+  var sheet = getSheet(sheetName);
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return [];
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var idx = headers.indexOf('fecha');
+  if (idx < 0) return [];
+  var values = sheet.getRange(2, idx + 1, lastRow - 1, 1).getValues();
+  var seen = {};
+  values.forEach(function(row) {
+    var fecha = normalizeFecha(row[0]);
+    if (fecha) seen[fecha] = true;
+  });
+  return Object.keys(seen);
+}
+
+function invalidateServerCacheTrasReset_(fechas) {
+  var keys = [
+    'sc:clientes', 'sc:productos', 'sc:proveedores_list', 'sc:saldos',
+    'sc:cobranzas', 'sc:stock', 'sc:dias', 'sc:medios_prov'
+  ];
+  var todas = {};
+  todas[todayArgentina()] = true;
+  (fechas || []).forEach(function(fecha) {
+    if (fecha) todas[fecha] = true;
+  });
+  Object.keys(todas).forEach(function(fecha) {
+    keys.push('sc:boot:' + fecha);
+    keys.push('sc:flujo:' + fecha);
+    keys.push('sc:pedidos:' + fecha);
+    keys.push('sc:recepcion:' + fecha);
+    keys.push('sc:precios:' + fecha);
+  });
+  serverCacheRemoveMany(keys);
 }
 
 /**
@@ -718,6 +749,19 @@ function resetAllDatos(confirmacion) {
     CONFIG.SHEETS.STOCK_BEBIDAS
   ];
 
+  var fechas = [];
+  [
+    CONFIG.SHEETS.PEDIDOS,
+    CONFIG.SHEETS.RECEPCION,
+    CONFIG.SHEETS.PRECIOS_CLIENTE,
+    CONFIG.SHEETS.CIERRE_DIA,
+    CONFIG.SHEETS.COBRANZAS,
+    CONFIG.SHEETS.PAGOS_PROVEEDORES,
+    CONFIG.SHEETS.CAJA_MOVIMIENTOS
+  ].forEach(function(sheetName) {
+    fechas = fechas.concat(fechasDeHoja_(sheetName));
+  });
+
   hojasOperativas.forEach(function(sheetName) {
     clearSheetDataRows(sheetName);
   });
@@ -727,7 +771,7 @@ function resetAllDatos(confirmacion) {
   initializeSheet(configSheet, CONFIG.SHEETS.CONFIGURACION);
 
   invalidateSheetCache();
-  invalidateAllServerCache();
+  invalidateServerCacheTrasReset_(fechas);
 
   return {
     success: true,
