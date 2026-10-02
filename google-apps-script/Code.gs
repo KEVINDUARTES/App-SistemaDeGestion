@@ -670,13 +670,26 @@ function findInIdMap(map, id) {
 }
 
 /**
- * Elimina todas las filas de datos de una hoja (conserva encabezados).
+ * Vacía las filas de datos de una hoja y conserva el encabezado.
+ * Sheets no deja borrar todas las filas que no están inmovilizadas,
+ * así que se limpia el contenido y se deja una fila vacía debajo del título.
  */
 function clearSheetDataRows(sheetName) {
   var sheet = getSheet(sheetName);
   var lastRow = sheet.getLastRow();
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
   if (lastRow > 1) {
-    sheet.deleteRows(2, lastRow - 1);
+    sheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
+  }
+
+  var frozen = sheet.getFrozenRows();
+  var keep = Math.max(frozen + 1, 2);
+  var maxRow = sheet.getMaxRows();
+  if (maxRow > keep) {
+    sheet.deleteRows(keep + 1, maxRow - keep);
+  }
+  if (sheet.getLastRow() >= keep) {
+    sheet.getRange(keep, 1, 1, lastCol).clearContent();
   }
   initializeSheet(sheet, sheetName);
 }
