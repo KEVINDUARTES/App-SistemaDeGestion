@@ -3167,7 +3167,11 @@ const Camiones = {
         const hit = this._clientesDelDia().find(c => c.id === String(clienteId));
         if (hit) return hit.nombre;
         const cliente = (AppState.clientes || []).find(c => String(c.id) === String(clienteId));
-        return cliente?.nombre || 'Cliente';
+        return cliente?.nombre || '';
+    },
+
+    _clienteConocido(clienteId) {
+        return !!this._nombreCliente(clienteId);
     },
 
     _libres(exceptoCamionId) {
@@ -3190,31 +3194,30 @@ const Camiones = {
     },
 
     _filas(camion) {
-        const ids = (camion.clientes || []).map(String);
+        const ids = new Set((camion.clientes || []).map(String).filter(id => this._clienteConocido(id)));
         const grupos = new Map();
         this._pedidos().forEach(pedido => {
             const clienteId = String(pedido.cliente_id || '');
-            if (!ids.includes(clienteId)) return;
+            if (!ids.has(clienteId)) return;
             const { nombreProveedor, proveedor } = Pedidos.resolverProveedorPedido(pedido);
             const proveedorId = String(pedido.proveedor_id || proveedor?.id || '');
-            const key = String(pedido.producto_id) + '|' + proveedorId;
+            const key = [pedido.producto_id, proveedorId, clienteId].join('|');
             if (!grupos.has(key)) {
                 grupos.set(key, {
                     producto: pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto'),
+                    cliente: this._nombreCliente(clienteId),
                     puesto: nombreProveedor,
-                    cantidades: {}
+                    cantidad: 0
                 });
             }
-            const grupo = grupos.get(key);
-            grupo.cantidades[clienteId] = (grupo.cantidades[clienteId] || 0) + (parseFloat(pedido.cantidad) || 0);
+            grupos.get(key).cantidad += parseFloat(pedido.cantidad) || 0;
         });
-        return [...grupos.values()].map(grupo => {
-            const total = ids.reduce((sum, id) => sum + (grupo.cantidades[id] || 0), 0);
-            return { ...grupo, total };
-        }).filter(grupo => grupo.total > 0).sort((a, b) => {
+        return [...grupos.values()].filter(fila => fila.cantidad > 0).sort((a, b) => {
             const puesto = a.puesto.localeCompare(b.puesto, 'es');
             if (puesto) return puesto;
-            return a.producto.localeCompare(b.producto, 'es');
+            const producto = a.producto.localeCompare(b.producto, 'es');
+            if (producto) return producto;
+            return a.cliente.localeCompare(b.cliente, 'es');
         });
     },
 
@@ -3231,16 +3234,16 @@ const Camiones = {
     },
 
     _tabla(camion) {
-        const clientes = (camion.clientes || []).map(id => ({ id: String(id), nombre: this._nombreCliente(id) }));
+        const tieneClientes = (camion.clientes || []).some(id => this._clienteConocido(id));
         const filas = this._filas(camion);
-        if (!clientes.length) return '<p class="camion-vacio">Sumá los clientes que van en este camión.</p>';
+        if (!tieneClientes) return '<p class="camion-vacio">Sumá los clientes que van en este camión.</p>';
         if (!filas.length) return '<p class="camion-vacio">Esos clientes no tienen pedidos en este día.</p>';
-        const cabeza = clientes.map(c => `<th class="num">${this._esc(c.nombre)}</th>`).join('');
+        const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
         const cuerpo = filas.map(fila => `
             <tr>
                 <td>${this._esc(fila.producto)}</td>
-                ${clientes.map(c => `<td class="num">${this._cant(fila.cantidades[c.id])}</td>`).join('')}
-                <td class="num"><strong>${this._cant(fila.total)}</strong></td>
+                <td>${this._esc(fila.cliente)}</td>
+                <td class="num"><strong>${this._cant(fila.cantidad)}</strong></td>
                 <td>${this._esc(fila.puesto)}</td>
             </tr>
         `).join('');
@@ -3250,12 +3253,19 @@ const Camiones = {
                     <thead>
                         <tr>
                             <th>Producto</th>
-                            ${cabeza}
-                            <th>Total</th>
+                            <th>Cliente</th>
+                            <th class="num">Cantidad</th>
                             <th>Puesto</th>
                         </tr>
                     </thead>
-                    <tbody>${cuerpo}</tbody>
+                    <tbody>
+                        ${cuerpo}
+                        <tr>
+                            <td colspan="2"><strong>Total</strong></td>
+                            <td class="num"><strong>${this._cant(total)}</strong></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
                 </table>
             </div>
         `;
@@ -3279,7 +3289,7 @@ const Camiones = {
         }
         const tarjetas = this.lista.map(camion => {
             const libres = this._libres(camion.id);
-            const chips = (camion.clientes || []).map(id => `
+            const chips = (camion.clientes || []).filter(id => this._clienteConocido(id)).map(id => `
                 <span class="camion-chip">${this._esc(this._nombreCliente(id))}
                     <button type="button" data-accion="quitar-cliente" data-camion="${camion.id}" data-cliente="${id}" aria-label="Sacar cliente">×</button>
                 </span>
@@ -3435,7 +3445,7 @@ const Camiones = {
         }
         const titulo = lista.length === 1 ? lista[0].nombre : 'todos los camiones';
         const content = `
-            <p class="modal-hint">Se arma el PDF de ${this._esc(titulo)} y se abre WhatsApp. En la computadora tenés que adjuntar el archivo que se descarga.</p>
+            <p class="modal-hint">Se arma el PDF de ${this._esc(titulo)}, con el mismo formato que el de precios, y se abre WhatsApp con ese archivo listo para enviar.</p>
             <div class="form-group">
                 <label for="modal-camion-telefono">Teléfono de quien carga</label>
                 <input type="tel" id="modal-camion-telefono" class="form-control" placeholder="261...">
@@ -3455,27 +3465,97 @@ const Camiones = {
         this.enviar(null);
     },
 
+    _fechaHoja() {
+        if (!AppState.currentDate) return '';
+        return new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR', {
+            weekday: 'long',
+            day: '2-digit',
+            month: 'long',
+            year: 'numeric'
+        });
+    },
+
     _documento(lista) {
-        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
-        const bloques = lista.map(camion => `
+        const fecha = this._fechaHoja();
+        const generado = new Date().toLocaleString('es-AR');
+        const bloques = lista.map(camion => {
+            const filas = this._filas(camion);
+            const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
+            const cuerpo = filas.map((fila, i) => `
+                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                    <td class="col-prod">${this._esc(fila.producto)}</td>
+                    <td>${this._esc(fila.cliente)}</td>
+                    <td class="col-cant">${this._esc(this._cant(fila.cantidad))}</td>
+                    <td>${this._esc(fila.puesto)}</td>
+                </tr>
+            `).join('');
+            return `
             <section class="hoja">
-                <h1>${this._esc(camion.nombre)}</h1>
-                <p>${this._esc(fecha)} · Luciano Cargas</p>
-                ${this._tabla(camion)}
-            </section>
-        `).join('');
-        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Carga de camiones</title>
+              <div class="doc-header">
+                <div class="brand">
+                  <h1>Luciano Cargas</h1>
+                  <p>Hoja de carga</p>
+                </div>
+                <div class="doc-meta">
+                  <strong>Fecha de carga</strong>
+                  ${this._esc(fecha)}<br>
+                  <span style="font-size:11px;">Generado: ${this._esc(generado)}</span>
+                </div>
+              </div>
+              <div class="cliente-box">
+                <div class="label">Camión</div>
+                <div class="name">${this._esc(camion.nombre)}</div>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Producto</th>
+                    <th>Cliente</th>
+                    <th class="col-cant">Cant.</th>
+                    <th>Puesto</th>
+                  </tr>
+                </thead>
+                <tbody>${cuerpo}</tbody>
+              </table>
+              <div class="totals-wrap">
+                <table class="totals-table">
+                  <tr class="saldo">
+                    <td>Total a cargar</td>
+                    <td>${this._esc(this._cant(total))}</td>
+                  </tr>
+                </table>
+              </div>
+              <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </section>`;
+        }).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Hoja de carga</title>
             <style>
-                body { font-family: Arial, sans-serif; color: #111; margin: 16px; }
-                h1 { margin: 0 0 4px; font-size: 22px; }
-                p { margin: 0 0 12px; }
-                table { width: 100%; border-collapse: collapse; font-size: 12px; }
-                th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
-                th.num, td.num { text-align: right; }
-                th { background: #e8eef8; }
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 13px; color: #1e293b; padding: 32px 40px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 16px 20px; border-radius: 8px; margin-bottom: 24px; }
+                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+                tbody td { padding: 11px 14px; border-bottom: 1px solid #e2e8f0; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f8fafc; }
+                .col-cant { text-align: center; font-weight: 600; width: 70px; }
+                .col-prod { font-weight: 500; }
+                .totals-wrap { margin-top: 20px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 280px; }
+                .totals-table td { padding: 10px 14px; font-size: 16px; font-weight: 700; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; border: none; }
+                .totals-table td:last-child { text-align: right; }
+                .footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
                 .hoja { break-after: page; page-break-after: always; }
                 .hoja:last-child { break-after: auto; page-break-after: auto; }
-                @media print { body { margin: 8mm; } }
+                @media print { body { padding: 20px; } @page { margin: 15mm; } }
             </style></head><body>${bloques}
             <script>window.addEventListener('load', function(){ setTimeout(function(){ window.print(); }, 200); });<\/script>
             </body></html>`;
@@ -3483,7 +3563,7 @@ const Camiones = {
 
     async _enviarPdf(lista, telefono) {
         const JsPDF = await Precios._cargarJsPdf();
-        const doc = new JsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+        const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
         lista.forEach((camion, indice) => {
             if (indice > 0) doc.addPage();
             this._dibujarPdf(doc, camion);
@@ -3496,60 +3576,127 @@ const Camiones = {
         const texto = lista.length === 1
             ? `Te mando la carga de ${lista[0].nombre}.`
             : 'Te mando la carga de los camiones.';
-        try {
-            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
-                await navigator.share({ files: [archivo], title: 'Carga de camiones', text: texto });
-                Utils.avisar('PDF listo. Elegí WhatsApp para enviarlo.');
-                return;
-            }
-        } catch (error) {
-            if (error && error.name === 'AbortError') return;
-        }
+        const compartido = await this._compartirPdf(archivo, texto);
+        if (compartido === 'ok' || compartido === 'cancelado') return;
+        WhatsAppService.openChat(telefono, texto);
         doc.save(nombre);
-        WhatsAppService.openChat(telefono, texto + ' Va en el PDF.');
-        Utils.avisar('Se descargó el PDF. Adjuntalo en el chat.');
+        Utils.avisar('WhatsApp abierto. En esta computadora el PDF se descarga al lado: arrastralo al chat para enviarlo.');
+    },
+
+    async _compartirPdf(archivo, texto) {
+        if (!navigator.share) return 'no';
+        const datos = { files: [archivo], title: 'Hoja de carga', text: texto };
+        if (navigator.canShare && !navigator.canShare(datos)) return 'no';
+        try {
+            await navigator.share(datos);
+            return 'ok';
+        } catch (error) {
+            if (error && error.name === 'AbortError') return 'cancelado';
+            return 'no';
+        }
     },
 
     _dibujarPdf(doc, camion) {
-        const clientes = (camion.clientes || []).map(id => ({ id: String(id), nombre: this._nombreCliente(id) }));
+        const pageW = doc.internal.pageSize.getWidth();
+        const pageH = doc.internal.pageSize.getHeight();
+        const m = 14;
+        const ancho = pageW - (m * 2);
         const filas = this._filas(camion);
-        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
-        doc.setFontSize(16);
-        doc.text(String(camion.nombre || 'Camión'), 10, 14);
+        const fecha = this._fechaHoja();
+        const azul = [26, 115, 232];
+        const tinta = [30, 41, 59];
+        const muted = [100, 116, 139];
+        const cols = [
+            { titulo: 'PRODUCTO', ancho: 62, align: 'left', campo: 'producto' },
+            { titulo: 'CLIENTE', ancho: 58, align: 'left', campo: 'cliente' },
+            { titulo: 'CANT.', ancho: 22, align: 'center', campo: 'cantidad' },
+            { titulo: 'PUESTO', ancho: 40, align: 'left', campo: 'puesto' }
+        ];
+
+        doc.setFillColor(...azul);
+        doc.rect(0, 0, pageW, 34, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(20);
+        doc.text('Luciano Cargas', m, 15);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(11);
+        doc.text('Hoja de carga', m, 23);
         doc.setFontSize(10);
-        doc.text(String(fecha || ''), 10, 20);
-        const inicio = 28;
-        const anchoNombre = 48;
-        const anchoPuesto = 32;
-        const anchoTotal = 16;
-        const utiles = 277 - anchoNombre - anchoPuesto - anchoTotal;
-        const anchoCliente = clientes.length ? Math.max(12, utiles / clientes.length) : utiles;
-        let y = inicio;
+        doc.text(String(fecha || ''), pageW - m, 14, { align: 'right' });
+        doc.text(String(camion.nombre || 'Camión'), pageW - m, 21, { align: 'right' });
+
+        doc.setFillColor(239, 246, 255);
+        doc.roundedRect(m, 42, ancho, 20, 2, 2, 'F');
+        doc.setFillColor(...azul);
+        doc.rect(m, 42, 1.6, 20, 'F');
+        doc.setTextColor(...muted);
+        doc.setFontSize(8);
+        doc.text('CAMIÓN', m + 6, 50);
+        doc.setTextColor(...tinta);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(14);
+        doc.text(String(camion.nombre || 'Camión'), m + 6, 57);
+
+        let y = 70;
         const pintarCabeza = () => {
+            doc.setFillColor(...azul);
+            doc.rect(m, y, ancho, 9, 'F');
+            doc.setTextColor(255, 255, 255);
+            doc.setFont('helvetica', 'bold');
             doc.setFontSize(8);
-            doc.text('Producto', 10, y);
-            clientes.forEach((cliente, index) => {
-                doc.text(String(cliente.nombre).slice(0, 12), 10 + anchoNombre + (index * anchoCliente), y);
+            let x = m;
+            cols.forEach(col => {
+                const tx = col.align === 'center' ? x + (col.ancho / 2) : x + 3;
+                doc.text(col.titulo, tx, y + 6, { align: col.align === 'center' ? 'center' : 'left' });
+                x += col.ancho;
             });
-            doc.text('Total', 10 + anchoNombre + (clientes.length * anchoCliente), y);
-            doc.text('Puesto', 10 + anchoNombre + (clientes.length * anchoCliente) + anchoTotal, y);
-            y += 5;
+            y += 9;
+        };
+        const valorFila = (fila, campo) => {
+            if (campo === 'cantidad') return this._cant(fila.cantidad);
+            return String(fila[campo] || '');
         };
         pintarCabeza();
-        filas.forEach(fila => {
-            if (y > 190) {
+        filas.forEach((fila, indice) => {
+            if (y > pageH - 32) {
                 doc.addPage();
                 y = 16;
                 pintarCabeza();
             }
-            doc.text(String(fila.producto).slice(0, 28), 10, y);
-            clientes.forEach((cliente, index) => {
-                doc.text(this._cant(fila.cantidades[cliente.id]), 10 + anchoNombre + (index * anchoCliente), y);
+            if (indice % 2 === 1) {
+                doc.setFillColor(248, 250, 252);
+                doc.rect(m, y, ancho, 8, 'F');
+            }
+            doc.setDrawColor(226, 232, 240);
+            doc.line(m, y + 8, m + ancho, y + 8);
+            doc.setTextColor(...tinta);
+            doc.setFont('helvetica', 'normal');
+            doc.setFontSize(9);
+            let x = m;
+            cols.forEach(col => {
+                const texto = doc.splitTextToSize(valorFila(fila, col.campo), col.ancho - 6)[0] || '';
+                const tx = col.align === 'center' ? x + (col.ancho / 2) : x + 3;
+                doc.text(texto, tx, y + 5.4, { align: col.align === 'center' ? 'center' : 'left' });
+                x += col.ancho;
             });
-            doc.text(this._cant(fila.total), 10 + anchoNombre + (clientes.length * anchoCliente), y);
-            doc.text(String(fila.puesto).slice(0, 16), 10 + anchoNombre + (clientes.length * anchoCliente) + anchoTotal, y);
-            y += 5;
+            y += 8;
         });
+
+        const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
+        y += 8;
+        doc.setFillColor(...azul);
+        doc.roundedRect(pageW - m - 74, y, 74, 12, 1.5, 1.5, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(12);
+        doc.text('Total a cargar', pageW - m - 70, y + 7.6);
+        doc.text(this._cant(total), pageW - m - 4, y + 7.6, { align: 'right' });
+
+        doc.setTextColor(...muted);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        doc.text('Documento generado por el Sistema de Gestión Luciano Cargas', pageW / 2, pageH - 10, { align: 'center' });
     }
 };
 
@@ -3589,7 +3736,7 @@ const Pedidos = {
         try {
             const flujo = await DataLoader.getFlujo(fecha);
             if (AppState.currentDate !== fecha) return;
-            AppState.pedidos = flujo.pedidos || [];
+            AppState.pedidos = this._conservarPendientes(flujo.pedidos || []);
             AppState.fechaCargada = fecha;
             this.aplicarEnviadosLocales();
             this.render();
@@ -3597,6 +3744,24 @@ const Pedidos = {
             console.error('Error loading pedidos:', error);
             Utils.hideLoader(tbody);
         }
+    },
+
+    _conservarPendientes(servidor) {
+        const lista = Array.isArray(servidor) ? servidor.slice() : [];
+        const ids = new Set(lista.map(pedido => String(pedido.id)));
+        (AppState.pedidos || []).forEach(pedido => {
+            if (!String(pedido.id).startsWith('local-')) return;
+            if (ids.has(String(pedido.id))) return;
+            lista.push(pedido);
+        });
+        return lista;
+    },
+
+    encontrarPedido(pedidoId) {
+        const id = String(pedidoId);
+        return (AppState.pedidos || []).find(pedido =>
+            String(pedido.id) === id || String(pedido.idLocal) === id
+        ) || null;
     },
     
     render() {
@@ -3739,6 +3904,12 @@ const Pedidos = {
         if (!AppState.productos || AppState.productos.length === 0) {
             promises.push(API.getProductos().then(data => { AppState.productos = data; }));
         }
+
+        if (!AppState.proveedores?.length) {
+            const cache = CacheManager.peek('proveedores');
+            if (Array.isArray(cache)) AppState.proveedores = cache;
+            else promises.push(API.getProveedores().then(data => { AppState.proveedores = data; }));
+        }
         
         if (promises.length > 0) {
             await Promise.all(promises);
@@ -3746,6 +3917,7 @@ const Pedidos = {
         
         const clientes = AppState.clientes;
         const productos = AppState.productos;
+        const proveedores = this.getProveedoresActivos(AppState.proveedores);
         
         const content = `
             <div class="form-group">
@@ -3763,6 +3935,14 @@ const Pedidos = {
                 </select>
             </div>
             <div class="form-group">
+                <label>Proveedor</label>
+                <select id="modal-proveedor" class="form-control">
+                    <option value="">Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('')}
+                </select>
+                <small class="modal-hint">Al elegir el producto se marca su proveedor habitual. Podés cambiarlo para este pedido.</small>
+            </div>
+            <div class="form-group">
                 <label>Cantidad</label>
                 <input type="number" id="modal-cantidad" class="form-control" min="1" value="1">
             </div>
@@ -3778,9 +3958,10 @@ const Pedidos = {
                 
                 const clienteId = document.getElementById('modal-cliente').value;
                 const productoId = document.getElementById('modal-producto').value;
+                const proveedorId = document.getElementById('modal-proveedor').value;
                 const cantidad = parseInt(document.getElementById('modal-cantidad').value);
                 
-                console.log('🔵 Datos del pedido:', { clienteId, productoId, cantidad });
+                console.log('🔵 Datos del pedido:', { clienteId, productoId, proveedorId, cantidad });
                 
                 if (!clienteId || !productoId || !cantidad) {
                     Utils.showError('Complete todos los campos');
@@ -3798,6 +3979,7 @@ const Pedidos = {
                 const tempId = 'local-' + Date.now();
                 const nuevoPedido = {
                     id: tempId,
+                    idLocal: tempId,
                     fecha: AppState.currentDate,
                     cliente_id: clienteId,
                     producto_id: productoId,
@@ -3805,6 +3987,7 @@ const Pedidos = {
                     producto_nombre: producto.nombre,
                     tipo: producto.tipo,
                     cantidad,
+                    proveedor_id: proveedorId,
                     enviado: false
                 };
                 Utils.upsertInList(AppState.pedidos, nuevoPedido);
@@ -3823,20 +4006,26 @@ const Pedidos = {
                     cliente_id: clienteId,
                     producto_id: productoId,
                     tipo: producto.tipo,
-                    cantidad
+                    cantidad,
+                    proveedor_id: proveedorId
                 };
                 Utils.enSegundoPlano(async () => {
                     const result = await API.createPedido(payload);
                     const guardado = (AppState.pedidos || []).find(p => p.id === tempId);
                     if (!guardado) return;
                     guardado.id = result.id || tempId;
+                    guardado.idLocal = tempId;
                     Object.assign(guardado, result, {
                         cliente_nombre: nuevoPedido.cliente_nombre,
                         producto_nombre: nuevoPedido.producto_nombre,
                         tipo: nuevoPedido.tipo,
-                        cantidad
+                        cantidad,
+                        proveedor_id: proveedorId,
+                        id: result.id || tempId,
+                        idLocal: tempId
                     });
                     CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+                    if (AppState.currentPage === 'pedidos') this.render();
                 }, () => {
                     Utils.removeFromList(AppState.pedidos, tempId);
                     CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
@@ -3848,10 +4037,21 @@ const Pedidos = {
                 Utils.showError('Error al crear pedido: ' + error.message);
             }
         });
+
+        const productoSelect = document.getElementById('modal-producto');
+        const proveedorSelect = document.getElementById('modal-proveedor');
+        productoSelect?.addEventListener('change', () => {
+            const producto = productos.find(p => String(p.id) === String(productoSelect.value));
+            const habitual = producto?.proveedor_default || '';
+            if (!proveedorSelect) return;
+            proveedorSelect.value = [...proveedorSelect.options].some(opcion => opcion.value === String(habitual))
+                ? String(habitual)
+                : '';
+        });
     },
     
     async edit(id) {
-        const pedido = AppState.pedidos.find(p => p.id === id);
+        const pedido = this.encontrarPedido(id);
         if (!pedido) {
             Utils.showError('Pedido no encontrado');
             return;
@@ -3942,18 +4142,23 @@ const Pedidos = {
     },
     
     async delete(id) {
+        const pedido = this.encontrarPedido(id);
+        if (!pedido) return;
+        const idReal = pedido.id;
         document.getElementById('modal-overlay')?.classList.remove('active');
         const confirmar = await Utils.showConfirm('¿Está seguro de eliminar este pedido?');
         if (!confirmar) return;
         
-        const anterior = (AppState.pedidos || []).find(p => String(p.id) === String(id));
-        Utils.removeFromList(AppState.pedidos, id);
+        const anterior = { ...pedido };
+        Utils.removeFromList(AppState.pedidos, idReal);
         CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
         this.render();
         Utils.avisar('Pedido eliminado');
         DiaOperativo.refreshSoon();
 
-        Utils.enSegundoPlano(() => API.deletePedido(id), () => {
+        if (String(idReal).startsWith('local-')) return;
+
+        Utils.enSegundoPlano(() => API.deletePedido(idReal), () => {
             if (anterior) Utils.upsertInList(AppState.pedidos, anterior);
             CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
             if (AppState.currentPage === 'pedidos') Pedidos.render();
@@ -4061,7 +4266,7 @@ const Pedidos = {
     },
 
     abrirAcciones(pedidoId) {
-        const pedido = (AppState.pedidos || []).find(p => String(p.id) === String(pedidoId));
+        const pedido = this.encontrarPedido(pedidoId);
         if (!pedido) {
             Utils.showError('Pedido no encontrado');
             return;
@@ -4151,7 +4356,7 @@ const Pedidos = {
         try {
             await this.ensureDatosProveedor();
 
-            const pedido = AppState.pedidos.find(p => String(p.id) === String(pedidoId));
+            const pedido = this.encontrarPedido(pedidoId);
             if (!pedido) {
                 Utils.showError('Pedido no encontrado');
                 return;
@@ -4173,7 +4378,7 @@ const Pedidos = {
         try {
             await this.ensureDatosProveedor();
 
-            const pedido = AppState.pedidos.find(p => String(p.id) === String(pedidoId));
+            const pedido = this.encontrarPedido(pedidoId);
             if (!pedido) {
                 Utils.showError('Pedido no encontrado');
                 return;
