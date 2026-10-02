@@ -1734,6 +1734,31 @@ function recepcionProductoConfirmada(rec) {
   return true;
 }
 
+/** Lo que no llegó no se cobra: no hace falta precio al cliente. */
+function productoNoLlego(rec) {
+  return recepcionProductoConfirmada(rec) && (Number(rec.llego) || 0) <= 0;
+}
+
+function recepcionDeProducto(recepcionMap, productoId) {
+  if (!recepcionMap) return null;
+  var directo = recepcionMap[String(productoId)];
+  if (directo) return directo;
+  var found = null;
+  Object.keys(recepcionMap).forEach(function(k) {
+    if (idsMatch(k, productoId)) found = recepcionMap[k];
+  });
+  return found;
+}
+
+function pedidoTienePrecioCliente(pedido, precios, rec) {
+  if (productoNoLlego(rec)) return true;
+  return (precios || []).some(function(pr) {
+    return idsMatch(pr.cliente_id, pedido.cliente_id) &&
+      idsMatch(pr.producto_id, pedido.producto_id) &&
+      normalizeAmount(pr.precio_cliente) > 0;
+  });
+}
+
 /**
  * Confirma la recepción de un solo producto (guarda cantidad/precio y marca confirmado).
  */
@@ -2017,11 +2042,13 @@ function cerrarDia(fecha) {
     // Validar precios cliente
     Logger.log('🔍 [CIERRE] Validando precios cliente...');
     const pedidos = getPedidos(fecha);
-    const preciosFaltantes = pedidos.filter(p => {
-      const precio = precios.find(pr => 
-        pr.cliente_id === p.cliente_id && pr.producto_id === p.producto_id
-      );
-      return !precio || !precio.precio_cliente;
+    var recepcionMapCierrePrecio = {};
+    recepciones.forEach(function(r) {
+      recepcionMapCierrePrecio[String(r.producto_id)] = r;
+    });
+    const preciosFaltantes = pedidos.filter(function(p) {
+      var rec = recepcionDeProducto(recepcionMapCierrePrecio, p.producto_id);
+      return !pedidoTienePrecioCliente(p, precios, rec);
     });
     
     if (preciosFaltantes.length > 0) {
@@ -2856,11 +2883,7 @@ function calcularEstadoDiaDesdeCache(pedidos, recepcionMap, preciosList) {
   });
 
   var preciosOk = pedidos.every(function(p) {
-    return preciosList.some(function(pr) {
-      return idsMatch(pr.cliente_id, p.cliente_id) &&
-        idsMatch(pr.producto_id, p.producto_id) &&
-        pr.precio_cliente;
-    });
+    return pedidoTienePrecioCliente(p, preciosList, recepcionDeProducto(recepcionMap, p.producto_id));
   });
 
   var estado = 'recepcion_pendiente';
@@ -2913,11 +2936,7 @@ function calcularEstadoDia(fecha, pedidos) {
 
   var precios = getPreciosCliente(fecha);
   var preciosOk = pedidos.every(function(p) {
-    return precios.some(function(pr) {
-      return pr.cliente_id === p.cliente_id &&
-        pr.producto_id === p.producto_id &&
-        pr.precio_cliente;
-    });
+    return pedidoTienePrecioCliente(p, precios, recepcionDeProducto(recepcionMap, p.producto_id));
   });
 
   var estado = 'recepcion_pendiente';

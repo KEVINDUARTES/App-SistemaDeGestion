@@ -245,6 +245,11 @@ const DiaOperativo = {
         return this.diasPendientes.find(d => d.fecha === fecha) || null;
     },
 
+    diaCerrado(fecha) {
+        const info = this.getDiaInfo(fecha || this.workDate || AppState.currentDate);
+        return !!(info && info.estado === 'cerrado');
+    },
+
     init() {
         if (this._initialized) return;
         document.querySelectorAll('.dia-operativo-select').forEach(select => {
@@ -325,12 +330,9 @@ const DiaOperativo = {
         this.renderSelectors();
         this.renderEstadoPanels();
 
-        DataLoader.prefetchFlujo(fecha);
-
         if (!options.skipReload && AppState.currentPage) {
-            const flowPages = ['pedidos', 'recepcion', 'precios', 'cierre'];
+            const flowPages = ['pedidos', 'recepcion', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
             if (flowPages.includes(AppState.currentPage)) {
-                DataLoader.invalidateFlujo(fecha);
                 await Navigation.loadPageData(AppState.currentPage);
             }
         }
@@ -1098,21 +1100,46 @@ const API = {
             let timeoutId = null;
             let settledRequest = false;
 
-            const cleanup = () => {
-                delete window[callbackName];
+            const cleanup = (keepCallback = false) => {
                 if (timeoutId) clearTimeout(timeoutId);
                 timeoutId = null;
+                if (keepCallback) return;
+                delete window[callbackName];
                 if (scriptTag) {
                     scriptTag.onerror = null;
                     if (scriptTag.parentNode) scriptTag.parentNode.removeChild(scriptTag);
                 }
             };
 
+            const guardarTarde = (response) => {
+                const ok = response && (response.success === true || response.success === 'true');
+                const payload = ok ? (response.data || response) : null;
+                if (!payload || endpoint !== 'flujo/dia' || !data || !data.fecha) return;
+                const fechaResp = data.fecha;
+                CacheManager.set(`flujo:${fechaResp}`, payload);
+                if (payload.pedidos) CacheManager.set(`pedidos:${fechaResp}`, payload.pedidos);
+                if (payload.recepcion) CacheManager.set(`recepcion:${fechaResp}`, payload.recepcion);
+                if (payload.precios) CacheManager.set(`precios:${fechaResp}`, payload.precios);
+                if (AppState.currentPage === 'pedidos' && AppState.currentDate === fechaResp) {
+                    AppState.pedidos = payload.pedidos || [];
+                    Pedidos.aplicarEnviadosLocales();
+                    Pedidos.render();
+                    Utils.hideLoader(document.getElementById('pedidos-tbody'));
+                }
+            };
+
             const fail = (error, allowRetry) => {
                 if (settledRequest) return;
                 settledRequest = true;
-                cleanup();
                 const esTimeout = String(error && error.message || '').includes('tardó más de');
+                cleanup(esTimeout);
+                if (esTimeout) {
+                    window[callbackName] = (response) => {
+                        delete window[callbackName];
+                        if (scriptTag && scriptTag.parentNode) scriptTag.parentNode.removeChild(scriptTag);
+                        guardarTarde(response);
+                    };
+                }
                 if (allowRetry && !esTimeout && method === 'GET' && retryCount < 1) {
                     setTimeout(() => {
                         this._executeRequest(endpoint, method, data, retryCount + 1)
@@ -1147,7 +1174,11 @@ const API = {
                 const hint = endpoint === 'cierre'
                     ? ' El cierre puede tardar. Revisá la URL en auth.js y volvé a publicar Code.gs.'
                     : ' Verificá que el Apps Script esté publicado (Deploy → Manage Deployments) y que la URL en auth.js sea correcta.';
-                fail(new Error('No se pudo conectar con el servidor.' + hint), true);
+                // El redirect de Google suele disparar onerror antes de que llegue el callback.
+                setTimeout(() => {
+                    if (settledRequest) return;
+                    fail(new Error('No se pudo conectar con el servidor.' + hint), true);
+                }, 4000);
             };
 
             timeoutId = setTimeout(() => {
@@ -1518,7 +1549,7 @@ const API = {
         const cached = CacheManager.get(cacheKey);
         if (cached) return cached;
 
-        const result = await this.request('flujo/dia', 'GET', { fecha });
+        const result = await this.request('flujo/dia', 'GET', { fecha, __timeout: 90000 });
         CacheManager.set(cacheKey, result);
         if (result.pedidos) CacheManager.set(`pedidos:${fecha}`, result.pedidos);
         if (result.recepcion) CacheManager.set(`recepcion:${fecha}`, result.recepcion);
@@ -1893,7 +1924,7 @@ const Navigation = {
     
     async loadPageData(page) {
         try {
-            const flowPages = ['pedidos', 'recepcion', 'precios', 'cobros-hoy', 'cierre'];
+            const flowPages = ['pedidos', 'recepcion', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
             if (flowPages.includes(page)) {
                 DiaOperativo.renderSelectors();
                 DiaOperativo.renderEstadoPanels();
@@ -2901,25 +2932,27 @@ const Pedidos = {
 
         const fecha = AppState.currentDate;
         const cached = CacheManager.get(`pedidos:${fecha}`) || CacheManager.get(`flujo:${fecha}`)?.pedidos;
-        const hasStale = AppState.pedidos.length > 0 || cached;
-        if (hasStale) {
-            if (!AppState.pedidos.length && cached) AppState.pedidos = cached;
+        if (Array.isArray(cached)) {
+            AppState.pedidos = cached;
             this.aplicarEnviadosLocales();
             this.render();
         } else {
+            AppState.pedidos = [];
             Utils.showLoader(tbody);
         }
 
         try {
+            const flujoPromise = DataLoader.getFlujo(fecha);
             await this.ensureDatosProveedor();
-            const flujo = await DataLoader.getFlujo(fecha);
+            const flujo = await flujoPromise;
+            if (AppState.currentDate !== fecha) return;
             AppState.pedidos = flujo.pedidos || [];
             this.aplicarEnviadosLocales();
             this.render();
         } catch (error) {
             console.error('Error loading pedidos:', error);
-            if (!hasStale) Utils.hideLoader(tbody);
-            if (AppState.currentPage === 'pedidos') {
+            Utils.hideLoader(tbody);
+            if (AppState.currentPage === 'pedidos' && AppState.currentDate === fecha && !Array.isArray(cached)) {
                 Utils.showError('Error al cargar pedidos');
             }
         }
@@ -5307,12 +5340,15 @@ const Cierre = {
 
         const pedidos = AppState.pedidos || [];
         const conPrecio = (precios || []).filter(p => Utils.parsePrice(p.precio_cliente) > 0);
-        const faltantes = pedidos.filter(pedido =>
-            !conPrecio.some(pr =>
+        const faltantes = pedidos.filter(pedido => {
+            const rec = (AppState.recepcion || []).find(r => String(r.producto_id) === String(pedido.producto_id));
+            const confirmado = rec && (rec.confirmado === true || rec.confirmado === 'true' || rec.confirmado === 1);
+            if (confirmado && (Number(rec.llego) || 0) <= 0) return false;
+            return !conPrecio.some(pr =>
                 String(pr.cliente_id) === String(pedido.cliente_id) &&
                 String(pr.producto_id) === String(pedido.producto_id)
-            )
-        );
+            );
+        });
 
         const partes = [];
         if (info && !info.recepcion_confirmada) {
@@ -5606,6 +5642,9 @@ const Cobranzas = {
         }
 
         try {
+            if (!AppState.clientes.length) {
+                AppState.clientes = await API.getClientes().catch(() => []);
+            }
             const todas = await API.getCobranzas();
             AppState.cobranzas = todas.filter(c => Utils.isCobranzaPendiente(c));
             this.render();
@@ -5626,25 +5665,155 @@ const Cobranzas = {
         
         if (AppState.cobranzas.length === 0) {
             tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 30px; color: #666;">' +
-                '<div style="margin-bottom: 10px;">💰 No hay cobranzas pendientes</div>' +
-                '<div style="font-size: 12px; color: #999;">Las cobranzas se generan al cerrar el día</div>' +
+                'No hay cobranzas pendientes.' +
                 '</td></tr>';
             return;
         }
         
         AppState.cobranzas.forEach(cobranza => {
             const tr = document.createElement('tr');
+            const saldo = Utils.getCobranzaSaldo(cobranza);
+            const cliente = this._clienteDe(cobranza);
+            const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
+            const btnWhatsApp = sinTelefono
+                ? '<button class="btn btn-whatsapp btn-sm" type="button" disabled title="Falta teléfono">WhatsApp</button>'
+                : `<button class="btn btn-whatsapp btn-sm" type="button" onclick="Cobranzas.enviarWhatsApp('${cobranza.id}')">WhatsApp</button>`;
             tr.innerHTML = `
-                <td>${Utils.formatDate(cobranza.fecha)}</td>
-                <td>${Utils.nombreCatalogo(cobranza, 'cliente')}</td>
-                <td>${Utils.formatCurrency(Utils.getCobranzaSaldo(cobranza))}</td>
-                <td><span class="status-badge status-pendiente">Pendiente</span></td>
-                <td>
-                    <button class="btn btn-secondary" onclick="Cobranzas.ver('${cobranza.id}')">Ver</button>
+                <td data-label="Cliente">${cliente.nombre || ''}</td>
+                <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
+                <td data-label="Fecha">${Utils.formatDate(cobranza.fecha)}</td>
+                <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span></td>
+                <td data-label="Acciones">
+                    <div class="pagos-acciones">
+                        <button class="btn btn-primary btn-sm" type="button" onclick="Cobranzas.cobrar('${cobranza.id}')">Cobrar</button>
+                        ${btnWhatsApp}
+                    </div>
                 </td>
             `;
             tbody.appendChild(tr);
         });
+    },
+
+    _clienteDe(cobranza) {
+        const id = String(cobranza?.cliente_id || '');
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === id);
+        return cliente || {
+            id,
+            nombre: cobranza?.cliente_nombre || Utils.nombreCatalogo(cobranza, 'cliente'),
+            telefono: ''
+        };
+    },
+
+    _setMontoCobro(valor) {
+        const input = document.getElementById('modal-cobro-monto');
+        if (!input) return;
+        input.value = valor > 0 ? Utils.formatPrice(valor) : '';
+        this._actualizarPreviewCobro();
+    },
+
+    _actualizarPreviewCobro() {
+        const preview = document.getElementById('modal-cobro-preview');
+        const saldo = Utils.parsePrice(preview?.dataset.saldo || 0);
+        const monto = Utils.parsePrice(document.getElementById('modal-cobro-monto')?.value || 0);
+        if (!preview) return;
+        if (!monto || monto <= 0) {
+            preview.hidden = true;
+            preview.innerHTML = '';
+            return;
+        }
+        preview.hidden = false;
+        if (monto > saldo) {
+            preview.innerHTML = `Ese monto supera lo que te debe (${Utils.formatCurrency(saldo)}).`;
+            return;
+        }
+        const resto = saldo - monto;
+        preview.innerHTML = resto > 0
+            ? `Vas a cobrar <strong>${Utils.formatCurrency(monto)}</strong>. Queda ${Utils.formatCurrency(resto)}.`
+            : `Vas a cobrar todo (${Utils.formatCurrency(monto)}).`;
+    },
+
+    async cobrar(cobranzaId) {
+        const cobranza = (AppState.cobranzas || []).find(c => String(c.id) === String(cobranzaId));
+        if (!cobranza) {
+            Utils.showError('Cobranza no encontrada');
+            return;
+        }
+        const cliente = this._clienteDe(cobranza);
+        const saldo = Utils.getCobranzaSaldo(cobranza);
+        const nombre = cliente.nombre || 'este cliente';
+        if (saldo <= 0) {
+            Utils.showInfo(`"${nombre}" está al día. No hay nada para cobrar.`);
+            return;
+        }
+
+        const content = `
+            <div class="form-group">
+                <label for="modal-cobro-deuda">Dinero a cobrar</label>
+                <input type="text" id="modal-cobro-deuda" class="form-control" value="${Utils.formatCurrency(saldo)}" readonly tabindex="-1">
+            </div>
+            <div class="form-group">
+                <label for="modal-cobro-monto">Monto</label>
+                <input type="text" id="modal-cobro-monto" class="form-control" data-price-input="true" value="${Utils.formatPrice(saldo)}" placeholder="0" inputmode="numeric">
+                <div class="pago-chips">
+                    <button type="button" class="pago-chip" id="cobro-chip-todo">Cobrar todo (${Utils.formatCurrency(saldo)})</button>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="modal-cobro-metodo">Cómo te paga</label>
+                <select id="modal-cobro-metodo" class="form-control">
+                    <option value="efectivo">Efectivo</option>
+                    <option value="transferencia">Transferencia</option>
+                    <option value="cheque">Cheque</option>
+                </select>
+            </div>
+            <p class="pago-preview" id="modal-cobro-preview" data-saldo="${saldo}" hidden></p>
+        `;
+
+        Utils.showModal('Cobrar a ' + nombre, content, async () => {
+            const monto = Utils.parsePrice(document.getElementById('modal-cobro-monto').value);
+            const metodo = document.getElementById('modal-cobro-metodo').value;
+            if (!monto || monto <= 0) {
+                Utils.showError('Poné cuánto te paga.');
+                throw new Error('Monto inválido');
+            }
+            if (monto > saldo) {
+                Utils.showError('El monto supera lo que te debe (' + Utils.formatCurrency(saldo) + ').');
+                throw new Error('Monto mayor al saldo');
+            }
+            try {
+                await API.registrarCobro({
+                    cobranza_id: cobranza.id,
+                    monto: monto,
+                    fecha: cobranza.fecha || AppState.currentDate
+                });
+                this._ultimoCobro = {
+                    cobranzaId: cobranza.id,
+                    clienteId: cliente.id,
+                    monto,
+                    metodo,
+                    saldoRestante: Math.max(0, saldo - monto),
+                    fecha: cobranza.fecha
+                };
+                CacheManager.invalidatePattern('cobranzas');
+                await this.load();
+                if (cliente.telefono && String(cliente.telefono).trim()) {
+                    this.programarAvisoWhatsApp(cliente, this._ultimoCobro, nombre);
+                } else {
+                    Utils.showSuccess(monto >= saldo
+                        ? `Cobro de ${Utils.formatCurrency(monto)} registrado a ${nombre}.`
+                        : `Cobro de ${Utils.formatCurrency(monto)} registrado. Queda ${Utils.formatCurrency(saldo - monto)}.`);
+                }
+            } catch (error) {
+                console.error('Error registrando cobro:', error);
+                Utils.showError('No se pudo registrar el cobro: ' + (error.message || 'intentá de nuevo.'));
+                throw error;
+            }
+        }, 'Cobrar');
+
+        this._actualizarPreviewCobro();
+        document.getElementById('cobro-chip-todo')?.addEventListener('click', () => this._setMontoCobro(saldo));
+        document.getElementById('modal-cobro-monto')?.addEventListener('input', () => this._actualizarPreviewCobro());
+        document.getElementById('modal-cobro-monto')?.addEventListener('change', () => this._actualizarPreviewCobro());
     },
     
     async registrar() {
@@ -5701,6 +5870,111 @@ const Cobranzas = {
         });
     },
     
+    metodoLabel(metodo) {
+        const labels = { efectivo: 'efectivo', transferencia: 'transferencia', cheque: 'cheque' };
+        return labels[metodo] || metodo || 'efectivo';
+    },
+
+    construirMensajeWhatsApp(cliente, cobro) {
+        const nombre = cliente?.nombre || 'cliente';
+        const fecha = cobro?.fecha || AppState.currentDate;
+        const fechaLabel = DiaOperativo.formatFechaLabel(fecha);
+        if (cobro && cobro.monto > 0) {
+            const metodo = this.metodoLabel(cobro.metodo);
+            let mensaje = `Hola ${nombre}, registramos tu pago de ${Utils.formatCurrency(cobro.monto)} por ${metodo} del ${fechaLabel}.\n\n`;
+            if (cobro.saldoRestante > 0) {
+                mensaje += `Saldo pendiente: ${Utils.formatCurrency(cobro.saldoRestante)}.\n\n`;
+            } else {
+                mensaje += 'Quedamos al día.\n\n';
+            }
+            mensaje += 'Muchas gracias.';
+            return mensaje;
+        }
+        const saldo = Utils.parsePrice(cliente?.saldo) || 0;
+        if (saldo > 0) {
+            return `Hola ${nombre}, te recordamos que queda un saldo de ${Utils.formatCurrency(saldo)} del ${fechaLabel}.\n\nMuchas gracias.`;
+        }
+        return `Hola ${nombre}, te confirmamos que no queda saldo pendiente. Quedamos al día.\n\nMuchas gracias.`;
+    },
+
+    programarAvisoWhatsApp(cliente, cobro, nombre) {
+        if (!cliente) return;
+        setTimeout(() => this.abrirModalWhatsApp(cliente, cobro, nombre), 350);
+    },
+
+    async enviarWhatsApp(cobranzaId) {
+        try {
+            await Pagos.ensureDatosWhatsApp();
+            const cobranza = (AppState.cobranzas || []).find(c => String(c.id) === String(cobranzaId));
+            if (!cobranza) {
+                Utils.showError('Cobranza no encontrada');
+                return;
+            }
+            const cliente = this._clienteDe(cobranza);
+            cliente.saldo = Utils.getCobranzaSaldo(cobranza);
+            const ultimo = this._ultimoCobro && String(this._ultimoCobro.cobranzaId) === String(cobranzaId)
+                ? this._ultimoCobro
+                : { fecha: cobranza.fecha };
+            this.abrirModalWhatsApp(cliente, ultimo, cliente.nombre);
+        } catch (error) {
+            console.error('Error preparando WhatsApp de cobro:', error);
+            Utils.showError('No se pudo preparar el WhatsApp: ' + (error.message || 'intentá de nuevo.'));
+        }
+    },
+
+    abrirModalWhatsApp(cliente, cobro = null, nombreCliente = '') {
+        if (!cliente) return;
+        const nombre = nombreCliente || cliente.nombre || 'cliente';
+        const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
+        const mensajeDefault = this.construirMensajeWhatsApp({ ...cliente, nombre }, cobro);
+        const saveLabel = AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp';
+        const saldo = Utils.parsePrice(cliente.saldo) || 0;
+        const monto = cobro?.monto > 0 ? cobro.monto : (saldo > 0 ? saldo : 0);
+        const metodo = cobro?.metodo ? this.metodoLabel(cobro.metodo) : '—';
+        const saldoDespues = cobro && cobro.monto > 0 ? (cobro.saldoRestante || 0) : saldo;
+
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <p class="modal-static-value">${nombre}</p>
+                <small class="modal-hint">${sinTelefono
+                    ? 'Este cliente no tiene teléfono. Configuralo en Clientes.'
+                    : (cliente.telefono || '')}</small>
+            </div>
+            <div class="form-group">
+                <label>Detalle del aviso</label>
+                <div class="modal-pedido-preview-box">
+                    <table class="modal-pedido-detalle-table">
+                        <thead><tr><th>Concepto</th><th>Valor</th></tr></thead>
+                        <tbody>
+                            <tr><td>Cobro</td><td>${monto > 0 ? Utils.formatCurrency(monto) : '—'}</td></tr>
+                            <tr><td>Método</td><td>${metodo}</td></tr>
+                            <tr><td>Saldo después</td><td>${Utils.formatCurrency(saldoDespues)}</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Mensaje de WhatsApp</label>
+                <textarea id="modal-cobro-preview-mensaje" class="whatsapp-preview form-control" rows="8"></textarea>
+            </div>
+        `;
+
+        Utils.showModal('Avisar cobro por WhatsApp', content, async () => {
+            const mensaje = document.getElementById('modal-cobro-preview-mensaje')?.value.trim();
+            if (!mensaje) {
+                Utils.showError('Escribí un mensaje para WhatsApp');
+                throw new Error('Mensaje requerido');
+            }
+            await Pagos.ejecutarEnvioWhatsApp({ ...cliente, nombre }, mensaje);
+        }, saveLabel);
+
+        const previewMensaje = document.getElementById('modal-cobro-preview-mensaje');
+        if (previewMensaje) previewMensaje.value = mensajeDefault;
+        const saveBtn = document.getElementById('modal-save');
+        if (saveBtn) saveBtn.disabled = sinTelefono;
+    },
+
     async ver(id) {
         const cobranza = AppState.cobranzas.find(c => c.id === id);
         if (!cobranza) {
@@ -5763,10 +6037,16 @@ const CobranzasHoy = {
         const tbody = document.getElementById('cobros-hoy-tbody');
         if (!tbody) return;
 
-        const fechaEl = document.getElementById('cobros-hoy-fecha');
-        if (fechaEl) fechaEl.textContent = Utils.formatDate(AppState.currentDate);
+        if (!DiaOperativo.diasPendientes.length) {
+            const cachedDias = CacheManager.get('flujo:dias-pendientes');
+            if (Array.isArray(cachedDias)) DiaOperativo.diasPendientes = cachedDias;
+        }
 
         const revision = this._revision;
+        if (DiaOperativo.diaCerrado(AppState.currentDate)) {
+            this.render([]);
+            return;
+        }
         if (this._lastTotales.length && this._pagadoConocido !== false) {
             this.render(this._lastTotales);
         } else {
@@ -5798,6 +6078,21 @@ const CobranzasHoy = {
         if (!tbody) return;
         Utils.hideTableLoader(tbody);
         tbody.innerHTML = '';
+
+        const hint = document.getElementById('cobros-hoy-hint');
+        if (DiaOperativo.diaCerrado(AppState.currentDate)) {
+            if (hint) {
+                hint.textContent = 'Este día está cerrado. Lo que quedó sin cobrar está en Cobranzas a clientes (pendientes).';
+            }
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">' +
+                'Este día está cerrado.<br>' +
+                '<small style="color:#999">Lo que quedó sin cobrar está en Cobranzas a clientes (pendientes).</small>' +
+                '</td></tr>';
+            return;
+        }
+        if (hint) {
+            hint.textContent = 'Cobrás a los clientes de este día. Al cerrar, lo que quede sin cobrar pasa a Cobranzas a clientes (pendientes).';
+        }
 
         if (totales.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">' +
@@ -5907,7 +6202,13 @@ const Pagos = {
         const tbody = document.getElementById('pagos-tbody');
         if (!tbody) return;
 
-        const hasStale = AppState.proveedores.length > 0;
+        if (!DiaOperativo.diasPendientes.length) {
+            const cachedDias = CacheManager.get('flujo:dias-pendientes');
+            if (Array.isArray(cachedDias)) DiaOperativo.diasPendientes = cachedDias;
+        }
+        if (AppState.recepcion) this._aplicarRecepcionHoy(AppState.recepcion);
+        const diaListo = this.vista === 'pendientes' || DiaOperativo.diaCerrado(AppState.currentDate);
+        const hasStale = AppState.proveedores.length > 0 && (diaListo || Object.keys(this._montosHoy).length > 0);
         if (hasStale) {
             this.render(AppState.proveedores);
         } else {
@@ -5939,17 +6240,27 @@ const Pagos = {
         tbody.innerHTML = '';
 
         const soloPendientes = this.vista === 'pendientes';
+        const diaCerrado = DiaOperativo.diaCerrado(AppState.currentDate);
         const titulo = document.getElementById('pagos-titulo');
         const hint = document.getElementById('pagos-hint');
+        const diaBar = document.getElementById('pagos-dia-bar');
+        if (diaBar) diaBar.hidden = soloPendientes;
         if (titulo) titulo.textContent = soloPendientes ? 'Pagos a proveedores (pendientes)' : 'Pagar al proveedor';
         if (hint) {
             hint.textContent = soloPendientes
                 ? 'Acá queda lo que todavía le debés a cada proveedor, de hoy o de días anteriores.'
-                : 'Pagá lo de hoy. Si queda saldo, lo vas a ver en Pagos a proveedores (pendientes).';
+                : (diaCerrado
+                    ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
+                    : 'Pagá la mercadería de este día. Al cerrar, lo que quede por pagar pasa a Pagos a proveedores (pendientes).');
         }
 
         const lista = [...(proveedores || [])]
-            .filter(p => !soloPendientes || (Utils.parsePrice(p.saldo) || 0) > 0)
+            .filter(p => {
+                const saldo = Utils.parsePrice(p.saldo) || 0;
+                if (soloPendientes) return saldo > 0;
+                if (diaCerrado) return false;
+                return (this._montosHoy[String(p.id)] || 0) > 0;
+            })
             .sort((a, b) => {
             const saldoA = Utils.parsePrice(a.saldo) || 0;
             const saldoB = Utils.parsePrice(b.saldo) || 0;
@@ -5993,7 +6304,9 @@ const Pagos = {
         if (lista.length === 0) {
             const vacio = soloPendientes
                 ? 'No hay pagos pendientes a proveedores.'
-                : 'No hay proveedores cargados.';
+                : (diaCerrado
+                    ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
+                    : 'No hay mercadería confirmada para pagar en este día.');
             tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#666;">${vacio}</td></tr>`;
             if (resumen) resumen.hidden = true;
             return;
@@ -6030,7 +6343,9 @@ const Pagos = {
 
     _aplicarRecepcionHoy(recepcion) {
         this._montosHoy = {};
+        const fecha = AppState.currentDate;
         (recepcion || []).forEach(item => {
+            if (fecha && item.fecha && Utils.fechaIso(item.fecha) !== fecha) return;
             if (item.confirmado === true || item.confirmado === 'true') {
                 const provId = String(item.proveedor_id || '');
                 if (!provId) return;
@@ -7274,15 +7589,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-seguir-cierre', () => Navigation.navigateTo('cierre'), 'Abriendo...');
     addButtonListener('btn-volver-cierre', () => Navigation.navigateTo('pagos'), 'Volviendo...');
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });
-    addButtonListener('btn-ver-cobranza', () => {
-        // Ver la primera cobranza seleccionada (se puede mejorar con selección)
-        if (AppState.cobranzas.length > 0) {
-            Cobranzas.ver(AppState.cobranzas[0].id);
-        } else {
-            Utils.showError('No hay cobranzas para ver');
-        }
-    });
-    addButtonListener('btn-registrar-cobro', () => Cobranzas.registrar(), 'Registrando...');
     addButtonListener('btn-ajustar-stock', () => Stock.ajustar(), 'Ajustando...');
     addButtonListener('btn-verificar-stock', () => Stock.verificarStockBajo(), 'Verificando...');
     addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
