@@ -1,19 +1,21 @@
 # Manual de uso — Luciano Cargas
 
-Guía corta para usar la app todos los días. El menú de la izquierda sigue el orden del trabajo. En el celular, la barra de abajo recorre el mismo camino: Pedidos, Recepción, Precios, Cobro, Pago y Cierre.
+Guía para usar la app todos los días. El menú de la izquierda sigue el orden del trabajo. En el celular, la barra de abajo recorre el camino principal: Pedidos, Camiones, Recepción, Precios, Cobro, Pago y Cierre.
 
 ## Para qué sirve
 
 La app organiza un día de reparto:
 
-1. Anotás qué pidió cada cliente.
-2. Se lo mandás al proveedor.
-3. Cuando llega la mercadería, confirmás cuánto vino y a qué costo.
-4. Armás el precio para el cliente y se lo enviás.
-5. Cobrás al cliente y le pagás al proveedor.
-6. Cerrás el día.
+1. Anotás qué pidió cada cliente y a qué proveedor va.
+2. Se lo mandás al proveedor por WhatsApp.
+3. Armás los camiones para quien carga la mercadería.
+4. Cuando llega, confirmás cuánto vino y a qué costo.
+5. Armás el precio para el cliente y se lo enviás en PDF.
+6. Cobrás al cliente y le pagás al proveedor. Podés partir el pago en más de un medio y dejar saldo.
+7. Si hace falta, repartís el efectivo del día entre los proveedores.
+8. Cerrás el día.
 
-El pago al proveedor no se carga en Pedidos. Se carga recién en **Pagar al proveedor**.
+El pago al proveedor no se carga en Pedidos. Se carga en **Pagar al proveedor** o en **Repartir efectivo**.
 
 ## Cómo entrar
 
@@ -21,7 +23,7 @@ El pago al proveedor no se carga en Pedidos. Se carga recién en **Pagar al prov
 2. Poné tu correo y tu contraseña.
 3. Para salir, usá **Salir**, arriba a la derecha.
 
-Arriba de cada pantalla del día aparece **Pedido del día**. Si la mercadería de ayer llega hoy, elegí la fecha de ayer y seguí con esa misma fecha en recepción, precios y cierre.
+Arriba de cada pantalla del día aparece **Pedido del día**. Si la mercadería de ayer llega hoy, elegí la fecha de ayer y seguí con esa misma fecha en camiones, recepción, precios, cobro, pago y cierre.
 
 ## Antes del primer día
 
@@ -32,7 +34,7 @@ Cargá esto una sola vez, en **Configuración**. Después solo lo tocás cuando 
 **Configuración → Clientes → Agregar cliente.**
 
 - Nombre.
-- Teléfono de WhatsApp. Sin teléfono no se le puede mandar la lista de precios.
+- Teléfono de WhatsApp. Sin teléfono no se le puede mandar la lista de precios ni el saldo.
 
 ### Proveedores
 
@@ -49,21 +51,35 @@ Cargá esto una sola vez, en **Configuración**. Después solo lo tocás cuando 
 - Nombre.
 - Tipo: Verdura o Bebida.
 - Unidad: kg, unidad, caja, docena o litro.
-- Proveedor predeterminado. Es quien recibe el pedido de ese producto. Si queda vacío, el pedido aparece como **Sin proveedor** y no se puede enviar.
+- Proveedor predeterminado. Es el que se propone al armar el pedido. En cada pedido se puede elegir otro proveedor. Si queda vacío, el pedido aparece como **Sin proveedor** y no se puede enviar.
+
+El mismo producto puede pedirse a distintos proveedores. El proveedor queda guardado en el pedido, no cambia el predeterminado del producto.
 
 ## El día, paso a paso
 
 ### 1. Pedidos del día
 
-Anotá cada pedido: cliente, producto y cantidad.
+Anotá cada pedido: cliente, producto, cantidad y proveedor.
 
 - **Agregar pedido** carga uno nuevo.
-- En **Acciones** podés editarlo, eliminarlo o cambiar el proveedor.
+- En **Acciones** podés editarlo, eliminarlo, elegir el proveedor o reenviar el WhatsApp. Al editar también se puede cambiar el proveedor.
 - **Enviar pendientes a proveedores** abre un mensaje de WhatsApp por cada proveedor, con todo lo que le corresponde.
 - Cuando un pedido ya se envió, figura **Enviado**. Podés reenviarlo desde Acciones.
-- **Seguir a recepción** pasa al paso 2. No hace falta haber enviado todo para seguir, pero conviene mandarlo antes de que salga el proveedor.
+- **Seguir a camiones** pasa al paso 2.
 
-### 2. Confirmar recepción
+### 2. Armar camiones
+
+Repartí los clientes del día en camiones, para quien carga la mercadería.
+
+- **Agregar camión** suma un camión. Le podés cambiar el nombre.
+- En cada camión elegís los clientes que van juntos. Un cliente va en un solo camión ese día. Si ya está en otro, al sumarlo dice que sale de ese camión y se mueve.
+- La hoja muestra, por producto, cuánto va a cada cliente, el total del camión y el puesto. El puesto es el proveedor del pedido. Si el mismo producto sale de dos proveedores, son dos filas.
+- **Imprimir** saca la hoja de un camión. **Imprimir todos** saca todas.
+- **WhatsApp** o **Enviar todos** arma un PDF y abre el chat. Pedile el teléfono a quien carga. En el celular podés compartir el PDF directo. En la computadora se descarga el archivo para adjuntarlo en el chat.
+- **Quitar camión** lo saca. Los clientes quedan sin camión.
+- **Seguir a recepción** pasa al paso 3.
+
+### 3. Confirmar recepción
 
 Cuando llega la mercadería, confirmá **cada producto**.
 
@@ -75,8 +91,11 @@ Cuando llega la mercadería, confirmá **cada producto**.
 - **Guardar borrador** guarda los números sin confirmar.
 - **Confirmar todos los completos** confirma de una vez los productos que ya tienen cantidad y precio.
 - Al confirmar, la app arma sola la lista de precios al cliente, con la cantidad que llegó. Si faltó mercadería, esa cantidad se reparte entre los clientes que la pidieron.
+- **Seguir a precios** pasa al paso 4.
 
-### 3. Precios al cliente
+Si un día no se confirmó y hay que recibirlo después, usá el paso 9, **Confirmar recepción (pendientes)**.
+
+### 4. Precios al cliente
 
 Acá definís cuánto le cobrás a cada cliente por cada unidad.
 
@@ -87,52 +106,69 @@ Acá definís cuánto le cobrás a cada cliente por cada unidad.
 - **Armar lista** vuelve a armar la lista con lo confirmado en recepción. Usalo si cambiaste una recepción.
 - **Guardar precios** guarda y actualiza lo que hay que cobrar.
 - Para mandar la lista, primero elegí **un cliente** en el filtro.
-  - **WhatsApp** abre el mensaje para ese cliente.
-  - **PDF** arma la lista para imprimir o compartir.
+  - **WhatsApp PDF** arma el PDF y abre WhatsApp. En el celular se comparte directo. En la computadora se descarga para adjuntarlo.
+  - **PDF** abre la lista para imprimir o guardar.
 - **Limpiar filtro** vuelve a mostrar a todos.
-- **Seguir a cobranza** pasa al paso 4.
+- **Seguir a cobranza** pasa al paso 5.
 
 Si falta el precio de alguien, el cierre te va a decir el cliente y el producto.
 
-### 4. Cobranza al cliente
+### 5. Cobranza al cliente
 
-Cobrá lo del día.
+Cobrá lo del día. El cliente puede pagar en más de un medio y dejar una parte adeudada.
 
-- Ves el total, lo ya cobrado, el saldo y el estado: sin cobrar, parcial o pagado.
-- **Cobrar** registra el pago. Podés cobrar una parte. El resto queda pendiente.
-- No se puede cobrar más que el saldo.
-- Métodos: efectivo, transferencia o cheque.
-- **Seguir a pagar al proveedor** pasa al paso 5.
+Medios: efectivo, transferencia, cheque y tarjeta.
 
-Podés cerrar el día aunque todavía no hayas cobrado a todos.
+- Ves el total, lo ya cobrado, cómo cobró, el saldo y el estado: sin cobrar, parcial o pagado.
+- **Acciones** abre las opciones:
+  - **Cobrar**, si todavía debe. Repartí el monto en los medios. Lo que no cargues queda adeudado. No se puede cobrar más que el saldo.
+  - **Ver detalle** muestra los productos de esa cuenta.
+  - **Enviar saldo** arma el PDF con todas las cargas abiertas de ese cliente y el total. Sirve para mandárselo por WhatsApp.
+  - **Avisar por WhatsApp** le manda el resumen de la cuenta de hoy.
+  - **Editar lo cobrado**, si ya pagó algo.
+  - **Eliminar cobro** deja de nuevo el saldo completo.
+- **Seguir a pagar al proveedor** pasa al paso 6.
 
-### 5. Pagar al proveedor
+Podés cerrar el día aunque todavía no hayas cobrado a todos. Lo que quede pasa a **Cobranzas a clientes (pendientes)**.
+
+### 6. Pagar al proveedor
 
 Pagá lo que le debés a cada proveedor. El saldo es todo lo confirmado en recepción menos lo que ya pagaste, no solo lo de hoy.
 
+Al proveedor se le paga en efectivo y en transferencia. Lo que no pagues queda adeudado.
+
 - **Le debés** es el saldo.
+- **Cómo pagaste** muestra los medios.
 - **Mercadería de hoy** es lo que se confirmó en este pedido.
-- **Pagar** registra el pago. Podés pagar una parte o todo.
-- No se puede pagar más que el saldo.
-- **WhatsApp** le avisa al proveedor.
+- **Pagar** registra el pago. Podés pagar una parte en cada medio o todo. No se puede pagar más que el saldo.
 - Si queda saldo, lo vas a ver en **Pagos a proveedores (pendientes)**.
-- **Seguir a cerrar el día** pasa al paso 8.
+- **Seguir a cerrar el día** pasa al paso 10.
 
 Podés cerrar el día aunque todavía le debas a algún proveedor.
 
-### 6. Cobranzas a clientes (pendientes)
+### 7. Cobranzas a clientes (pendientes)
 
-Lo que el cliente todavía no pagó. Sirve para cobrar deudas de este día o de días anteriores.
+Lo que cada cliente todavía debe, de este día o de días anteriores. Cada fila es una carga.
 
-- **Ver** muestra el detalle.
-- **Registrar cobro** anota el pago.
-- **Seguir a pagos pendientes** pasa al paso 7.
+- **Cobrar** anota el pago. También se puede partir en efectivo, transferencia, cheque y tarjeta, y dejar saldo.
+- **Enviar saldo** arma un PDF para ese cliente:
+  - Cada fila amarilla es una carga, con la fecha y el total de ese día.
+  - Si ya pagó una parte, aparece el pago y el **Faltante** de esa carga.
+  - Si no pagó nada, queda solo la fila amarilla.
+  - Al final está el **Total saldo**.
+  - En el celular se comparte por WhatsApp. En la computadora se descarga el PDF para adjuntarlo.
+- **WhatsApp** abre un aviso de esa cobranza.
+- **Seguir a pagos pendientes** pasa al paso 8.
 
-### 7. Pagos a proveedores (pendientes)
+### 8. Pagos a proveedores (pendientes)
 
-La misma lista de proveedores, pero solo los que todavía tienen saldo. El que está al día no aparece.
+La misma lista de proveedores, pero solo los que todavía tienen saldo. El que está al día no aparece. Se paga igual que en el paso 6: efectivo, transferencia, o una parte de cada uno.
 
-### 8. Cerrar el día
+### 9. Confirmar recepción (pendientes)
+
+Para los días en los que la mercadería se recibe después. Elegí el día que todavía no recibiste y confirmá igual que en el paso 3. Sirve para confirmar hoy lo que se pidió ayer.
+
+### 10. Cerrar el día
 
 Último paso. El resumen te dice si ya podés cerrar.
 
@@ -157,17 +193,21 @@ La pantalla de inicio muestra:
 
 Si falta un paso del día, el cartel de arriba te dice cuál es el siguiente.
 
-## Stock de bebidas
+**Repartir efectivo** también está en el inicio.
 
-**Configuración → Stock de Bebidas.**
+## Repartir efectivo
 
-El stock de bebidas se mueve al **cerrar el día**, no en el momento de la recepción. Antes del cierre puede seguir mostrando el stock del último día cerrado.
+**Historial → Repartir efectivo.** También se entra desde el inicio y desde **Caja**.
 
-- **Ajustar stock** corrige la cantidad a mano.
-- **Verificar stock bajo** revisa qué productos están debajo del mínimo.
-- **Configurar notificaciones** define el aviso de stock bajo.
+Sirve cuando entra efectivo de un cliente y, de eso, se le da una parte a uno o más proveedores. Los saldos bajan en el momento. Lo que no se reparte queda en la caja.
 
-Las verduras no llevan stock.
+1. Elegí el cliente. Solo aparecen los que ya deben.
+2. Poné el efectivo que entró. No puede ser más de lo que debe.
+3. En **De eso le das**, elegí cada proveedor y el monto. Solo aparecen proveedores que ya tienen saldo. **Todo** completa lo que les debés, sin pasar el efectivo que entró.
+4. El resumen muestra cuánto entró, cuánto repartís y cuánto queda en la caja.
+5. **Descontar saldos** aplica el cobro al cliente y el pago a cada proveedor, todo en efectivo.
+
+No se puede repartir más de lo que entró ni más de lo que le debés a un proveedor.
 
 ## Caja
 
@@ -180,23 +220,42 @@ Muestra el dinero del día que elijas:
 - **Saldo del día:** ingresos menos egresos.
 - **Saldo acumulado:** cómo viene la caja en el tiempo.
 
+**Repartir efectivo** abre la pantalla del reparto.
+
 ## Historial de días
 
 **Historial → Historial de Días.**
 
-Lista los días ya cerrados. **Ver día** abre el detalle de esa fecha.
+Lista los días ya cerrados.
+
+- **Ver día** abre el detalle de esa fecha.
+- **Reporte** arma el informe del día para imprimir o guardar como PDF.
+
+## Stock de bebidas
+
+**Configuración → Stock de Bebidas.**
+
+El stock de bebidas se mueve al **cerrar el día**, no en el momento de la recepción. Antes del cierre puede seguir mostrando el stock del último día cerrado.
+
+- **Ajustar stock** corrige la cantidad a mano.
+- **Verificar stock bajo** revisa qué productos están debajo del mínimo.
+- **Configurar notificaciones** define el aviso de stock bajo.
+
+Las verduras no llevan stock.
 
 ## Qué no tocar
 
-**Configuración → Limpiar datos** borra todo: clientes, productos, proveedores, pedidos, cobros, pagos, caja, stock e historial. No se puede recuperar. No lo uses en el trabajo de todos los días.
+**Configuración → Limpiar datos** borra todo: clientes, productos, proveedores, pedidos, cobros, pagos, caja, stock, camiones e historial. No se puede recuperar. No lo uses en el trabajo de todos los días.
 
 ## Si algo no cierra
 
 | Lo que ves | Qué hacer |
 | --- | --- |
-| Sin proveedor | Entrá al producto y elegí un proveedor predeterminado. El proveedor tiene que tener teléfono. |
+| Sin proveedor | En el pedido, elegí el proveedor desde Acciones. Si el producto no tiene uno predeterminado, cargalo en Productos. El proveedor tiene que tener teléfono para el WhatsApp. |
 | Falta teléfono | Cargalo en Clientes o en Proveedores. |
 | No confirma la recepción | Si llegó mercadería, cargá el precio real por unidad. Si no llegó, poné 0. |
 | Falta el precio al cliente | En Precios al cliente, completá el precio que indica el cierre y guardá. |
-| No puedo cobrar o pagar ese monto | El monto es mayor que el saldo. Cargá el saldo o menos. |
+| No puedo cobrar o pagar ese monto | La suma supera el saldo. Cargá el saldo o menos. Lo que no cargues queda adeudado. |
+| En repartir efectivo no aparece el cliente o el proveedor | Solo entran los que ya tienen saldo. Primero tiene que haber un precio o una cobranza, y el proveedor tiene que deber. |
+| El PDF de WhatsApp no sale adjunto en la computadora | Se descarga el archivo. Abrilo en el chat y adjuntalo a mano. En el celular se puede compartir directo. |
 | El stock de bebidas no cambió | El stock se actualiza al cerrar el día. |

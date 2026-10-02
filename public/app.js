@@ -2577,12 +2577,10 @@ const Productos = {
     },
     
     async add() {
-        try {
-            AppState.proveedores = await API._listaFresca('proveedores', 'proveedores');
-        } catch (error) {
-            if (!AppState.proveedores) AppState.proveedores = [];
+        if (!AppState.proveedores?.length) {
+            const cache = CacheManager.peek('proveedores');
+            if (Array.isArray(cache)) AppState.proveedores = cache;
         }
-
         const proveedores = AppState.proveedores || [];
         
         const content = `
@@ -2661,6 +2659,18 @@ const Productos = {
                 Utils.showError('Error al crear producto: ' + error.message);
             }
         });
+
+        if (!CacheManager.get('proveedores')) {
+            API.getProveedores().then(lista => {
+                AppState.proveedores = lista || [];
+                const select = document.getElementById('modal-producto-proveedor');
+                if (!select) return;
+                const elegido = select.value;
+                select.innerHTML = '<option value="">Sin proveedor</option>' +
+                    AppState.proveedores.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('');
+                if (elegido) select.value = elegido;
+            }).catch(() => {});
+        }
     },
     
     async edit(id) {
@@ -6541,6 +6551,212 @@ const MediosPago = {
 };
 
 // Cobranzas
+const SaldoCliente = {
+    abrir(clienteId) {
+        const cliente = this._cliente(clienteId);
+        const filas = this.filas(clienteId);
+        if (!filas.length) {
+            Utils.showError('Este cliente no tiene saldo pendiente.');
+            return;
+        }
+        const nombre = cliente.nombre || 'Cliente';
+        const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
+        const content = `
+            <p class="modal-hint">${this._esc(nombre)}. La fila amarilla es cada carga. Si ya pagó una parte, abajo va el faltante. Al final está el total.</p>
+            ${this._tabla(filas)}
+            <p class="modal-hint">${sinTelefono
+                ? 'Este cliente no tiene teléfono. El PDF se descarga igual.'
+                : 'Se arma un PDF y se abre WhatsApp. En la computadora tenés que adjuntar el archivo que se descarga.'}</p>
+        `;
+        Utils.showModal('Saldo de ' + nombre, content, async () => {
+            await this._enviar(cliente, filas);
+        }, sinTelefono ? 'Descargar PDF' : 'Enviar PDF');
+    },
+
+    filas(clienteId) {
+        const cargas = this._cargas(clienteId);
+        const filas = [];
+        cargas.forEach(carga => {
+            filas.push({ tipo: 'carga', texto: this._fecha(carga.fecha), monto: carga.total });
+            this._pagos(carga).forEach(pago => {
+                filas.push({ tipo: 'pago', texto: pago.texto, monto: pago.monto });
+            });
+            if (carga.pagado > 0.01) {
+                filas.push({ tipo: 'faltante', texto: 'Faltante', monto: carga.saldo });
+            }
+        });
+        if (!filas.length) return [];
+        const total = cargas.reduce((sum, carga) => sum + carga.saldo, 0);
+        filas.push({ tipo: 'total', texto: 'Total saldo', monto: total });
+        return filas;
+    },
+
+    _cargas(clienteId) {
+        const id = String(clienteId);
+        const porFecha = new Map();
+        this._cobranzas().forEach(cobranza => {
+            if (String(cobranza.cliente_id) !== id) return;
+            const saldo = Utils.getCobranzaSaldo(cobranza);
+            if (saldo <= 0.01) return;
+            const fecha = Utils.fechaIso(cobranza.fecha);
+            if (!fecha) return;
+            const total = Utils.parsePrice(cobranza.total) || saldo;
+            const pagado = Utils.parsePrice(cobranza.pagado) || Math.max(0, total - saldo);
+            porFecha.set(fecha, {
+                fecha,
+                total,
+                pagado,
+                saldo,
+                medios: cobranza.medios
+            });
+        });
+        const hoy = this._cargaDeHoy(id, porFecha);
+        if (hoy) porFecha.set(hoy.fecha, hoy);
+        return [...porFecha.values()].sort((a, b) => a.fecha.localeCompare(b.fecha));
+    },
+
+    _cobranzas() {
+        const cache = CacheManager.peek('cobranzas:all:all');
+        const lista = Array.isArray(cache) ? cache.slice() : [];
+        (AppState.cobranzas || []).forEach(cobranza => {
+            const index = lista.findIndex(item => String(item.id) === String(cobranza.id));
+            if (index >= 0) lista[index] = { ...lista[index], ...cobranza };
+            else lista.push(cobranza);
+        });
+        return lista;
+    },
+
+    _cargaDeHoy(clienteId, porFecha) {
+        const fecha = AppState.currentDate;
+        if (!fecha || porFecha.has(fecha)) return null;
+        if (typeof CobranzasHoy === 'undefined' || !CobranzasHoy._desdePrecios) return null;
+        const totales = CobranzasHoy._desdePrecios(fecha);
+        if (!Array.isArray(totales)) return null;
+        const fila = totales.find(item => String(item.cliente_id) === String(clienteId));
+        if (!fila) return null;
+        const saldo = Utils.parsePrice(fila.saldo) || 0;
+        if (saldo <= 0.01) return null;
+        const total = Utils.parsePrice(fila.total) || saldo;
+        return {
+            fecha,
+            total,
+            pagado: Utils.parsePrice(fila.pagado) || Math.max(0, total - saldo),
+            saldo,
+            medios: fila.medios
+        };
+    },
+
+    _pagos(carga) {
+        if (carga.pagado <= 0.01) return [];
+        const medios = MediosPago.parse(carga.medios);
+        const lineas = MediosPago.deCliente
+            .filter(([medio]) => medios[medio] > 0.01)
+            .map(([medio, etiqueta]) => ({ texto: etiqueta, monto: medios[medio] }));
+        const suma = lineas.reduce((sum, linea) => sum + linea.monto, 0);
+        if (!lineas.length || Math.abs(suma - carga.pagado) > 1) {
+            return [{ texto: 'Cobrado', monto: carga.pagado }];
+        }
+        return lineas;
+    },
+
+    _cliente(clienteId) {
+        const cobranza = this._cobranzas().find(item => String(item.cliente_id) === String(clienteId));
+        if (typeof Cobranzas !== 'undefined' && Cobranzas._clienteDe) {
+            return Cobranzas._clienteDe(cobranza || { cliente_id: clienteId });
+        }
+        const cliente = (AppState.clientes || []).find(item => String(item.id) === String(clienteId));
+        return cliente || { id: clienteId, nombre: 'Cliente', telefono: '' };
+    },
+
+    _tabla(filas) {
+        return `<table class="saldo-tabla">${filas.map(fila => `
+            <tr class="saldo-${fila.tipo}">
+                <td>${this._esc(fila.texto)}</td>
+                <td>${this._pesos(fila.monto)}</td>
+            </tr>
+        `).join('')}</table>`;
+    },
+
+    _fecha(iso) {
+        const fecha = Utils.fechaIso(iso);
+        if (!fecha) return '';
+        const [anio, mes, dia] = fecha.split('-');
+        return `${Number(dia)}/${Number(mes)}/${anio}`;
+    },
+
+    _pesos(valor) {
+        const monto = Math.round(Utils.parsePrice(valor) || 0);
+        const texto = new Intl.NumberFormat('es-AR', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        }).format(monto);
+        return `$ ${texto}`;
+    },
+
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    async _enviar(cliente, filas) {
+        const nombre = cliente.nombre || 'Cliente';
+        const doc = await this._pdf(nombre, filas);
+        const archivoNombre = `saldo-${nombre.replace(/[^\w\-]+/g, '-')}.pdf`;
+        const blob = doc.output('blob');
+        const archivo = new File([blob], archivoNombre, { type: 'application/pdf' });
+        const texto = `Hola ${nombre}, te paso el saldo por carga y el total. Va en el PDF.`;
+        try {
+            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                await navigator.share({ files: [archivo], title: 'Saldo', text: texto });
+                Utils.avisar('PDF listo. Elegí WhatsApp para enviarlo.');
+                return;
+            }
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+        }
+        doc.save(archivoNombre);
+        if (cliente.telefono && String(cliente.telefono).trim()) {
+            WhatsAppService.openChat(cliente.telefono, texto);
+            Utils.avisar(`Se descargó el PDF. Adjuntalo en el chat de ${nombre}.`);
+            return;
+        }
+        Utils.avisar('Se descargó el PDF del saldo.');
+    },
+
+    async _pdf(nombre, filas) {
+        const JsPDF = await Precios._cargarJsPdf();
+        const doc = new JsPDF({ unit: 'mm', format: 'a4' });
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(16);
+        doc.text(String(nombre), 14, 16);
+        doc.setFontSize(11);
+        doc.text('Luciano Cargas', 14, 23);
+        let y = 32;
+        const x = 14;
+        const anchoTexto = 112;
+        const anchoMonto = 70;
+        const alto = 11;
+        filas.forEach(fila => {
+            if (y > 275) {
+                doc.addPage();
+                y = 16;
+            }
+            if (fila.tipo === 'carga') doc.setFillColor(255, 242, 0);
+            else doc.setFillColor(255, 255, 255);
+            doc.setDrawColor(0);
+            doc.rect(x, y, anchoTexto, alto, 'FD');
+            doc.rect(x + anchoTexto, y, anchoMonto, alto, 'FD');
+            doc.setTextColor(0);
+            doc.setFontSize(fila.tipo === 'pago' ? 12 : 14);
+            doc.text(String(fila.texto), x + 3, y + 7.5);
+            doc.text(this._pesos(fila.monto), x + anchoTexto + anchoMonto - 3, y + 7.5, { align: 'right' });
+            y += alto;
+        });
+        return doc;
+    }
+};
+
 const Cobranzas = {
     async load() {
         const tbody = document.getElementById('cobranzas-tbody');
@@ -6602,6 +6818,7 @@ const Cobranzas = {
                 <td data-label="Acciones">
                     <div class="pagos-acciones">
                         <button class="btn btn-primary btn-sm" type="button" onclick="Cobranzas.cobrar('${cobranza.id}')">Cobrar</button>
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="SaldoCliente.abrir('${cliente.id}')">Enviar saldo</button>
                         ${btnWhatsApp}
                     </div>
                 </td>
@@ -7109,6 +7326,7 @@ const CobranzasHoy = {
             botones.push(`<button type="button" class="btn btn-primary" onclick="CobranzasHoy.cobrar('${clienteId}', ${total}, ${saldo})">Cobrar</button>`);
         }
         botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.verDetalle('${clienteId}')">Ver detalle</button>`);
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="SaldoCliente.abrir('${clienteId}')">Enviar saldo</button>`);
         botones.push(`<button type="button" class="btn btn-whatsapp" onclick="CobranzasHoy.avisarWhatsApp('${clienteId}')">${telefono ? 'Avisar por WhatsApp' : 'WhatsApp (falta teléfono)'}</button>`);
         if (pagado > 0) {
             botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.editarCobro('${clienteId}')">Editar lo cobrado</button>`);

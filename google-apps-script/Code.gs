@@ -1559,7 +1559,7 @@ function updatePedido(data) {
 
   var lastCol = sheet.getLastColumn();
   var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-  var values = sheet.getRange(row, 1, row, lastCol).getValues()[0];
+  var values = sheet.getRange(row, 1, 1, lastCol).getValues()[0];
 
   function setCol(name, value) {
     var idx = headers.indexOf(name);
@@ -1572,7 +1572,7 @@ function updatePedido(data) {
   if (data.cantidad !== undefined && data.cantidad !== null) setCol('cantidad', data.cantidad);
   if (data.proveedor_id !== undefined) setCol('proveedor_id', data.proveedor_id || '');
 
-  sheet.getRange(row, 1, row, lastCol).setValues([values]);
+  sheet.getRange(row, 1, 1, lastCol).setValues([values]);
 
   var fechaIdx = headers.indexOf('fecha');
   var fecha = normalizeFecha(values[fechaIdx !== -1 ? fechaIdx : 1]);
@@ -2036,7 +2036,7 @@ function confirmarRecepcionItem(data) {
     values[rowIdx][llegoCol] = llego;
     values[rowIdx][precioCol] = precioReal;
     values[rowIdx][confirmadoCol] = true;
-    sheet.getRange(rowIdx + 1, 1, rowIdx + 1, values[rowIdx].length).setValues([values[rowIdx]]);
+    sheet.getRange(rowIdx + 1, 1, 1, values[rowIdx].length).setValues([values[rowIdx]]);
   }
 
   invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
@@ -2857,7 +2857,7 @@ function ajustarCobroClienteHoy(data) {
   values[rowIdx][saldoIdx] = saldo;
   values[rowIdx][estadoIdx] = estado;
   if (mediosIdx >= 0) values[rowIdx][mediosIdx] = JSON.stringify(nuevos);
-  sheet.getRange(rowIdx + 1, 1, rowIdx + 1, values[rowIdx].length).setValues([values[rowIdx]]);
+  sheet.getRange(rowIdx + 1, 1, 1, values[rowIdx].length).setValues([values[rowIdx]]);
 
   var deltas = mediosVacios_();
   METODOS_CLIENTE_.forEach(function(m) {
