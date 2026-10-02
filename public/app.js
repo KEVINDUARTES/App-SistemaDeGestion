@@ -82,9 +82,9 @@ const CacheManager = {
     },
 
     hydrateAppStateFromCache() {
-        const clientes = this.get('clientes');
-        const productos = this.get('productos');
-        const proveedores = this.get('proveedores');
+        const clientes = this.peek('clientes');
+        const productos = this.peek('productos');
+        const proveedores = this.peek('proveedores');
         if (clientes) AppState.clientes = clientes;
         if (productos) AppState.productos = productos;
         if (proveedores) AppState.proveedores = proveedores;
@@ -121,14 +121,14 @@ const CacheManager = {
         const dataType = key.split(':')[0];
         const ttl = this.TTL[dataType] || 60000;
 
-        if (now - timestamp > ttl) {
-            delete this.cache[key];
-            delete this.timestamps[key];
-            this._schedulePersist();
-            return null;
-        }
+        if (now - timestamp > ttl) return null;
 
         return cached;
+    },
+
+    peek(key) {
+        if (this.cache[key] == null || !this.timestamps[key]) return null;
+        return this.cache[key];
     },
 
     set(key, data) {
@@ -250,6 +250,12 @@ const DiaOperativo = {
         return !!(info && info.estado === 'cerrado');
     },
 
+    diaSinPedidos(fecha) {
+        const info = this.getDiaInfo(fecha || this.workDate || AppState.currentDate);
+        if (!info) return false;
+        return !(Number(info.pedidos_count) > 0);
+    },
+
     init() {
         if (this._initialized) return;
         document.querySelectorAll('.dia-operativo-select').forEach(select => {
@@ -285,6 +291,13 @@ const DiaOperativo = {
             this.renderDashboardBanner();
             this.renderNavBadge();
         }
+    },
+
+    refreshSoon() {
+        clearTimeout(this._refreshTimer);
+        this._refreshTimer = setTimeout(() => {
+            this.refresh().catch(() => {});
+        }, 1200);
     },
 
     async resolveWorkDate(options = {}) {
@@ -331,7 +344,7 @@ const DiaOperativo = {
         this.renderEstadoPanels();
 
         if (!options.skipReload && AppState.currentPage) {
-            const flowPages = ['pedidos', 'recepcion', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
+            const flowPages = ['pedidos', 'camiones', 'recepcion', 'recepcion-pendientes', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
             if (flowPages.includes(AppState.currentPage)) {
                 await Navigation.loadPageData(AppState.currentPage);
             }
@@ -741,31 +754,65 @@ const Utils = {
         cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
         closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
         
-        newSaveBtn.onclick = async () => {
-            if (onSave) {
-                try {
-                    // Deshabilitar botón mientras procesa
-                    newSaveBtn.disabled = true;
-                    newSaveBtn.textContent = 'Guardando...';
-                    
-                    const stayOpen = await onSave();
-                    if (stayOpen === true) {
-                        newSaveBtn.disabled = false;
-                        newSaveBtn.textContent = saveLabel;
-                        return;
-                    }
-                    
-                    // Cerrar solo si todo salió bien
-                    closeModal();
-                } catch (error) {
-                    console.error('Error en onSave:', error);
-                    // Re-habilitar botón si hay error
+        newSaveBtn.onclick = () => {
+            if (!onSave) {
+                closeModal();
+                return;
+            }
+
+            newSaveBtn.disabled = true;
+            newSaveBtn.textContent = 'Guardando...';
+
+            let settled = false;
+            let stayOpen = false;
+            const finish = (value, failed) => {
+                settled = true;
+                stayOpen = failed || value === true;
+            };
+
+            let result;
+            try {
+                result = onSave();
+            } catch (error) {
+                console.error('Error en onSave:', error);
+                newSaveBtn.disabled = false;
+                newSaveBtn.textContent = saveLabel;
+                return;
+            }
+
+            if (!result || typeof result.then !== 'function') {
+                if (result === true) {
                     newSaveBtn.disabled = false;
                     newSaveBtn.textContent = saveLabel;
+                    return;
                 }
-            } else {
                 closeModal();
+                return;
             }
+
+            result.then(
+                value => finish(value, false),
+                () => finish(undefined, true)
+            );
+
+            // Si la validación termina en este turno, el modal sigue abierto.
+            // Si el guardado sigue en el servidor, se cierra y la pantalla no espera.
+            setTimeout(() => {
+                if (!settled) {
+                    closeModal();
+                    result.catch(() => {});
+                    return;
+                }
+                if (stayOpen) {
+                    const btn = document.getElementById('modal-save');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = saveLabel;
+                    }
+                    return;
+                }
+                closeModal();
+            }, 0);
         };
         
         newCancelBtn.onclick = closeModal;
@@ -777,7 +824,35 @@ const Utils = {
     },
     
     showSuccess: (message) => {
-        Utils.showCustomAlert('Éxito', message, 'success');
+        Utils.avisar(message);
+        return Promise.resolve();
+    },
+
+    avisar: (message) => {
+        let aviso = document.getElementById('aviso-rapido');
+        if (!aviso) {
+            aviso = document.createElement('div');
+            aviso.id = 'aviso-rapido';
+            aviso.className = 'aviso-rapido';
+            aviso.setAttribute('role', 'status');
+            document.body.appendChild(aviso);
+        }
+        aviso.textContent = message;
+        aviso.hidden = false;
+        clearTimeout(Utils._avisoTimer);
+        Utils._avisoTimer = setTimeout(() => {
+            aviso.hidden = true;
+        }, 2200);
+    },
+
+    enSegundoPlano: (tarea, alFallar) => {
+        Promise.resolve()
+            .then(tarea)
+            .catch(error => {
+                console.error(error);
+                if (alFallar) alFallar(error);
+                else Utils.showError(error && error.message ? error.message : 'No se pudo guardar');
+            });
     },
     
     showWarning: (message) => {
@@ -1454,6 +1529,14 @@ const API = {
         return result;
     },
 
+    async getCamiones(fecha) {
+        return await this.request('camiones', 'GET', { fecha });
+    },
+
+    async guardarCamiones(fecha, camiones) {
+        return await this.request('camiones', 'POST', { fecha, camiones });
+    },
+
     async getTopProductosVendidos(dias = 7, limite = 5) {
         const cacheKey = `estadisticas:top-productos:${dias}:${limite}`;
         const cached = CacheManager.get(cacheKey);
@@ -1472,6 +1555,16 @@ const API = {
 
         const dash = result.dashboard || result;
         if (dash.pedidos) CacheManager.set(`pedidos:${fecha}`, dash.pedidos);
+        if (dash.recepcion) CacheManager.set(`recepcion:${fecha}`, dash.recepcion);
+        if (dash.precios) CacheManager.set(`precios:${fecha}`, dash.precios);
+        if (dash.pedidos && dash.recepcion && dash.precios) {
+            CacheManager.set(`flujo:${fecha}`, {
+                fecha: fecha,
+                pedidos: dash.pedidos,
+                recepcion: dash.recepcion,
+                precios: dash.precios
+            });
+        }
         if (dash.cobranzas) CacheManager.set('cobranzas:all:all', dash.cobranzas);
         if (dash.stock) CacheManager.set('stock', dash.stock);
         if (dash.topProductos) CacheManager.set('estadisticas:top-productos:7:5', dash.topProductos);
@@ -1710,13 +1803,24 @@ const API = {
     },
 
     async getTotalesClientesHoy(fecha) {
+        const cacheKey = `cobranzas:totales:${fecha}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
         const result = await this.request('cobranzas/totales-hoy', 'GET', { fecha });
+        CacheManager.set(cacheKey, result);
         return result;
     },
 
     async cobrarClienteHoy(data) {
         const result = await this.request('cobranzas/cobrar-cliente', 'POST', data);
         CacheManager.invalidatePattern('cobranzas');
+        return result;
+    },
+
+    async ajustarCobroClienteHoy(data) {
+        const result = await this.request('cobranzas/ajustar-cobro', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('caja');
         return result;
     },
     
@@ -1793,6 +1897,16 @@ const API = {
         CacheManager.invalidate('caja');
         return result;
     },
+
+    async repartirEfectivo(data) {
+        const result = await this.request('caja/repartir', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
     
     // Historial
     async getHistorial() {
@@ -1866,9 +1980,13 @@ const Navigation = {
     navigateTo(page) {
         if (!page) return;
         const requested = page;
-        const screen = page === 'pagos-pendientes' ? 'pagos' : page;
+        const screen = requested === 'pagos-pendientes'
+            ? 'pagos'
+            : (requested === 'recepcion-pendientes' ? 'recepcion' : requested);
         if (requested === 'pagos-pendientes') Pagos.vista = 'pendientes';
         else if (requested === 'pagos') Pagos.vista = 'hoy';
+        if (requested === 'recepcion-pendientes') Recepcion.vista = 'pendientes';
+        else if (requested === 'recepcion') Recepcion.vista = 'hoy';
 
         AppState.currentPage = requested;
 
@@ -1904,7 +2022,9 @@ const Navigation = {
             productos: 'Productos',
             proveedores: 'Proveedores',
             pedidos: 'Pedidos del día',
+            camiones: 'Armar camiones',
             recepcion: 'Confirmación de lo que llegó',
+            'recepcion-pendientes': 'Confirmar recepción (pendientes)',
             precios: 'Precios al cliente',
             'cobros-hoy': 'Cobranza al cliente',
             cierre: 'Cierre del día',
@@ -1913,6 +2033,7 @@ const Navigation = {
             'pagos-pendientes': 'Pagos a proveedores (pendientes)',
             stock: 'Stock de bebidas',
             historial: 'Historial de días',
+            reparto: 'Repartir efectivo',
             caja: 'Caja',
             mantenimiento: 'Limpiar datos'
         };
@@ -1924,7 +2045,7 @@ const Navigation = {
     
     async loadPageData(page) {
         try {
-            const flowPages = ['pedidos', 'recepcion', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
+            const flowPages = ['pedidos', 'camiones', 'recepcion', 'recepcion-pendientes', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
             if (flowPages.includes(page)) {
                 DiaOperativo.renderSelectors();
                 DiaOperativo.renderEstadoPanels();
@@ -1946,6 +2067,9 @@ const Navigation = {
                 case 'pedidos':
                     await Pedidos.load();
                     break;
+                case 'camiones':
+                    await Camiones.load();
+                    break;
                 case 'recepcion':
                     await Recepcion.load();
                     break;
@@ -1965,6 +2089,9 @@ const Navigation = {
                 case 'pagos-pendientes':
                     await Pagos.load();
                     break;
+                case 'recepcion-pendientes':
+                    await Recepcion.load();
+                    break;
                 case 'stock':
                     await Stock.load();
                     break;
@@ -1973,6 +2100,9 @@ const Navigation = {
                     break;
                 case 'caja':
                     await Caja.load();
+                    break;
+                case 'reparto':
+                    await Reparto.load();
                     break;
             }
         } catch (error) {
@@ -1988,7 +2118,7 @@ const Dashboard = {
     async load() {
         const chartContainer = document.querySelector('.chart-container');
         const fecha = AppState.currentDate;
-        const cachedDash = CacheManager.get(`dashboard:${fecha}`);
+        const cachedDash = CacheManager.peek(`dashboard:${fecha}`);
 
         if (cachedDash) {
             this.applyResumen(cachedDash);
@@ -2153,7 +2283,7 @@ const Clientes = {
         const tbody = document.getElementById('clientes-tbody');
         if (!tbody) return;
 
-        const cached = CacheManager.get('clientes');
+        const cached = CacheManager.peek('clientes');
         const hasStale = AppState.clientes.length > 0 || cached;
         if (hasStale) {
             if (!AppState.clientes.length && cached) AppState.clientes = cached;
@@ -2385,10 +2515,10 @@ const Productos = {
         const tbody = document.getElementById('productos-tbody');
         if (!tbody) return;
 
-        const hasStale = AppState.productos.length > 0 || CacheManager.get('productos');
+        const hasStale = AppState.productos.length > 0 || CacheManager.peek('productos');
         if (hasStale) {
-            if (!AppState.productos.length) AppState.productos = CacheManager.get('productos') || [];
-            if (!AppState.proveedores.length) AppState.proveedores = CacheManager.get('proveedores') || [];
+            if (!AppState.productos.length) AppState.productos = CacheManager.peek('productos') || [];
+            if (!AppState.proveedores.length) AppState.proveedores = CacheManager.peek('proveedores') || [];
             this.render();
         } else {
             Utils.showTableLoader(tbody);
@@ -2396,10 +2526,10 @@ const Productos = {
 
         try {
             const promises = [];
-            if (!AppState.productos.length) {
+            if (!CacheManager.get('productos')) {
                 promises.push(API.getProductos().then(data => { AppState.productos = data; }));
             }
-            if (!AppState.proveedores.length) {
+            if (!CacheManager.get('proveedores')) {
                 promises.push(API.getProveedores().then(data => { AppState.proveedores = data; }));
             }
             if (promises.length > 0) await Promise.all(promises);
@@ -2681,7 +2811,7 @@ const ProveedoresGestion = {
         if (!tbody) return;
 
         this.initActions();
-        const cached = CacheManager.get('proveedores');
+        const cached = CacheManager.peek('proveedores');
         const hasStale = AppState.proveedores.length > 0 || cached;
         if (hasStale) {
             if (!AppState.proveedores.length && cached) AppState.proveedores = cached;
@@ -2924,6 +3054,495 @@ const ProveedoresGestion = {
     }
 };
 
+const Camiones = {
+    lista: [],
+    _guardando: null,
+    _avisoScript: false,
+
+    enganchar() {
+        const root = document.getElementById('camiones-root');
+        if (!root || root.dataset.listo === '1') return;
+        root.dataset.listo = '1';
+        root.addEventListener('click', (event) => {
+            const btn = event.target.closest('[data-accion]');
+            if (!btn) return;
+            const id = btn.dataset.camion;
+            if (btn.dataset.accion === 'quitar-cliente') this.quitarCliente(id, btn.dataset.cliente);
+            if (btn.dataset.accion === 'quitar-camion') this.quitar(id);
+            if (btn.dataset.accion === 'imprimir') this.imprimir(id);
+            if (btn.dataset.accion === 'enviar') this.enviar(id);
+        });
+        root.addEventListener('change', (event) => {
+            const el = event.target;
+            if (el.dataset.accion === 'agregar-cliente') this.agregarCliente(el.dataset.camion, el.value);
+            if (el.dataset.accion === 'nombre') this.renombrar(el.dataset.camion, el.value);
+        });
+    },
+
+    async load() {
+        const root = document.getElementById('camiones-root');
+        if (!root) return;
+        const fecha = AppState.currentDate;
+        const token = (this._carga = (this._carga || 0) + 1);
+        this.lista = this._leerLocal(fecha);
+        const pedidosCache = CacheManager.peek(`pedidos:${fecha}`) || CacheManager.peek(`flujo:${fecha}`)?.pedidos;
+        if (Array.isArray(pedidosCache)) {
+            AppState.pedidos = pedidosCache;
+            AppState.fechaCargada = fecha;
+        }
+        this.render();
+
+        this._asegurarPedidos(fecha).then(() => {
+            if (this._carga !== token || AppState.currentDate !== fecha || AppState.currentPage !== 'camiones') return;
+            this.render();
+        }).catch(error => console.error('Error cargando pedidos del camión:', error));
+
+        API.getCamiones(fecha).then(remotos => {
+            if (this._carga !== token || AppState.currentDate !== fecha) return;
+            if (Array.isArray(remotos) && remotos.length) {
+                this.lista = this._normalizar(remotos);
+                this._guardarLocal(fecha, this.lista);
+                if (AppState.currentPage === 'camiones') this.render();
+            } else if (this.lista.length && Array.isArray(remotos)) {
+                this._persistir(false);
+            }
+        }).catch(() => {});
+    },
+
+    async _asegurarPedidos(fecha) {
+        if (!AppState.clientes.length) {
+            AppState.clientes = CacheManager.get('clientes') || await API.getClientes().catch(() => []);
+        }
+        if (!AppState.productos.length) {
+            AppState.productos = CacheManager.get('productos') || await API.getProductos().catch(() => []);
+        }
+        if (!AppState.proveedores.length) {
+            AppState.proveedores = CacheManager.get('proveedores') || await API.getProveedores().catch(() => []);
+        }
+        const cached = CacheManager.get(`pedidos:${fecha}`) || CacheManager.get(`flujo:${fecha}`)?.pedidos;
+        if (Array.isArray(cached)) {
+            AppState.pedidos = cached;
+            return;
+        }
+        if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.pedidos = [];
+            return;
+        }
+        const flujo = await DataLoader.getFlujo(fecha);
+        if (AppState.currentDate !== fecha) return;
+        AppState.pedidos = flujo.pedidos || [];
+    },
+
+    _pedidos() {
+        const fecha = AppState.currentDate;
+        return (AppState.pedidos || []).filter(pedido => {
+            if (!pedido.fecha) return true;
+            return Utils.fechaIso(pedido.fecha) === fecha;
+        });
+    },
+
+    _clientesDelDia() {
+        const map = new Map();
+        this._pedidos().forEach(pedido => {
+            const id = String(pedido.cliente_id || '');
+            if (!id || map.has(id)) return;
+            map.set(id, Utils.nombreCatalogo(pedido, 'cliente'));
+        });
+        return [...map.entries()]
+            .map(([id, nombre]) => ({ id, nombre }))
+            .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    _nombreCliente(clienteId) {
+        const hit = this._clientesDelDia().find(c => c.id === String(clienteId));
+        if (hit) return hit.nombre;
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === String(clienteId));
+        return cliente?.nombre || 'Cliente';
+    },
+
+    _libres(exceptoCamionId) {
+        const enEste = new Set(
+            (this.lista.find(c => String(c.id) === String(exceptoCamionId))?.clientes || []).map(String)
+        );
+        return this._clientesDelDia().filter(c => !enEste.has(c.id)).map(cliente => {
+            const otro = this.lista.find(camion =>
+                String(camion.id) !== String(exceptoCamionId) &&
+                (camion.clientes || []).map(String).includes(cliente.id)
+            );
+            return { ...cliente, nota: otro ? `sale de ${otro.nombre}` : '' };
+        });
+    },
+
+    _sinCamion() {
+        const ocupados = new Set();
+        this.lista.forEach(camion => (camion.clientes || []).forEach(id => ocupados.add(String(id))));
+        return this._clientesDelDia().filter(c => !ocupados.has(c.id));
+    },
+
+    _filas(camion) {
+        const ids = (camion.clientes || []).map(String);
+        const grupos = new Map();
+        this._pedidos().forEach(pedido => {
+            const clienteId = String(pedido.cliente_id || '');
+            if (!ids.includes(clienteId)) return;
+            const { nombreProveedor, proveedor } = Pedidos.resolverProveedorPedido(pedido);
+            const proveedorId = String(pedido.proveedor_id || proveedor?.id || '');
+            const key = String(pedido.producto_id) + '|' + proveedorId;
+            if (!grupos.has(key)) {
+                grupos.set(key, {
+                    producto: pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto'),
+                    puesto: nombreProveedor,
+                    cantidades: {}
+                });
+            }
+            const grupo = grupos.get(key);
+            grupo.cantidades[clienteId] = (grupo.cantidades[clienteId] || 0) + (parseFloat(pedido.cantidad) || 0);
+        });
+        return [...grupos.values()].map(grupo => {
+            const total = ids.reduce((sum, id) => sum + (grupo.cantidades[id] || 0), 0);
+            return { ...grupo, total };
+        }).filter(grupo => grupo.total > 0).sort((a, b) => {
+            const puesto = a.puesto.localeCompare(b.puesto, 'es');
+            if (puesto) return puesto;
+            return a.producto.localeCompare(b.producto, 'es');
+        });
+    },
+
+    _cant(valor) {
+        const numero = Math.round((parseFloat(valor) || 0) * 100) / 100;
+        if (!numero) return '';
+        return Number.isInteger(numero) ? String(numero) : String(numero);
+    },
+
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    _tabla(camion) {
+        const clientes = (camion.clientes || []).map(id => ({ id: String(id), nombre: this._nombreCliente(id) }));
+        const filas = this._filas(camion);
+        if (!clientes.length) return '<p class="camion-vacio">Sumá los clientes que van en este camión.</p>';
+        if (!filas.length) return '<p class="camion-vacio">Esos clientes no tienen pedidos en este día.</p>';
+        const cabeza = clientes.map(c => `<th class="num">${this._esc(c.nombre)}</th>`).join('');
+        const cuerpo = filas.map(fila => `
+            <tr>
+                <td>${this._esc(fila.producto)}</td>
+                ${clientes.map(c => `<td class="num">${this._cant(fila.cantidades[c.id])}</td>`).join('')}
+                <td class="num"><strong>${this._cant(fila.total)}</strong></td>
+                <td>${this._esc(fila.puesto)}</td>
+            </tr>
+        `).join('');
+        return `
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Producto</th>
+                            ${cabeza}
+                            <th>Total</th>
+                            <th>Puesto</th>
+                        </tr>
+                    </thead>
+                    <tbody>${cuerpo}</tbody>
+                </table>
+            </div>
+        `;
+    },
+
+    render() {
+        const root = document.getElementById('camiones-root');
+        if (!root) return;
+        const clientes = this._clientesDelDia();
+        if (!clientes.length && !this.lista.length) {
+            root.innerHTML = '<p class="camion-vacio">No hay pedidos cargados para este día. Cargalos en Pedidos del día y volvé acá.</p>';
+            return;
+        }
+        const sueltos = this._sinCamion();
+        const aviso = sueltos.length
+            ? `<div class="camion-sin"><strong>Sin camión:</strong> ${sueltos.map(c => this._esc(c.nombre)).join(', ')}</div>`
+            : '';
+        if (!this.lista.length) {
+            root.innerHTML = aviso + '<p class="camion-vacio">Agregá un camión y sumale los clientes que van juntos.</p>';
+            return;
+        }
+        const tarjetas = this.lista.map(camion => {
+            const libres = this._libres(camion.id);
+            const chips = (camion.clientes || []).map(id => `
+                <span class="camion-chip">${this._esc(this._nombreCliente(id))}
+                    <button type="button" data-accion="quitar-cliente" data-camion="${camion.id}" data-cliente="${id}" aria-label="Sacar cliente">×</button>
+                </span>
+            `).join('');
+            const opciones = libres.map(c => `<option value="${c.id}">${this._esc(c.nota ? `${c.nombre} · ${c.nota}` : c.nombre)}</option>`).join('');
+            return `
+                <article class="camion-card">
+                    <div class="camion-card-top">
+                        <input class="camion-nombre" data-accion="nombre" data-camion="${camion.id}" value="${this._esc(camion.nombre)}">
+                        <button class="btn btn-danger btn-sm" type="button" data-accion="quitar-camion" data-camion="${camion.id}">Quitar camión</button>
+                    </div>
+                    <div class="camion-clientes">
+                        ${chips || '<span>Sin clientes</span>'}
+                        <select class="form-control camion-agregar" data-accion="agregar-cliente" data-camion="${camion.id}">
+                            <option value="">Sumar cliente</option>
+                            ${opciones}
+                        </select>
+                    </div>
+                    ${this._tabla(camion)}
+                    <div class="camion-acciones">
+                        <button class="btn btn-secondary btn-sm" type="button" data-accion="imprimir" data-camion="${camion.id}">Imprimir</button>
+                        <button class="btn btn-whatsapp btn-sm" type="button" data-accion="enviar" data-camion="${camion.id}">WhatsApp</button>
+                    </div>
+                </article>
+            `;
+        }).join('');
+        root.innerHTML = aviso + `<div class="camion-lista">${tarjetas}</div>`;
+    },
+
+    agregar() {
+        const numero = this.lista.length + 1;
+        this.lista.push({
+            id: 'c-' + Date.now(),
+            nombre: 'Camión ' + numero,
+            orden: numero,
+            clientes: []
+        });
+        this._persistir();
+    },
+
+    async quitar(id) {
+        const camion = this.lista.find(c => String(c.id) === String(id));
+        if (!camion) return;
+        const ok = await Utils.showConfirm(`¿Quitar ${camion.nombre}? Los clientes quedan sin camión.`);
+        if (!ok) return;
+        this.lista = this.lista.filter(c => String(c.id) !== String(id));
+        this._persistir();
+    },
+
+    renombrar(id, nombre) {
+        const camion = this.lista.find(c => String(c.id) === String(id));
+        if (!camion) return;
+        const limpio = String(nombre || '').trim();
+        if (!limpio) return;
+        camion.nombre = limpio;
+        this._persistir(false);
+    },
+
+    agregarCliente(camionId, clienteId) {
+        if (!clienteId) return;
+        const id = String(clienteId);
+        this.lista.forEach(camion => {
+            camion.clientes = (camion.clientes || []).map(String).filter(actual => actual !== id);
+        });
+        const camion = this.lista.find(c => String(c.id) === String(camionId));
+        if (!camion) return;
+        camion.clientes.push(id);
+        this._persistir();
+    },
+
+    quitarCliente(camionId, clienteId) {
+        const camion = this.lista.find(c => String(c.id) === String(camionId));
+        if (!camion) return;
+        camion.clientes = (camion.clientes || []).filter(id => String(id) !== String(clienteId));
+        this._persistir();
+    },
+
+    _normalizar(lista) {
+        return (lista || []).map((camion, index) => {
+            let clientes = camion.clientes;
+            if (typeof clientes === 'string') {
+                try { clientes = JSON.parse(clientes); } catch (error) { clientes = []; }
+            }
+            return {
+                id: camion.id || ('c-' + index),
+                nombre: camion.nombre || ('Camión ' + (index + 1)),
+                orden: Number(camion.orden) || index + 1,
+                clientes: Array.isArray(clientes) ? clientes.map(String) : []
+            };
+        });
+    },
+
+    _leerLocal(fecha) {
+        try {
+            const raw = localStorage.getItem('sg_camiones:' + fecha);
+            const data = raw ? JSON.parse(raw) : [];
+            return this._normalizar(Array.isArray(data) ? data : []);
+        } catch (error) {
+            return [];
+        }
+    },
+
+    _guardarLocal(fecha, lista) {
+        localStorage.setItem('sg_camiones:' + fecha, JSON.stringify(lista));
+    },
+
+    _persistir(pintar = true) {
+        const fecha = AppState.currentDate;
+        const payload = this.lista.map((camion, index) => ({
+            id: camion.id,
+            nombre: camion.nombre,
+            orden: index + 1,
+            clientes: camion.clientes || []
+        }));
+        this._guardarLocal(fecha, payload);
+        if (pintar) this.render();
+        clearTimeout(this._guardando);
+        this._guardando = setTimeout(() => {
+            Utils.enSegundoPlano(() => API.guardarCamiones(fecha, payload), () => {
+                if (this._avisoScript) return;
+                this._avisoScript = true;
+                Utils.avisar('Quedó en esta compu. Publicá el script para verlo en otro dispositivo.');
+            });
+        }, 400);
+    },
+
+    imprimir(camionId) {
+        const lista = camionId
+            ? this.lista.filter(c => String(c.id) === String(camionId))
+            : this.lista;
+        if (!lista.length) {
+            Utils.showError('Agregá un camión primero.');
+            return;
+        }
+        Utils.openPrintHtml(this._documento(lista));
+    },
+
+    imprimirTodos() {
+        this.imprimir(null);
+    },
+
+    enviar(camionId) {
+        const lista = camionId
+            ? this.lista.filter(c => String(c.id) === String(camionId))
+            : this.lista;
+        if (!lista.length) {
+            Utils.showError('Agregá un camión primero.');
+            return;
+        }
+        if (lista.every(camion => !this._filas(camion).length)) {
+            Utils.showError('Esos camiones no tienen pedidos para enviar.');
+            return;
+        }
+        const titulo = lista.length === 1 ? lista[0].nombre : 'todos los camiones';
+        const content = `
+            <p class="modal-hint">Se arma el PDF de ${this._esc(titulo)} y se abre WhatsApp. En la computadora tenés que adjuntar el archivo que se descarga.</p>
+            <div class="form-group">
+                <label for="modal-camion-telefono">Teléfono de quien carga</label>
+                <input type="tel" id="modal-camion-telefono" class="form-control" placeholder="261...">
+            </div>
+        `;
+        Utils.showModal('Enviar hoja de carga', content, async () => {
+            const telefono = document.getElementById('modal-camion-telefono')?.value.trim();
+            if (!telefono) {
+                Utils.showError('Poné el teléfono.');
+                throw new Error('Falta teléfono');
+            }
+            await this._enviarPdf(lista, telefono);
+        }, 'Enviar PDF');
+    },
+
+    enviarTodos() {
+        this.enviar(null);
+    },
+
+    _documento(lista) {
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        const bloques = lista.map(camion => `
+            <section class="hoja">
+                <h1>${this._esc(camion.nombre)}</h1>
+                <p>${this._esc(fecha)} · Luciano Cargas</p>
+                ${this._tabla(camion)}
+            </section>
+        `).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Carga de camiones</title>
+            <style>
+                body { font-family: Arial, sans-serif; color: #111; margin: 16px; }
+                h1 { margin: 0 0 4px; font-size: 22px; }
+                p { margin: 0 0 12px; }
+                table { width: 100%; border-collapse: collapse; font-size: 12px; }
+                th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
+                th.num, td.num { text-align: right; }
+                th { background: #e8eef8; }
+                .hoja { break-after: page; page-break-after: always; }
+                .hoja:last-child { break-after: auto; page-break-after: auto; }
+                @media print { body { margin: 8mm; } }
+            </style></head><body>${bloques}
+            <script>window.addEventListener('load', function(){ setTimeout(function(){ window.print(); }, 200); });<\/script>
+            </body></html>`;
+    },
+
+    async _enviarPdf(lista, telefono) {
+        const JsPDF = await Precios._cargarJsPdf();
+        const doc = new JsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+        lista.forEach((camion, indice) => {
+            if (indice > 0) doc.addPage();
+            this._dibujarPdf(doc, camion);
+        });
+        const nombre = lista.length === 1
+            ? `carga-${String(lista[0].nombre).replace(/[^\w\-]+/g, '-')}.pdf`
+            : 'carga-camiones.pdf';
+        const blob = doc.output('blob');
+        const archivo = new File([blob], nombre, { type: 'application/pdf' });
+        const texto = lista.length === 1
+            ? `Te mando la carga de ${lista[0].nombre}.`
+            : 'Te mando la carga de los camiones.';
+        try {
+            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                await navigator.share({ files: [archivo], title: 'Carga de camiones', text: texto });
+                Utils.avisar('PDF listo. Elegí WhatsApp para enviarlo.');
+                return;
+            }
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+        }
+        doc.save(nombre);
+        WhatsAppService.openChat(telefono, texto + ' Va en el PDF.');
+        Utils.avisar('Se descargó el PDF. Adjuntalo en el chat.');
+    },
+
+    _dibujarPdf(doc, camion) {
+        const clientes = (camion.clientes || []).map(id => ({ id: String(id), nombre: this._nombreCliente(id) }));
+        const filas = this._filas(camion);
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        doc.setFontSize(16);
+        doc.text(String(camion.nombre || 'Camión'), 10, 14);
+        doc.setFontSize(10);
+        doc.text(String(fecha || ''), 10, 20);
+        const inicio = 28;
+        const anchoNombre = 48;
+        const anchoPuesto = 32;
+        const anchoTotal = 16;
+        const utiles = 277 - anchoNombre - anchoPuesto - anchoTotal;
+        const anchoCliente = clientes.length ? Math.max(12, utiles / clientes.length) : utiles;
+        let y = inicio;
+        const pintarCabeza = () => {
+            doc.setFontSize(8);
+            doc.text('Producto', 10, y);
+            clientes.forEach((cliente, index) => {
+                doc.text(String(cliente.nombre).slice(0, 12), 10 + anchoNombre + (index * anchoCliente), y);
+            });
+            doc.text('Total', 10 + anchoNombre + (clientes.length * anchoCliente), y);
+            doc.text('Puesto', 10 + anchoNombre + (clientes.length * anchoCliente) + anchoTotal, y);
+            y += 5;
+        };
+        pintarCabeza();
+        filas.forEach(fila => {
+            if (y > 190) {
+                doc.addPage();
+                y = 16;
+                pintarCabeza();
+            }
+            doc.text(String(fila.producto).slice(0, 28), 10, y);
+            clientes.forEach((cliente, index) => {
+                doc.text(this._cant(fila.cantidades[cliente.id]), 10 + anchoNombre + (index * anchoCliente), y);
+            });
+            doc.text(this._cant(fila.total), 10 + anchoNombre + (clientes.length * anchoCliente), y);
+            doc.text(String(fila.puesto).slice(0, 16), 10 + anchoNombre + (clientes.length * anchoCliente) + anchoTotal, y);
+            y += 5;
+        });
+    }
+};
+
 // Pedidos
 const Pedidos = {
     async load() {
@@ -2931,30 +3550,42 @@ const Pedidos = {
         if (!tbody) return;
 
         const fecha = AppState.currentDate;
-        const cached = CacheManager.get(`pedidos:${fecha}`) || CacheManager.get(`flujo:${fecha}`)?.pedidos;
+        const fresco = CacheManager.get(`pedidos:${fecha}`) || CacheManager.get(`flujo:${fecha}`)?.pedidos;
+        const cached = Array.isArray(fresco)
+            ? fresco
+            : (CacheManager.peek(`pedidos:${fecha}`) || CacheManager.peek(`flujo:${fecha}`)?.pedidos);
         if (Array.isArray(cached)) {
             AppState.pedidos = cached;
+            AppState.fechaCargada = fecha;
             this.aplicarEnviadosLocales();
             this.render();
-        } else {
+            if (Array.isArray(fresco)) return;
+        } else if (AppState.fechaCargada === fecha) {
+            this.aplicarEnviadosLocales();
+            this.render();
+            return;
+        } else if (DiaOperativo.diaSinPedidos(fecha)) {
             AppState.pedidos = [];
-            Utils.showLoader(tbody);
+            AppState.fechaCargada = fecha;
+            this.render();
+            return;
         }
 
+        if (!Array.isArray(cached)) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">Buscando pedidos…</td></tr>';
+        }
+        this.ensureDatosProveedor().catch(() => {});
+
         try {
-            const flujoPromise = DataLoader.getFlujo(fecha);
-            await this.ensureDatosProveedor();
-            const flujo = await flujoPromise;
+            const flujo = await DataLoader.getFlujo(fecha);
             if (AppState.currentDate !== fecha) return;
             AppState.pedidos = flujo.pedidos || [];
+            AppState.fechaCargada = fecha;
             this.aplicarEnviadosLocales();
             this.render();
         } catch (error) {
             console.error('Error loading pedidos:', error);
             Utils.hideLoader(tbody);
-            if (AppState.currentPage === 'pedidos' && AppState.currentDate === fecha && !Array.isArray(cached)) {
-                Utils.showError('Error al cargar pedidos');
-            }
         }
     },
     
@@ -3153,41 +3784,10 @@ const Pedidos = {
                     return;
                 }
                 
-                console.log('🔵 Llamando a API.createPedido...');
-                
-                // Crear el pedido
-                const result = await API.createPedido({
-                    fecha: AppState.currentDate,
-                    cliente_id: clienteId,
-                    producto_id: productoId,
-                    tipo: producto.tipo,
-                    cantidad: cantidad
-                });
-                
-                console.log('✅ Pedido creado, resultado:', result);
-                console.log('🔍 Tipo de resultado:', typeof result, Array.isArray(result) ? '(array)' : '(no array)');
-                
-                // Verificar que el resultado sea válido
-                // Si result es un array vacío, puede ser que no se guardó correctamente
-                if (Array.isArray(result) && result.length === 0) {
-                    console.error('❌ El servidor devolvió un array vacío. El pedido no se guardó.');
-                    Utils.showError('Error: El pedido no se guardó correctamente. El servidor devolvió una respuesta vacía.');
-                    return;
-                }
-                
-                // Si result es un objeto con id, se guardó correctamente
-                if (result && typeof result === 'object' && !Array.isArray(result) && result.id) {
-                    console.log('✅ Pedido guardado con ID:', result.id);
-                } else if (result && typeof result === 'object' && !Array.isArray(result)) {
-                    console.log('✅ Pedido guardado, datos:', result);
-                } else {
-                    console.warn('⚠️ Resultado inesperado:', result);
-                }
-                
                 const cliente = clientes.find(c => String(c.id) === String(clienteId));
+                const tempId = 'local-' + Date.now();
                 const nuevoPedido = {
-                    ...result,
-                    id: result.id,
+                    id: tempId,
                     fecha: AppState.currentDate,
                     cliente_id: clienteId,
                     producto_id: productoId,
@@ -3195,36 +3795,44 @@ const Pedidos = {
                     producto_nombre: producto.nombre,
                     tipo: producto.tipo,
                     cantidad,
+                    enviado: false
                 };
                 Utils.upsertInList(AppState.pedidos, nuevoPedido);
                 CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
-                DataLoader.invalidateFlujo(AppState.currentDate);
                 this.render();
-                DiaOperativo.refresh().catch(() => {});
-                
-                // Verificar si realmente se guardó buscando el pedido en la lista
-                const pedidosActualizados = AppState.pedidos || [];
-                const pedidoGuardado = pedidosActualizados.find(p => 
-                    String(p.cliente_id) === String(clienteId) && 
-                    String(p.producto_id) === String(productoId) && 
-                    String(p.cantidad) === String(cantidad) &&
-                    p.fecha === AppState.currentDate
-                );
-                
+                Utils.avisar('Pedido agregado');
+                DiaOperativo.refreshSoon();
+
                 const seguirCargando = document.getElementById('modal-seguir-cargando')?.checked;
-                if (pedidoGuardado) {
-                    console.log('✅ Pedido verificado en la lista:', pedidoGuardado);
-                    await Utils.showSuccess('Pedido agregado correctamente');
-                } else {
-                    console.error('❌ El pedido no aparece después de recargar');
-                    console.log('🔍 Pedidos actuales:', pedidosActualizados);
-                    console.log('🔍 Buscando:', { clienteId, productoId, cantidad, fecha: AppState.currentDate });
-                    await Utils.showError('El pedido se envió pero no aparece en la lista. Por favor, verifica en el servidor o intenta nuevamente.');
+                if (seguirCargando) {
+                    setTimeout(() => Pedidos.add(clienteId), 40);
                 }
 
-                if (seguirCargando && pedidoGuardado) {
-                    setTimeout(() => Pedidos.add(clienteId), 0);
-                }
+                const payload = {
+                    fecha: AppState.currentDate,
+                    cliente_id: clienteId,
+                    producto_id: productoId,
+                    tipo: producto.tipo,
+                    cantidad
+                };
+                Utils.enSegundoPlano(async () => {
+                    const result = await API.createPedido(payload);
+                    const guardado = (AppState.pedidos || []).find(p => p.id === tempId);
+                    if (!guardado) return;
+                    guardado.id = result.id || tempId;
+                    Object.assign(guardado, result, {
+                        cliente_nombre: nuevoPedido.cliente_nombre,
+                        producto_nombre: nuevoPedido.producto_nombre,
+                        tipo: nuevoPedido.tipo,
+                        cantidad
+                    });
+                    CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+                }, () => {
+                    Utils.removeFromList(AppState.pedidos, tempId);
+                    CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+                    if (AppState.currentPage === 'pedidos') Pedidos.render();
+                    Utils.showError('No se pudo guardar el pedido. Se quitó de la lista.');
+                });
             } catch (error) {
                 console.error('❌ Error en creación de pedido:', error);
                 Utils.showError('Error al crear pedido: ' + error.message);
@@ -3239,27 +3847,41 @@ const Pedidos = {
             return;
         }
         
-        const clientes = await API.getClientes();
-        const productos = await API.getProductos();
+        if (!AppState.clientes?.length) AppState.clientes = await API.getClientes();
+        if (!AppState.productos?.length) AppState.productos = await API.getProductos();
+        const clientes = AppState.clientes;
+        const productos = AppState.productos;
+        await this.ensureDatosProveedor();
+        const proveedores = this.getProveedoresActivos(AppState.proveedores);
+        const productoActual = productos.find(p => String(p.id) === String(pedido.producto_id));
+        const proveedorActual = pedido.proveedor_id || productoActual?.proveedor_default || '';
         
         const content = `
             <div class="form-group">
                 <label>Cliente</label>
                 <select id="modal-cliente" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${clientes.map(c => `<option value="${c.id}" ${c.id === pedido.cliente_id ? 'selected' : ''}>${c.nombre}</option>`).join('')}
+                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(pedido.cliente_id) ? 'selected' : ''}>${c.nombre}</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
                 <label>Producto</label>
                 <select id="modal-producto" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${productos.map(p => `<option value="${p.id}" ${p.id === pedido.producto_id ? 'selected' : ''}>${p.nombre} (${p.tipo})</option>`).join('')}
+                    ${productos.map(p => `<option value="${p.id}" ${String(p.id) === String(pedido.producto_id) ? 'selected' : ''}>${p.nombre} (${p.tipo})</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
                 <label>Cantidad</label>
                 <input type="number" id="modal-cantidad" class="form-control" min="1" value="${pedido.cantidad || 1}">
+            </div>
+            <div class="form-group">
+                <label>Proveedor</label>
+                <select id="modal-proveedor" class="form-control">
+                    <option value="">Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${p.id}" ${String(p.id) === String(proveedorActual) ? 'selected' : ''}>${p.nombre}</option>`).join('')}
+                </select>
+                <small class="modal-hint">El mismo producto puede pedirse a distintos proveedores. Este cambio vale solo para este pedido.</small>
             </div>
         `;
         
@@ -3267,31 +3889,45 @@ const Pedidos = {
             const clienteId = document.getElementById('modal-cliente').value;
             const productoId = document.getElementById('modal-producto').value;
             const cantidad = parseInt(document.getElementById('modal-cantidad').value);
+            const proveedorId = document.getElementById('modal-proveedor').value;
             
             if (!clienteId || !productoId || !cantidad) {
                 Utils.showError('Complete todos los campos');
                 return;
             }
             
-            const producto = productos.find(p => p.id == productoId);
-            
-            try {
+            const producto = productos.find(p => String(p.id) === String(productoId));
+            const cliente = clientes.find(c => String(c.id) === String(clienteId));
+            const anterior = { ...pedido };
+            Object.assign(pedido, {
+                cliente_id: clienteId,
+                producto_id: productoId,
+                tipo: producto?.tipo || pedido.tipo,
+                cantidad,
+                proveedor_id: proveedorId,
+                cliente_nombre: cliente?.nombre || pedido.cliente_nombre,
+                producto_nombre: producto?.nombre || pedido.producto_nombre
+            });
+            CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
+            this.render();
+            Utils.avisar('Pedido actualizado');
+
+            Utils.enSegundoPlano(async () => {
                 await API.updatePedido(id, {
                     fecha: pedido.fecha,
                     cliente_id: clienteId,
                     producto_id: productoId,
-                    tipo: producto.tipo,
-                    cantidad: cantidad
+                    tipo: pedido.tipo,
+                    cantidad,
+                    proveedor_id: proveedorId
                 });
-                
-                CacheManager.invalidatePattern('pedidos');
-                
-                Utils.showSuccess('Pedido actualizado correctamente');
-                await Pedidos.load();
-            } catch (error) {
-                console.error('Error updating pedido:', error);
-                Utils.showError('Error al actualizar el pedido');
-            }
+                CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
+            }, () => {
+                Object.assign(pedido, anterior);
+                CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
+                if (AppState.currentPage === 'pedidos') Pedidos.render();
+                Utils.showError('No se pudo actualizar el pedido.');
+            });
         });
     },
     
@@ -3300,21 +3936,19 @@ const Pedidos = {
         const confirmar = await Utils.showConfirm('¿Está seguro de eliminar este pedido?');
         if (!confirmar) return;
         
-        const tbody = document.getElementById('pedidos-tbody');
-        Utils.showLoader(tbody);
-        try {
-            await API.deletePedido(id);
-            Utils.removeFromList(AppState.pedidos, id);
-            CacheManager.invalidate(`pedidos:${AppState.currentDate}`);
+        const anterior = (AppState.pedidos || []).find(p => String(p.id) === String(id));
+        Utils.removeFromList(AppState.pedidos, id);
+        CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+        this.render();
+        Utils.avisar('Pedido eliminado');
+        DiaOperativo.refreshSoon();
+
+        Utils.enSegundoPlano(() => API.deletePedido(id), () => {
+            if (anterior) Utils.upsertInList(AppState.pedidos, anterior);
             CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
-            this.render();
-            Utils.showSuccess('Pedido eliminado');
-        } catch (error) {
-            console.error('Error deleting pedido:', error);
-            Utils.showError('Error al eliminar pedido: ' + error.message);
-        } finally {
-            Utils.hideLoader(tbody);
-        }
+            if (AppState.currentPage === 'pedidos') Pedidos.render();
+            Utils.showError('No se pudo eliminar el pedido.');
+        });
     },
     
     async save() {
@@ -3333,7 +3967,7 @@ const Pedidos = {
             const grupos = {};
             pendientes.forEach(pedido => {
                 const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
-                const proveedorId = producto?.proveedor_default || PedidoProveedorService.SIN_PROVEEDOR_ID;
+                const proveedorId = pedido.proveedor_id || producto?.proveedor_default || PedidoProveedorService.SIN_PROVEEDOR_ID;
                 if (!grupos[proveedorId]) grupos[proveedorId] = [];
                 grupos[proveedorId].push(pedido);
             });
@@ -3407,7 +4041,8 @@ const Pedidos = {
 
     resolverProveedorPedido(pedido) {
         const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido?.producto_id));
-        const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(producto?.proveedor_default || ''));
+        const proveedorId = pedido?.proveedor_id || producto?.proveedor_default || '';
+        const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
         return {
             producto,
             proveedor,
@@ -3609,20 +4244,20 @@ const Pedidos = {
         this.actualizarPreviewModalProveedor(proveedorDefault, pedido);
     },
 
-    async asignarProductoAlProveedor(proveedorId, productoId) {
-        const producto = AppState.productos.find(p => String(p.id) === String(productoId));
-        if (!producto) return;
-
-        await API.updateProducto(productoId, {
-            id: productoId,
-            nombre: producto.nombre,
-            tipo: producto.tipo,
-            unidad: producto.unidad,
-            proveedor_default: proveedorId
+    async guardarProveedorDelPedido(pedido, proveedorId) {
+        await API.updatePedido(pedido.id, {
+            fecha: pedido.fecha,
+            cliente_id: pedido.cliente_id,
+            producto_id: pedido.producto_id,
+            tipo: pedido.tipo,
+            cantidad: pedido.cantidad,
+            proveedor_id: proveedorId
         });
-
-        producto.proveedor_default = proveedorId;
-        CacheManager.invalidate('productos');
+        pedido.proveedor_id = proveedorId;
+        const lista = AppState.pedidos || [];
+        const local = lista.find(p => String(p.id) === String(pedido.id));
+        if (local) local.proveedor_id = proveedorId;
+        CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, lista);
     },
 
     abrirModalEnviarPedido(pedido, modo = 'seleccionar') {
@@ -3635,9 +4270,10 @@ const Pedidos = {
 
         const producto = AppState.productos.find(p => String(p.id) === String(pedido.producto_id));
 
-        const proveedorDefault = producto?.proveedor_default &&
-            proveedoresActivos.some(p => String(p.id) === String(producto.proveedor_default))
-            ? producto.proveedor_default
+        const proveedorElegido = pedido.proveedor_id || producto?.proveedor_default || '';
+        const proveedorDefault = proveedorElegido &&
+            proveedoresActivos.some(p => String(p.id) === String(proveedorElegido))
+            ? proveedorElegido
             : proveedoresActivos[0].id;
 
         const saveLabel = esReSeleccion
@@ -3705,7 +4341,7 @@ const Pedidos = {
                 );
             }
 
-            await this.asignarProductoAlProveedor(proveedorId, pedido.producto_id);
+            await this.guardarProveedorDelPedido(pedido, proveedorId);
 
             const modoEnvio = await WhatsAppService.sendOrOpen(
                 proveedor.telefono,
@@ -3745,7 +4381,7 @@ const Pedidos = {
                 );
             }
 
-            await this.asignarProductoAlProveedor(proveedorId, pedido.producto_id);
+            await this.guardarProveedorDelPedido(pedido, proveedorId);
 
             const context = {
                 pedidos: AppState.pedidos,
@@ -3777,6 +4413,7 @@ const Pedidos = {
 
 // Recepción
 const Recepcion = {
+    vista: 'hoy',
     _actionsBound: false,
 
     findById(list, id) {
@@ -3786,6 +4423,51 @@ const Recepcion = {
 
     findRecepcionForProducto(recepciones, productoId) {
         return recepciones.find(r => String(r.producto_id) === String(productoId)) || null;
+    },
+
+    _prepararDiaPendiente() {
+        const heading = document.querySelector('#recepcion .page-header h2');
+        const hint = document.querySelector('#recepcion .dia-operativo-hint');
+        if (this.vista !== 'pendientes') {
+            if (heading) heading.textContent = 'Confirmación de lo que llegó';
+            if (hint) {
+                hint.innerHTML = 'Confirmá <strong>cada producto</strong> cuando llegue. Al confirmar se arma la lista de precios al cliente con lo que llegó. Los que falten podés confirmarlos otro día (poné 0 en "Llegó" si no vino).';
+            }
+            return false;
+        }
+
+        if (heading) heading.textContent = 'Confirmar recepción (pendientes)';
+        if (hint) {
+            hint.innerHTML = 'Elegí el día que todavía no recibiste. Sirve para confirmar hoy lo que se pidió ayer.';
+        }
+
+        const dias = (DiaOperativo.diasPendientes || []).filter(d => d.estado === 'recepcion_pendiente');
+        if (!dias.length || dias.some(d => d.fecha === AppState.currentDate)) return false;
+
+        const fecha = dias[0].fecha;
+        DiaOperativo.workDate = fecha;
+        AppState.currentDate = fecha;
+        sessionStorage.setItem('sg_work_date', fecha);
+        DiaOperativo.renderSelectors();
+        return true;
+    },
+
+    _proveedorDePedidos(pedidos, productoId) {
+        const conteo = {};
+        (pedidos || []).forEach(pedido => {
+            if (String(pedido.producto_id) !== String(productoId) || !pedido.proveedor_id) return;
+            const id = String(pedido.proveedor_id);
+            conteo[id] = (conteo[id] || 0) + (parseFloat(pedido.cantidad) || 1);
+        });
+        let mejor = '';
+        let max = 0;
+        Object.keys(conteo).forEach(id => {
+            if (conteo[id] > max) {
+                max = conteo[id];
+                mejor = id;
+            }
+        });
+        return mejor;
     },
 
     initActions() {
@@ -3866,16 +4548,25 @@ const Recepcion = {
         if (!tbody) return;
 
         this.initActions();
+        const cambioDia = this._prepararDiaPendiente();
+        if (cambioDia) AppState.recepcion = [];
         const fecha = AppState.currentDate;
         const token = DataLoader._flujoToken;
-        const cachedRec = CacheManager.get(`recepcion:${fecha}`);
-        const hasStale = AppState.recepcion.length > 0 || cachedRec;
-        const editando = tbody.contains(document.activeElement);
-        if (hasStale && !editando) {
-            if (!AppState.recepcion.length && cachedRec) AppState.recepcion = cachedRec;
-            if (AppState.recepcion.length) this.render();
-        } else if (!hasStale) {
-            Utils.showLoader(tbody);
+        if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.recepcion = [];
+            AppState.fechaCargada = fecha;
+            this.render();
+            return;
+        }
+
+        const flujoLocal = DataLoader.armarFlujoLocal(fecha);
+        const flujoRecordado = flujoLocal || CacheManager.peek(`flujo:${fecha}`);
+        if (flujoRecordado && !flujoLocal) {
+            AppState.recepcion = flujoRecordado.recepcion || [];
+            if (Array.isArray(flujoRecordado.pedidos)) AppState.pedidos = flujoRecordado.pedidos;
+            this.render();
+        } else if (!flujoLocal && AppState.fechaCargada !== fecha) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">Buscando recepción…</td></tr>';
         }
 
         try {
@@ -3919,8 +4610,9 @@ const Recepcion = {
                 const pedidoInfo = pedidosPorProducto[productoId];
                 const producto = this.findById(productos, productoId);
                 const rec = this.findRecepcionForProducto(recepciones, productoId);
+                const proveedorPedidoId = this._proveedorDePedidos(pedidos, productoId);
                 const proveedor = producto
-                    ? this.findById(proveedores, producto.proveedor_default)
+                    ? this.findById(proveedores, proveedorPedidoId || producto.proveedor_default)
                     : null;
                 const local = (AppState.recepcion || []).find(r => String(r.producto_id) === String(productoId));
                 const confirmado = rec?.confirmado === true || rec?.confirmado === 'true';
@@ -3944,7 +4636,7 @@ const Recepcion = {
                     llego,
                     precio_real: precioReal,
                     proveedor_nombre: rec?.proveedor_nombre || proveedor?.nombre || local?.proveedor_nombre || '',
-                    proveedor_id: rec?.proveedor_id || producto?.proveedor_default || local?.proveedor_id || '',
+                    proveedor_id: (confirmado && rec?.proveedor_id) || proveedorPedidoId || rec?.proveedor_id || producto?.proveedor_default || local?.proveedor_id || '',
                     confirmado: confirmado || conservarLocal
                 });
             });
@@ -4065,39 +4757,49 @@ const Recepcion = {
         const ok = await Utils.showConfirm(`¿Confirmar ${listos.length} producto(s) con datos completos?${aviso}`);
         if (!ok) return;
 
-        Utils.showLoader();
-        try {
+        const anteriores = listos.map(entrada => ({ ...entrada.item }));
+        listos.forEach(entrada => {
+            const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(entrada.item.producto_id));
+            if (idx !== -1) {
+                AppState.recepcion[idx] = {
+                    ...AppState.recepcion[idx],
+                    llego: entrada.llego,
+                    precio_real: entrada.precio,
+                    confirmado: true
+                };
+            }
+            this._ajustarSaldoProveedor(entrada.item.proveedor_id, this._subtotal(entrada.llego, entrada.precio));
+        });
+        CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+        CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this.render();
+        Utils.avisar(`Se confirmaron ${listos.length} producto(s)`);
+        DiaOperativo.refreshSoon();
+
+        Utils.enSegundoPlano(async () => {
             for (const entrada of listos) {
                 await API.confirmarRecepcionItem({
                     fecha: AppState.currentDate,
                     producto_id: entrada.item.producto_id,
                     llego: entrada.llego,
-                    precio_real: entrada.precio
+                    precio_real: entrada.precio,
+                    proveedor_id: entrada.item.proveedor_id,
+                    pedido_total: entrada.item.pedido_total
                 });
-                const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(entrada.item.producto_id));
-                if (idx !== -1) {
-                    AppState.recepcion[idx] = {
-                        ...AppState.recepcion[idx],
-                        llego: entrada.llego,
-                        precio_real: entrada.precio,
-                        confirmado: true
-                    };
-                }
-                this._ajustarSaldoProveedor(entrada.item.proveedor_id, this._subtotal(entrada.llego, entrada.precio));
             }
+            this._armarListaPrecios();
+        }, () => {
+            listos.forEach(entrada => {
+                this._ajustarSaldoProveedor(entrada.item.proveedor_id, -this._subtotal(entrada.llego, entrada.precio));
+            });
+            anteriores.forEach(anterior => {
+                const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(anterior.producto_id));
+                if (idx !== -1) AppState.recepcion[idx] = anterior;
+            });
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
             this.render();
-            CacheManager.invalidate(`recepcion:${AppState.currentDate}`);
-            CacheManager.invalidate(`flujo:${AppState.currentDate}`);
-            await DiaOperativo.refresh();
-            await this.load();
-            const lista = await this._armarListaPrecios();
-            const extra = this._textoListaPrecios(lista);
-            Utils.showSuccess(`Se confirmaron ${listos.length} producto(s).${extra}`);
-        } catch (error) {
-            Utils.showError('Error al confirmar: ' + error.message);
-        } finally {
-            Utils.hideLoader();
-        }
+            Utils.showError('No se pudo confirmar la recepción. Volvé a intentarlo.');
+        });
     },
 
     getValoresProducto(productoId) {
@@ -4136,40 +4838,41 @@ const Recepcion = {
         );
         if (!confirmar) return;
 
-        const btnConfirmar = document.querySelector(`.btn-confirmar-recepcion-item[data-producto-id="${productoId}"]`);
-        try {
-            if (btnConfirmar) Utils.setButtonLoading(btnConfirmar, true);
+        const anterior = { ...item };
+        const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+        if (idx !== -1) {
+            AppState.recepcion[idx] = {
+                ...AppState.recepcion[idx],
+                llego,
+                precio_real: precio,
+                confirmado: true
+            };
+        }
+        this._ajustarSaldoProveedor(item.proveedor_id, this._subtotal(llego, precio));
+        CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+        CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this.render();
+        Utils.avisar(`"${nombre}" confirmado`);
+        DiaOperativo.refreshSoon();
 
+        Utils.enSegundoPlano(async () => {
             await API.confirmarRecepcionItem({
                 fecha: AppState.currentDate,
                 producto_id: productoId,
                 llego,
-                precio_real: precio
+                precio_real: precio,
+                proveedor_id: item.proveedor_id,
+                pedido_total: item.pedido_total
             });
-
-            // Actualizar estado local sin recargar del servidor
-            const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
-            if (idx !== -1) {
-                AppState.recepcion[idx] = {
-                    ...AppState.recepcion[idx],
-                    llego,
-                    precio_real: precio,
-                    confirmado: true
-                };
-            }
-            this._ajustarSaldoProveedor(item.proveedor_id, this._subtotal(llego, precio));
-            CacheManager.invalidate(`recepcion:${AppState.currentDate}`);
-            CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+            this._armarListaPrecios();
+        }, () => {
+            const actual = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+            if (actual !== -1) AppState.recepcion[actual] = anterior;
+            this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(llego, precio));
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
             this.render();
-            const lista = await this._armarListaPrecios();
-            Utils.showSuccess(`"${nombre}" confirmado.${this._textoListaPrecios(lista)}`);
-            DiaOperativo.refresh().catch(() => {});
-        } catch (error) {
-            console.error('Error confirming recepcion item:', error);
-            Utils.showError('Error al confirmar: ' + error.message);
-        } finally {
-            if (btnConfirmar) Utils.setButtonLoading(btnConfirmar, false);
-        }
+            Utils.showError('No se pudo confirmar "' + nombre + '".');
+        });
     },
 
     async editarProducto(productoId) {
@@ -4214,40 +4917,49 @@ const Recepcion = {
                 throw new Error('Precio real requerido');
             }
 
-            try {
+            const yaConfirmado = item.confirmado === true || item.confirmado === 'true';
+            const anterior = { llego: item.llego, precio_real: item.precio_real };
+            const delta = (yaConfirmado ? this._subtotal(llego, precio) : 0) - (yaConfirmado ? this._subtotal(item.llego, item.precio_real) : 0);
+            const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+            if (idx !== -1) {
+                AppState.recepcion[idx] = {
+                    ...AppState.recepcion[idx],
+                    llego,
+                    precio_real: precio
+                };
+            }
+            this._ajustarSaldoProveedor(item.proveedor_id, delta);
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+            CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+            this.render();
+            Utils.avisar(`Recepción de "${nombre}" actualizada`);
+
+            Utils.enSegundoPlano(async () => {
                 await API.saveRecepcion({
                     fecha: AppState.currentDate,
                     items: [{
                         producto_id: productoId,
                         llego,
-                        precio_real: precio
+                        precio_real: precio,
+                        pedido_total: item.pedido_total,
+                        proveedor_id: item.proveedor_id
                     }]
                 });
-
-                const yaConfirmado = item.confirmado === true || item.confirmado === 'true';
-                const delta = (yaConfirmado ? this._subtotal(llego, precio) : 0) - (yaConfirmado ? this._subtotal(item.llego, item.precio_real) : 0);
-                const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
-                if (idx !== -1) {
-                    AppState.recepcion[idx] = {
-                        ...AppState.recepcion[idx],
-                        llego,
-                        precio_real: precio
+                if (yaConfirmado) this._armarListaPrecios();
+            }, () => {
+                const actual = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+                if (actual !== -1) {
+                    AppState.recepcion[actual] = {
+                        ...AppState.recepcion[actual],
+                        llego: anterior.llego,
+                        precio_real: anterior.precio_real
                     };
                 }
-                this._ajustarSaldoProveedor(item.proveedor_id, delta);
+                this._ajustarSaldoProveedor(item.proveedor_id, -delta);
+                CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
                 this.render();
-                CacheManager.invalidate(`recepcion:${AppState.currentDate}`);
-                CacheManager.invalidate(`flujo:${AppState.currentDate}`);
-                const lista = yaConfirmado ? await this._armarListaPrecios() : null;
-                DiaOperativo.refresh().catch(() => {});
-                queueMicrotask(() => Utils.showSuccess(`Recepción de "${nombre}" actualizada.${yaConfirmado ? this._textoListaPrecios(lista) : ''}`));
-            } catch (error) {
-                console.error('Error updating recepcion item:', error);
-                if (error.message !== 'Cantidad inválida' && error.message !== 'Precio real requerido') {
-                    Utils.showError('Error al guardar: ' + error.message);
-                }
-                throw error;
-            }
+                Utils.showError('No se pudo guardar la recepción.');
+            });
         });
     },
 
@@ -4266,41 +4978,43 @@ const Recepcion = {
         );
         if (!confirmar) return;
 
-        const btnEliminar = document.querySelector(`.btn-eliminar-recepcion-item[data-producto-id="${productoId}"]`);
-        try {
-            if (btnEliminar) Utils.setButtonLoading(btnEliminar, true);
+        const estabaConfirmado = item.confirmado === true || item.confirmado === 'true';
+        const anterior = { ...item };
+        if (estabaConfirmado) {
+            this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(item.llego, item.precio_real));
+        }
+        const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+        if (idx !== -1) {
+            AppState.recepcion[idx] = {
+                ...AppState.recepcion[idx],
+                id: 'temp-' + productoId,
+                llego: 0,
+                precio_real: 0,
+                confirmado: false
+            };
+        }
+        CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+        CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this.render();
+        Utils.avisar(`Recepción de "${nombre}" eliminada`);
+        DiaOperativo.refreshSoon();
 
+        Utils.enSegundoPlano(async () => {
             await API.deleteRecepcionItem({
                 fecha: AppState.currentDate,
                 producto_id: productoId
             });
-
-            const estabaConfirmado = item.confirmado === true || item.confirmado === 'true';
+            if (estabaConfirmado) this._armarListaPrecios();
+        }, () => {
+            const actual = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+            if (actual !== -1) AppState.recepcion[actual] = anterior;
             if (estabaConfirmado) {
-                this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(item.llego, item.precio_real));
+                this._ajustarSaldoProveedor(anterior.proveedor_id, this._subtotal(anterior.llego, anterior.precio_real));
             }
-            const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
-            if (idx !== -1) {
-                AppState.recepcion[idx] = {
-                    ...AppState.recepcion[idx],
-                    id: 'temp-' + productoId,
-                    llego: 0,
-                    precio_real: 0,
-                    confirmado: false
-                };
-            }
-            CacheManager.invalidate(`recepcion:${AppState.currentDate}`);
-            CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
             this.render();
-            const lista = estabaConfirmado ? await this._armarListaPrecios() : null;
-            Utils.showSuccess(`Recepción de "${nombre}" eliminada.${estabaConfirmado ? this._textoListaPrecios(lista) : ''}`);
-            DiaOperativo.refresh().catch(() => {});
-        } catch (error) {
-            console.error('Error deleting recepcion item:', error);
-            Utils.showError('Error al eliminar: ' + error.message);
-        } finally {
-            if (btnEliminar) Utils.setButtonLoading(btnEliminar, false);
-        }
+            Utils.showError('No se pudo eliminar la recepción.');
+        });
     },
 
     async _armarListaPrecios() {
@@ -4331,18 +5045,39 @@ const Precios = {
         if (!tbody) return;
 
         const fecha = AppState.currentDate;
-        tbody.innerHTML = '';
-        const cachedPrecios = CacheManager.get(`precios:${fecha}`);
-        const hasStale = AppState.precios.length > 0 || cachedPrecios;
+        if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.precios = [];
+            AppState.fechaCargada = fecha;
+            this.recepciones = [];
+            this.render();
+            return;
+        }
+
+        const preciosFrescos = CacheManager.get(`precios:${fecha}`);
+        const cachedPrecios = preciosFrescos || CacheManager.peek(`precios:${fecha}`);
+        const flujoLocal = DataLoader.armarFlujoLocal(fecha);
+        if (flujoLocal) {
+            AppState.precios = flujoLocal.precios || [];
+            this.recepciones = flujoLocal.recepcion || [];
+            AppState.fechaCargada = fecha;
+            this.limpiarPrecioClienteAutomatico();
+            this.render();
+            this.loadClientesFilter();
+            return;
+        }
+
+        const hasStale = AppState.fechaCargada === fecha || AppState.precios.length > 0 || cachedPrecios;
         if (hasStale) {
             if (!AppState.precios.length && cachedPrecios) AppState.precios = cachedPrecios;
-            if (AppState.precios.length) {
-                this.recepciones = CacheManager.get(`recepcion:${fecha}`) || this.recepciones;
-                this.limpiarPrecioClienteAutomatico();
-                this.render();
+            this.recepciones = CacheManager.peek(`recepcion:${fecha}`) || this.recepciones;
+            this.limpiarPrecioClienteAutomatico();
+            this.render();
+            if (Array.isArray(preciosFrescos) || AppState.fechaCargada === fecha) {
+                this.loadClientesFilter();
+                return;
             }
         } else {
-            Utils.showLoader(tbody);
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">Buscando precios…</td></tr>';
         }
 
         try {
@@ -4776,23 +5511,21 @@ const Precios = {
         }
 
         this.sincronizarCobranza();
-        
-        try {
+        CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
+        Utils.avisar('Precios guardados');
+
+        Utils.enSegundoPlano(async () => {
             await API.savePreciosCliente({
                 fecha: AppState.currentDate,
                 comision_por_unidad: this.comisionPorUnidad,
                 items: items
             });
-            
-            Utils.showSuccess('Precios guardados correctamente');
+            CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
+        }, async () => {
+            Utils.showError('No se pudieron guardar los precios.');
             await this.load();
             this.sincronizarCobranza();
-        } catch (error) {
-            console.error('Error saving precios:', error);
-            Utils.showError('Error al guardar precios: ' + error.message);
-            await this.load();
-            this.sincronizarCobranza();
-        }
+        });
     },
     
     sincronizarCobranza() {
@@ -5002,12 +5735,6 @@ const Precios = {
             c => String(c.id) === String(this.selectedClienteId)
         );
         const sinTelefono = !cliente?.telefono || !String(cliente.telefono).trim();
-        const fechaLabel = DiaOperativo.formatFechaLabel(AppState.currentDate);
-        const mensajeDefault = PrecioClienteService.construirMensaje(
-            datos,
-            this.comisionPorUnidad,
-            fechaLabel
-        );
 
         const filasPreview = datos.filas.map(f => `
             <tr>
@@ -5018,7 +5745,7 @@ const Precios = {
             </tr>
         `).join('');
 
-        const saveLabel = AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp';
+        const saveLabel = 'Enviar PDF';
 
         const content = `
             <div class="form-group">
@@ -5029,7 +5756,7 @@ const Precios = {
                     : (cliente.telefono || '')}</small>
             </div>
             <div class="form-group">
-                <label>Detalle del pedido</label>
+                <label>PDF que se envía</label>
                 <div class="modal-pedido-preview-box">
                     <table class="modal-pedido-detalle-table">
                         <thead>
@@ -5050,47 +5777,92 @@ const Precios = {
                     </table>
                 </div>
             </div>
-            <div class="form-group">
-                <label>Mensaje de WhatsApp</label>
-                <textarea id="modal-precio-preview-mensaje" class="whatsapp-preview form-control" rows="10"></textarea>
-            </div>
+            <p class="modal-hint">Se arma un PDF con esta lista y se abre WhatsApp para enviarlo. En el celular podés compartirlo directo. En la computadora se descarga el archivo para que lo adjuntes en el chat.</p>
         `;
 
-        Utils.showModal('Enviar precios al cliente', content, async () => {
-            const mensaje = document.getElementById('modal-precio-preview-mensaje').value.trim();
-
-            if (!mensaje) {
-                Utils.showError('Escribí un mensaje para WhatsApp');
-                throw new Error('Mensaje requerido');
-            }
-
-            await this.ejecutarEnvioWhatsApp(cliente, mensaje);
+        Utils.showModal('Enviar PDF al cliente', content, async () => {
+            await this.ejecutarEnvioPdfWhatsApp(cliente, datos);
         }, saveLabel);
-
-        const previewMensaje = document.getElementById('modal-precio-preview-mensaje');
-        if (previewMensaje) previewMensaje.value = mensajeDefault;
 
         const saveBtn = document.getElementById('modal-save');
         if (saveBtn) saveBtn.disabled = sinTelefono;
     },
 
-    async ejecutarEnvioWhatsApp(cliente, mensaje) {
+    async _cargarJsPdf() {
+        if (window.jspdf && window.jspdf.jsPDF) return window.jspdf.jsPDF;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo cargar el generador de PDF'));
+            document.head.appendChild(script);
+        });
+        if (!window.jspdf || !window.jspdf.jsPDF) {
+            throw new Error('No se pudo cargar el generador de PDF');
+        }
+        return window.jspdf.jsPDF;
+    },
+
+    async _construirPdfPrecios(datos) {
+        const JsPDF = await this._cargarJsPdf();
+        const doc = new JsPDF({ unit: 'mm', format: 'a4' });
+        const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        doc.setFontSize(16);
+        doc.text('Luciano Cargas', 14, 18);
+        doc.setFontSize(12);
+        doc.text('Lista de precios', 14, 26);
+        doc.setFontSize(11);
+        doc.text(String(datos.clienteNombre || ''), 14, 34);
+        doc.setFontSize(10);
+        doc.text(String(fecha || ''), 14, 40);
+        let y = 50;
+        doc.text('Cant.', 14, y);
+        doc.text('Producto', 32, y);
+        doc.text('Precio', 130, y);
+        doc.text('Total', 165, y);
+        y += 6;
+        (datos.filas || []).forEach(fila => {
+            if (y > 275) {
+                doc.addPage();
+                y = 20;
+            }
+            const unitario = (parseFloat(fila.precioUnitario) || 0) + extra;
+            const subtotal = unitario * (parseFloat(fila.cantidad) || 0);
+            doc.text(String(fila.cantidad ?? ''), 14, y);
+            doc.text(String(fila.producto || '').slice(0, 42), 32, y);
+            doc.text(Utils.formatCurrency(unitario), 130, y);
+            doc.text(Utils.formatCurrency(subtotal), 165, y);
+            y += 7;
+        });
+        doc.setFontSize(12);
+        doc.text('Total a pagar: ' + Utils.formatCurrency(datos.saldoTotal), 14, Math.min(y + 8, 285));
+        return doc;
+    },
+
+    async ejecutarEnvioPdfWhatsApp(cliente, datos) {
         try {
-            PrecioClienteService.validarEnvio(cliente, this._obtenerDatosClienteParaExportar());
+            PrecioClienteService.validarEnvio(cliente, datos);
+            const doc = await this._construirPdfPrecios(datos);
+            const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.pdf`;
+            const blob = doc.output('blob');
+            const archivo = new File([blob], nombre, { type: 'application/pdf' });
 
-            const modoEnvio = await WhatsAppService.sendOrOpen(
-                cliente.telefono,
-                mensaje,
-                API,
-                AppState.whatsappAutoEnvio
-            );
+            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                await navigator.share({
+                    files: [archivo],
+                    title: 'Lista de precios',
+                    text: `Lista de precios de ${datos.clienteNombre || 'cliente'}`
+                });
+                Utils.showSuccess(`PDF listo para enviar a ${cliente.nombre}. Elegí WhatsApp.`);
+                return;
+            }
 
-            const mensajeExito = modoEnvio === 'auto'
-                ? `WhatsApp enviado a ${cliente.nombre}.`
-                : `WhatsApp abierto para ${cliente.nombre}.`;
-
-            Utils.showSuccess(mensajeExito);
+            doc.save(nombre);
+            WhatsAppService.openChat(cliente.telefono, 'Te envío la lista de precios en el PDF.');
+            Utils.showSuccess(`Se descargó el PDF. Adjuntalo en el chat de ${cliente.nombre}.`);
         } catch (error) {
+            if (error && error.name === 'AbortError') return;
             this.handleWhatsAppError(error);
             throw error;
         }
@@ -5625,13 +6397,156 @@ const Cierre = {
     }
 };
 
+const MediosPago = {
+    deCliente: [
+        ['efectivo', 'Efectivo'],
+        ['transferencia', 'Transferencia'],
+        ['cheque', 'Cheque'],
+        ['tarjeta', 'Tarjeta de crédito']
+    ],
+    deProveedor: [
+        ['efectivo', 'Efectivo'],
+        ['transferencia', 'Transferencia']
+    ],
+
+    vacio() {
+        return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0 };
+    },
+
+    parse(valor) {
+        const medios = this.vacio();
+        let raw = valor;
+        if (typeof raw === 'string' && raw.trim()) {
+            try { raw = JSON.parse(raw); } catch (error) { raw = null; }
+        }
+        if (!raw || typeof raw !== 'object') return medios;
+        Object.keys(medios).forEach(id => {
+            medios[id] = Utils.parsePrice(raw[id]) || 0;
+        });
+        return medios;
+    },
+
+    total(medios) {
+        return Object.keys(this.vacio()).reduce((sum, id) => sum + (parseFloat(medios?.[id]) || 0), 0);
+    },
+
+    sumar(a, b) {
+        const base = this.parse(a);
+        const extra = this.parse(b);
+        Object.keys(base).forEach(id => {
+            base[id] = Math.round((base[id] + extra[id]) * 100) / 100;
+        });
+        return base;
+    },
+
+    texto(medios) {
+        const datos = this.parse(medios);
+        const partes = this.deCliente
+            .filter(([id]) => datos[id] > 0)
+            .map(([id, label]) => `${label} ${Utils.formatCurrency(datos[id])}`);
+        return partes.length ? partes.join(' · ') : '—';
+    },
+
+    html(tipos, valores) {
+        const datos = this.parse(valores);
+        const campos = tipos.map(([id, label]) => `
+            <div class="form-group medios-campo">
+                <label for="medio-${id}">${label}</label>
+                <input type="text" id="medio-${id}" class="form-control medio-monto" data-medio="${id}" data-price-input="true" value="${datos[id] > 0 ? Utils.formatPrice(datos[id]) : ''}" placeholder="0" inputmode="numeric">
+            </div>
+        `).join('');
+        return `
+            <div class="medios-pago">
+                <div class="medios-grid">${campos}</div>
+                <div class="pago-chips">
+                    <button type="button" class="pago-chip" id="medios-chip-efectivo">Todo en efectivo</button>
+                </div>
+                <div class="medios-resumen">
+                    <p>Ahora: <strong id="medios-suma">$ 0</strong></p>
+                    <p id="medios-resto-linea">Queda adeudado: <strong id="medios-resto">$ 0</strong></p>
+                </div>
+                <p class="pago-preview" id="medios-aviso" hidden></p>
+            </div>
+        `;
+    },
+
+    leer() {
+        const medios = this.vacio();
+        document.querySelectorAll('.medio-monto').forEach(input => {
+            const id = input.dataset.medio;
+            if (Object.prototype.hasOwnProperty.call(medios, id)) {
+                medios[id] = Utils.parsePrice(input.value) || 0;
+            }
+        });
+        const lista = Object.keys(medios)
+            .filter(id => medios[id] > 0)
+            .map(id => ({ metodo: id, monto: medios[id] }));
+        return { medios, lista, total: this.total(medios) };
+    },
+
+    poner(valores) {
+        const datos = this.parse(valores);
+        document.querySelectorAll('.medio-monto').forEach(input => {
+            const id = input.dataset.medio;
+            const monto = datos[id] || 0;
+            input.value = monto > 0 ? Utils.formatPrice(monto) : '';
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+    },
+
+    enganchar(saldo, opciones = {}) {
+        const tope = opciones.tope !== false;
+        const linea = document.getElementById('medios-resto-linea');
+        if (linea && opciones.ocultarAdeudado) linea.hidden = true;
+        const actualizar = () => {
+            const { total } = this.leer();
+            const suma = document.getElementById('medios-suma');
+            const resto = document.getElementById('medios-resto');
+            const aviso = document.getElementById('medios-aviso');
+            if (suma) suma.textContent = Utils.formatCurrency(total);
+            const queda = Math.max(0, (parseFloat(saldo) || 0) - total);
+            if (resto) resto.textContent = Utils.formatCurrency(queda);
+            if (!aviso) return;
+            if (tope && total > saldo + 0.01) {
+                aviso.hidden = false;
+                aviso.textContent = 'La suma supera lo adeudado (' + Utils.formatCurrency(saldo) + ').';
+                return;
+            }
+            if (total > 0 && !opciones.ocultarAdeudado && queda > 0.01) {
+                aviso.hidden = false;
+                aviso.textContent = 'Queda un saldo adeudado de ' + Utils.formatCurrency(queda) + '.';
+                return;
+            }
+            if (total > 0 && !opciones.ocultarAdeudado) {
+                aviso.hidden = false;
+                aviso.textContent = 'No queda saldo adeudado.';
+                return;
+            }
+            aviso.hidden = true;
+            aviso.textContent = '';
+        };
+        document.querySelectorAll('.medio-monto').forEach(input => {
+            input.addEventListener('input', actualizar);
+            input.addEventListener('change', actualizar);
+        });
+        document.getElementById('medios-chip-efectivo')?.addEventListener('click', () => {
+            const lleno = this.vacio();
+            if (saldo > 0) lleno.efectivo = saldo;
+            this.poner(lleno);
+            actualizar();
+        });
+        actualizar();
+        return actualizar;
+    }
+};
+
 // Cobranzas
 const Cobranzas = {
     async load() {
         const tbody = document.getElementById('cobranzas-tbody');
         if (!tbody) return;
 
-        const cached = CacheManager.get('cobranzas:all:all');
+        const cached = CacheManager.peek('cobranzas:all:all');
         const hasStale = AppState.cobranzas.length > 0 || cached;
         if (hasStale) {
             const todas = cached || AppState.cobranzas;
@@ -5664,7 +6579,7 @@ const Cobranzas = {
         tbody.innerHTML = '';
         
         if (AppState.cobranzas.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; padding: 30px; color: #666;">' +
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 30px; color: #666;">' +
                 'No hay cobranzas pendientes.' +
                 '</td></tr>';
             return;
@@ -5681,6 +6596,7 @@ const Cobranzas = {
             tr.innerHTML = `
                 <td data-label="Cliente">${cliente.nombre || ''}</td>
                 <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
+                <td data-label="Cómo pagó" class="medios-texto">${MediosPago.texto(cobranza.medios)}</td>
                 <td data-label="Fecha">${Utils.formatDate(cobranza.fecha)}</td>
                 <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span></td>
                 <td data-label="Acciones">
@@ -5704,34 +6620,6 @@ const Cobranzas = {
         };
     },
 
-    _setMontoCobro(valor) {
-        const input = document.getElementById('modal-cobro-monto');
-        if (!input) return;
-        input.value = valor > 0 ? Utils.formatPrice(valor) : '';
-        this._actualizarPreviewCobro();
-    },
-
-    _actualizarPreviewCobro() {
-        const preview = document.getElementById('modal-cobro-preview');
-        const saldo = Utils.parsePrice(preview?.dataset.saldo || 0);
-        const monto = Utils.parsePrice(document.getElementById('modal-cobro-monto')?.value || 0);
-        if (!preview) return;
-        if (!monto || monto <= 0) {
-            preview.hidden = true;
-            preview.innerHTML = '';
-            return;
-        }
-        preview.hidden = false;
-        if (monto > saldo) {
-            preview.innerHTML = `Ese monto supera lo que te debe (${Utils.formatCurrency(saldo)}).`;
-            return;
-        }
-        const resto = saldo - monto;
-        preview.innerHTML = resto > 0
-            ? `Vas a cobrar <strong>${Utils.formatCurrency(monto)}</strong>. Queda ${Utils.formatCurrency(resto)}.`
-            : `Vas a cobrar todo (${Utils.formatCurrency(monto)}).`;
-    },
-
     async cobrar(cobranzaId) {
         const cobranza = (AppState.cobranzas || []).find(c => String(c.id) === String(cobranzaId));
         if (!cobranza) {
@@ -5746,74 +6634,69 @@ const Cobranzas = {
             return;
         }
 
+        const inicial = MediosPago.vacio();
+        inicial.efectivo = saldo;
         const content = `
             <div class="form-group">
-                <label for="modal-cobro-deuda">Dinero a cobrar</label>
+                <label for="modal-cobro-deuda">Te debe</label>
                 <input type="text" id="modal-cobro-deuda" class="form-control" value="${Utils.formatCurrency(saldo)}" readonly tabindex="-1">
             </div>
-            <div class="form-group">
-                <label for="modal-cobro-monto">Monto</label>
-                <input type="text" id="modal-cobro-monto" class="form-control" data-price-input="true" value="${Utils.formatPrice(saldo)}" placeholder="0" inputmode="numeric">
-                <div class="pago-chips">
-                    <button type="button" class="pago-chip" id="cobro-chip-todo">Cobrar todo (${Utils.formatCurrency(saldo)})</button>
-                </div>
-            </div>
-            <div class="form-group">
-                <label for="modal-cobro-metodo">Cómo te paga</label>
-                <select id="modal-cobro-metodo" class="form-control">
-                    <option value="efectivo">Efectivo</option>
-                    <option value="transferencia">Transferencia</option>
-                    <option value="cheque">Cheque</option>
-                </select>
-            </div>
-            <p class="pago-preview" id="modal-cobro-preview" data-saldo="${saldo}" hidden></p>
+            <p class="modal-hint">Repartí el pago. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deCliente, inicial)}
         `;
 
         Utils.showModal('Cobrar a ' + nombre, content, async () => {
-            const monto = Utils.parsePrice(document.getElementById('modal-cobro-monto').value);
-            const metodo = document.getElementById('modal-cobro-metodo').value;
-            if (!monto || monto <= 0) {
+            const leido = MediosPago.leer();
+            if (leido.total <= 0) {
                 Utils.showError('Poné cuánto te paga.');
                 throw new Error('Monto inválido');
             }
-            if (monto > saldo) {
-                Utils.showError('El monto supera lo que te debe (' + Utils.formatCurrency(saldo) + ').');
+            if (leido.total > saldo + 0.01) {
+                Utils.showError('La suma supera lo que te debe (' + Utils.formatCurrency(saldo) + ').');
                 throw new Error('Monto mayor al saldo');
             }
-            try {
-                await API.registrarCobro({
-                    cobranza_id: cobranza.id,
-                    monto: monto,
-                    fecha: cobranza.fecha || AppState.currentDate
-                });
-                this._ultimoCobro = {
-                    cobranzaId: cobranza.id,
-                    clienteId: cliente.id,
-                    monto,
-                    metodo,
-                    saldoRestante: Math.max(0, saldo - monto),
-                    fecha: cobranza.fecha
-                };
-                CacheManager.invalidatePattern('cobranzas');
-                await this.load();
-                if (cliente.telefono && String(cliente.telefono).trim()) {
-                    this.programarAvisoWhatsApp(cliente, this._ultimoCobro, nombre);
-                } else {
-                    Utils.showSuccess(monto >= saldo
-                        ? `Cobro de ${Utils.formatCurrency(monto)} registrado a ${nombre}.`
-                        : `Cobro de ${Utils.formatCurrency(monto)} registrado. Queda ${Utils.formatCurrency(saldo - monto)}.`);
-                }
-            } catch (error) {
-                console.error('Error registrando cobro:', error);
-                Utils.showError('No se pudo registrar el cobro: ' + (error.message || 'intentá de nuevo.'));
-                throw error;
+            const saldoAnterior = cobranza.saldo;
+            const pagadoAnterior = cobranza.pagado;
+            const estadoAnterior = cobranza.estado;
+            const mediosAnteriores = MediosPago.parse(cobranza.medios);
+            cobranza.medios = MediosPago.sumar(mediosAnteriores, leido.medios);
+            cobranza.pagado = (Utils.parsePrice(cobranza.pagado) || 0) + leido.total;
+            cobranza.saldo = Math.max(0, saldo - leido.total);
+            cobranza.estado = cobranza.saldo > 0.01 ? 'pendiente' : 'pagado';
+            CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+            this.render();
+            Utils.avisar(leido.total >= saldo
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
+                : `Cobro registrado. Queda ${Utils.formatCurrency(cobranza.saldo)}`);
+
+            this._ultimoCobro = {
+                cobranzaId: cobranza.id,
+                clienteId: cliente.id,
+                monto: leido.total,
+                medios: leido.medios,
+                saldoRestante: cobranza.saldo,
+                fecha: cobranza.fecha
+            };
+            if (cliente.telefono && String(cliente.telefono).trim()) {
+                this.programarAvisoWhatsApp(cliente, this._ultimoCobro, nombre);
             }
+
+            Utils.enSegundoPlano(() => API.registrarCobro({
+                cobranza_id: cobranza.id,
+                medios: leido.lista,
+                fecha: cobranza.fecha || AppState.currentDate
+            }), () => {
+                cobranza.saldo = saldoAnterior;
+                cobranza.pagado = pagadoAnterior;
+                cobranza.estado = estadoAnterior;
+                cobranza.medios = mediosAnteriores;
+                CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+                this.render();
+                Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
+            });
         }, 'Cobrar');
 
-        this._actualizarPreviewCobro();
-        document.getElementById('cobro-chip-todo')?.addEventListener('click', () => this._setMontoCobro(saldo));
-        document.getElementById('modal-cobro-monto')?.addEventListener('input', () => this._actualizarPreviewCobro());
-        document.getElementById('modal-cobro-monto')?.addEventListener('change', () => this._actualizarPreviewCobro());
+        MediosPago.enganchar(saldo);
     },
     
     async registrar() {
@@ -5880,8 +6763,8 @@ const Cobranzas = {
         const fecha = cobro?.fecha || AppState.currentDate;
         const fechaLabel = DiaOperativo.formatFechaLabel(fecha);
         if (cobro && cobro.monto > 0) {
-            const metodo = this.metodoLabel(cobro.metodo);
-            let mensaje = `Hola ${nombre}, registramos tu pago de ${Utils.formatCurrency(cobro.monto)} por ${metodo} del ${fechaLabel}.\n\n`;
+            const detalle = cobro.medios ? MediosPago.texto(cobro.medios) : this.metodoLabel(cobro.metodo);
+            let mensaje = `Hola ${nombre}, registramos tu pago de ${Utils.formatCurrency(cobro.monto)} (${detalle}) del ${fechaLabel}.\n\n`;
             if (cobro.saldoRestante > 0) {
                 mensaje += `Saldo pendiente: ${Utils.formatCurrency(cobro.saldoRestante)}.\n\n`;
             } else {
@@ -5930,7 +6813,7 @@ const Cobranzas = {
         const saveLabel = AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp';
         const saldo = Utils.parsePrice(cliente.saldo) || 0;
         const monto = cobro?.monto > 0 ? cobro.monto : (saldo > 0 ? saldo : 0);
-        const metodo = cobro?.metodo ? this.metodoLabel(cobro.metodo) : '—';
+        const metodo = cobro?.medios ? MediosPago.texto(cobro.medios) : (cobro?.metodo ? this.metodoLabel(cobro.metodo) : '—');
         const saldoDespues = cobro && cobro.monto > 0 ? (cobro.saldoRestante || 0) : saldo;
 
         const content = `
@@ -6029,7 +6912,7 @@ const CobranzasHoy = {
             let estado = 'sin_cobrar';
             if (pagado > 0 && saldo <= 0) estado = 'pagado';
             else if (pagado > 0) estado = 'parcial';
-            return { ...item, total, pagado, saldo, estado };
+            return { ...item, total, pagado, saldo, estado, medios: MediosPago.parse(item.medios) };
         });
     },
 
@@ -6047,10 +6930,22 @@ const CobranzasHoy = {
             this.render([]);
             return;
         }
-        if (this._lastTotales.length && this._pagadoConocido !== false) {
+        const preciosDia = CacheManager.get(`precios:${AppState.currentDate}`);
+        if (DiaOperativo.diaSinPedidos(AppState.currentDate) || (Array.isArray(preciosDia) && preciosDia.length === 0)) {
+            this._lastTotales = [];
+            this.render([]);
+            return;
+        }
+
+        const locales = this._desdePrecios(AppState.currentDate);
+        if (locales) {
+            this._lastTotales = this.normalizarTotales(locales);
+            this._pagadoConocido = true;
+            this.render(this._lastTotales);
+        } else if (this._lastTotales.length && this._pagadoConocido !== false) {
             this.render(this._lastTotales);
         } else {
-            Utils.showTableLoader(tbody);
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">Buscando cobros…</td></tr>';
         }
 
         try {
@@ -6073,6 +6968,55 @@ const CobranzasHoy = {
         }
     },
 
+    _desdePrecios(fecha) {
+        const precios = CacheManager.peek(`precios:${fecha}`)
+            || (AppState.fechaCargada === fecha ? AppState.precios : null);
+        if (!Array.isArray(precios)) return null;
+        const cobranzas = (CacheManager.peek('cobranzas:all:all') || AppState.cobranzas || [])
+            .filter(cobranza => Utils.fechaIso(cobranza.fecha) === fecha);
+        const grupos = new Map();
+        precios.forEach(precio => {
+            const id = String(precio.cliente_id || '');
+            if (!id) return;
+            const cantidad = parseFloat(precio.cantidad) || 0;
+            const unit = Utils.parsePrice(precio.precio_cliente);
+            const comision = Utils.parsePrice(precio.comision_unitaria);
+            const subtotal = Math.round(cantidad * unit) + Math.round(cantidad * comision);
+            if (!grupos.has(id)) {
+                grupos.set(id, {
+                    cliente_id: precio.cliente_id,
+                    cliente_nombre: precio.cliente_nombre || Utils.nombreCatalogo(precio, 'cliente'),
+                    total: 0,
+                    items: []
+                });
+            }
+            const grupo = grupos.get(id);
+            grupo.total += subtotal;
+            grupo.items.push({
+                producto_nombre: precio.producto_nombre || '',
+                cantidad,
+                precio_cliente: unit,
+                subtotal
+            });
+        });
+        return [...grupos.values()].map(grupo => {
+            const cobranza = cobranzas.find(item => String(item.cliente_id) === String(grupo.cliente_id));
+            const pagado = cobranza ? Utils.parsePrice(cobranza.pagado) : 0;
+            const saldo = Math.max(0, grupo.total - pagado);
+            let estado = 'sin_cobrar';
+            if (pagado > 0 && saldo <= 0) estado = 'pagado';
+            else if (pagado > 0) estado = 'parcial';
+            return {
+                ...grupo,
+                pagado,
+                saldo,
+                estado,
+                cobranza_id: cobranza ? cobranza.id : null,
+                medios: cobranza ? cobranza.medios : null
+            };
+        });
+    },
+
     render(totales) {
         const tbody = document.getElementById('cobros-hoy-tbody');
         if (!tbody) return;
@@ -6084,18 +7028,18 @@ const CobranzasHoy = {
             if (hint) {
                 hint.textContent = 'Este día está cerrado. Lo que quedó sin cobrar está en Cobranzas a clientes (pendientes).';
             }
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">' +
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">' +
                 'Este día está cerrado.<br>' +
                 '<small style="color:#999">Lo que quedó sin cobrar está en Cobranzas a clientes (pendientes).</small>' +
                 '</td></tr>';
             return;
         }
         if (hint) {
-            hint.textContent = 'Cobrás a los clientes de este día. Al cerrar, lo que quede sin cobrar pasa a Cobranzas a clientes (pendientes).';
+            hint.textContent = 'Cobrás en efectivo, transferencia, cheque o tarjeta. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).';
         }
 
         if (totales.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">' +
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">' +
                 'No hay precios al cliente cargados para el día de hoy.<br>' +
                 '<small style="color:#999">Completá el paso "Precios al cliente" primero.</small>' +
                 '</td></tr>';
@@ -6108,7 +7052,6 @@ const CobranzasHoy = {
             const saldo = parseFloat(t.saldo) || 0;
             const total = parseFloat(t.total) || 0;
             const pagadoTotal = saldo <= 0 || t.estado === 'pagado';
-            const yaCobradoSesion = this._cobrados.has(String(t.cliente_id));
 
             let estadoBadge;
             if (pagadoTotal) {
@@ -6119,75 +7062,253 @@ const CobranzasHoy = {
                 estadoBadge = '<span class="status-badge">Sin cobrar</span>';
             }
 
-            const btnDisabled = (yaCobradoSesion && pagadoTotal) || pagadoTotal
-                ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : '';
-
             tr.innerHTML = `
                 <td>${Utils.nombreCatalogo(t, 'cliente')}</td>
                 <td>${Utils.formatCurrency(total)}</td>
                 <td>${pagado > 0 ? Utils.formatCurrency(pagado) : '—'}</td>
+                <td class="medios-texto">${MediosPago.texto(t.medios)}</td>
                 <td style="${saldo > 0 ? 'color:#dc3545;font-weight:bold' : 'color:#28a745'}">${Utils.formatCurrency(saldo)}</td>
                 <td>${estadoBadge}</td>
                 <td>
-                    <button class="btn btn-primary" onclick="CobranzasHoy.cobrar('${t.cliente_id}', ${total}, ${saldo})" ${btnDisabled}>
-                        ${pagado > 0 && saldo > 0 ? 'Cobrar más' : 'Cobrar'}
-                    </button>
+                    <button class="btn btn-secondary btn-sm" type="button" onclick="CobranzasHoy.abrirAcciones('${t.cliente_id}')">Acciones</button>
                 </td>
             `;
             tbody.appendChild(tr);
         });
     },
 
-    async cobrar(clienteId, total, saldoActual) {
-        const montoSugerido = saldoActual > 0 ? saldoActual : total;
+    _fila(clienteId) {
+        return (this._lastTotales || []).find(t => String(t.cliente_id) === String(clienteId)) || null;
+    },
+
+    _cliente(clienteId) {
+        return (AppState.clientes || []).find(c => String(c.id) === String(clienteId)) || null;
+    },
+
+    abrirAcciones(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const total = parseFloat(fila.total) || 0;
+        const pagado = parseFloat(fila.pagado) || 0;
+        const saldo = parseFloat(fila.saldo) || 0;
+        const cliente = this._cliente(clienteId);
+        const telefono = cliente?.telefono ? String(cliente.telefono).trim() : '';
+        const estado = saldo <= 0
+            ? '<span class="status-badge status-activo">Pagado</span>'
+            : (pagado > 0
+                ? '<span class="status-badge status-pendiente">Parcial</span>'
+                : '<span class="status-badge">Sin cobrar</span>');
+
+        const botones = [];
+        if (saldo > 0) {
+            botones.push(`<button type="button" class="btn btn-primary" onclick="CobranzasHoy.cobrar('${clienteId}', ${total}, ${saldo})">Cobrar</button>`);
+        }
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.verDetalle('${clienteId}')">Ver detalle</button>`);
+        botones.push(`<button type="button" class="btn btn-whatsapp" onclick="CobranzasHoy.avisarWhatsApp('${clienteId}')">${telefono ? 'Avisar por WhatsApp' : 'WhatsApp (falta teléfono)'}</button>`);
+        if (pagado > 0) {
+            botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.editarCobro('${clienteId}')">Editar lo cobrado</button>`);
+            botones.push(`<button type="button" class="btn btn-danger" onclick="CobranzasHoy.anularCobro('${clienteId}')">Eliminar cobro</button>`);
+        }
+
         const content = `
-            <div class="form-group">
-                <label>Monto a cobrar</label>
-                <input type="text" id="modal-cobro-monto" class="form-control" data-price-input="true"
-                    value="${montoSugerido > 0 ? montoSugerido : ''}" placeholder="0">
-                <small style="color:#666">Total del día: ${Utils.formatCurrency(total)} · Saldo pendiente: ${Utils.formatCurrency(saldoActual)}</small>
+            <div class="pedido-acciones-resumen">
+                <div class="pedido-acciones-resumen-top">
+                    <strong>${nombre}</strong>
+                    <div class="pedido-acciones-badges">${estado}</div>
+                </div>
+                <p>Total ${Utils.formatCurrency(total)} · Cobrado ${Utils.formatCurrency(pagado)}</p>
+                <p class="pedido-acciones-proveedor">Adeudado: ${Utils.formatCurrency(saldo)}</p>
+                <p class="pedido-acciones-proveedor">${MediosPago.texto(fila.medios)}</p>
             </div>
-            <div class="form-group">
-                <label>Método</label>
-                <select id="modal-cobro-metodo" class="form-control">
-                    <option value="efectivo">Efectivo</option>
-                    <option value="transferencia">Transferencia</option>
-                    <option value="cheque">Cheque</option>
-                </select>
+            <div class="pedido-acciones-lista">
+                ${botones.join('')}
             </div>
         `;
 
+        Utils.showModal('Acciones del cobro', content, null);
+        const cancelBtn = document.getElementById('modal-cancel');
+        if (cancelBtn) cancelBtn.textContent = 'Cerrar';
+    },
+
+    verDetalle(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const items = Array.isArray(fila.items) ? fila.items : [];
+        const filas = items.length
+            ? items.map(item => `
+                <tr>
+                    <td>${item.producto_nombre || 'Producto'}</td>
+                    <td>${item.cantidad ?? ''}</td>
+                    <td>${Utils.formatCurrency(item.precio_cliente || 0)}</td>
+                    <td>${Utils.formatCurrency(item.subtotal || 0)}</td>
+                </tr>
+            `).join('')
+            : '<tr><td colspan="4">No hay detalle de productos cargado.</td></tr>';
+        const content = `
+            <p class="modal-hint">${nombre}</p>
+            <div class="modal-pedido-preview-box">
+                <table class="modal-pedido-detalle-table">
+                    <thead>
+                        <tr><th>Producto</th><th>Cant.</th><th>Precio</th><th>Total</th></tr>
+                    </thead>
+                    <tbody>${filas}</tbody>
+                </table>
+            </div>
+            <p>Total del día: <strong>${Utils.formatCurrency(fila.total || 0)}</strong></p>
+            <p>Cómo cobró: ${MediosPago.texto(fila.medios)}</p>
+            <p>Adeudado: <strong>${Utils.formatCurrency(fila.saldo || 0)}</strong></p>
+        `;
+        Utils.showModal('Detalle del cobro', content, null);
+        const cancelBtn = document.getElementById('modal-cancel');
+        if (cancelBtn) cancelBtn.textContent = 'Cerrar';
+    },
+
+    avisarWhatsApp(clienteId) {
+        const fila = this._fila(clienteId);
+        const cliente = this._cliente(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        const telefono = cliente?.telefono ? String(cliente.telefono).trim() : '';
+        if (!telefono) {
+            Utils.showError('Este cliente no tiene teléfono. Cargalo en Clientes.');
+            return;
+        }
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        const lineas = (fila.items || []).slice(0, 12).map(item =>
+            `${item.producto_nombre || 'Producto'} x ${item.cantidad ?? ''} — ${Utils.formatCurrency(item.subtotal || 0)}`
+        );
+        const mensaje = [
+            `Hola ${nombre}, te paso la cuenta del ${fecha}.`,
+            lineas.length ? lineas.join('\n') : '',
+            `Total: ${Utils.formatCurrency(fila.total || 0)}`,
+            `Cobrado: ${Utils.formatCurrency(fila.pagado || 0)}`,
+            `Adeudado: ${Utils.formatCurrency(fila.saldo || 0)}`,
+            MediosPago.texto(fila.medios) !== '—' ? MediosPago.texto(fila.medios) : ''
+        ].filter(Boolean).join('\n');
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        WhatsAppService.openChat(telefono, mensaje);
+        Utils.avisar(`WhatsApp abierto para ${nombre}`);
+    },
+
+    editarCobro(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        const total = parseFloat(fila.total) || 0;
+        const pagado = parseFloat(fila.pagado) || 0;
+        const mediosAntes = MediosPago.parse(fila.medios);
+        const inicial = MediosPago.total(mediosAntes) > 0 ? mediosAntes : Object.assign(MediosPago.vacio(), { efectivo: pagado });
+        const content = `
+            <p class="modal-hint">Repartí lo que ya te pagó. El máximo es ${Utils.formatCurrency(total)}. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deCliente, inicial)}
+        `;
+        Utils.showModal('Editar lo cobrado', content, async () => {
+            const leido = MediosPago.leer();
+            if (leido.total > total + 0.01) {
+                Utils.showError('La suma supera el total del día (' + Utils.formatCurrency(total) + ').');
+                throw new Error('Monto mayor al total');
+            }
+            const mediosPrevios = MediosPago.parse(fila.medios);
+            const pagadoPrevio = parseFloat(fila.pagado) || 0;
+            this._aplicarMediosLocal(clienteId, leido.medios);
+            Utils.avisar('Cobro actualizado');
+            Utils.enSegundoPlano(() => API.ajustarCobroClienteHoy({
+                fecha: AppState.currentDate,
+                cliente_id: clienteId,
+                medios: leido.medios
+            }), () => {
+                this._aplicarMediosLocal(clienteId, MediosPago.total(mediosPrevios) > 0 ? mediosPrevios : Object.assign(MediosPago.vacio(), { efectivo: pagadoPrevio }));
+                Utils.showError('No se pudo editar el cobro. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Guardar');
+        MediosPago.enganchar(total);
+    },
+
+    async anularCobro(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const ok = await Utils.showConfirm(`¿Eliminar el cobro de ${nombre}? Queda de nuevo el saldo completo. El cliente sigue en la lista.`);
+        if (!ok) return;
+        const mediosPrevios = MediosPago.parse(fila.medios);
+        this._aplicarMediosLocal(clienteId, MediosPago.vacio());
+        Utils.avisar('Cobro eliminado');
+        Utils.enSegundoPlano(() => API.ajustarCobroClienteHoy({
+            fecha: AppState.currentDate,
+            cliente_id: clienteId,
+            pagado: 0
+        }), () => {
+            this._aplicarMediosLocal(clienteId, mediosPrevios);
+            Utils.showError('No se pudo eliminar el cobro. Publicá el script si todavía no lo hiciste.');
+        });
+    },
+
+    _aplicarMediosLocal(clienteId, medios) {
+        const fila = this._fila(clienteId);
+        if (!fila) return;
+        const total = parseFloat(fila.total) || 0;
+        fila.medios = MediosPago.parse(medios);
+        const pagado = MediosPago.total(fila.medios);
+        fila.pagado = pagado;
+        fila.saldo = Math.max(0, total - pagado);
+        fila.estado = pagado <= 0 ? 'sin_cobrar' : (fila.saldo <= 0.01 ? 'pagado' : 'parcial');
+        if (fila.saldo <= 0.01) this._cobrados.add(String(clienteId));
+        else this._cobrados.delete(String(clienteId));
+        this.render(this._lastTotales);
+    },
+
+    async cobrar(clienteId, total, saldoActual) {
+        const inicial = MediosPago.vacio();
+        inicial.efectivo = saldoActual > 0 ? saldoActual : 0;
+        const content = `
+            <p class="modal-hint">Total del día ${Utils.formatCurrency(total)}. Repartí el cobro. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deCliente, inicial)}
+        `;
+
         Utils.showModal('Registrar cobro', content, async () => {
-            const monto = Utils.parsePrice(document.getElementById('modal-cobro-monto').value);
-            if (!monto || monto <= 0) {
-                Utils.showError('Ingresá un monto válido');
+            const leido = MediosPago.leer();
+            if (leido.total <= 0) {
+                Utils.showError('Poné cuánto te paga.');
                 throw new Error('Monto inválido');
             }
-            if (monto > saldoActual) {
-                Utils.showError('El monto supera el saldo pendiente (' + Utils.formatCurrency(saldoActual) + ').');
+            if (leido.total > saldoActual + 0.01) {
+                Utils.showError('La suma supera el saldo pendiente (' + Utils.formatCurrency(saldoActual) + ').');
                 throw new Error('Monto mayor al saldo');
             }
-
-            try {
-                await API.cobrarClienteHoy({
-                    fecha: AppState.currentDate,
-                    cliente_id: clienteId,
-                    monto: monto
-                });
-
-                Utils.showSuccess('Cobro registrado correctamente');
-
-                if (monto >= saldoActual) {
-                    this._cobrados.add(String(clienteId));
-                }
-
-                await this.load();
-            } catch (error) {
-                console.error('Error registrando cobro:', error);
-                Utils.showError('Error al registrar el cobro: ' + error.message);
-                throw error;
-            }
-        });
+            const fila = this._fila(clienteId);
+            const mediosPrevios = MediosPago.parse(fila?.medios);
+            this._aplicarMediosLocal(clienteId, MediosPago.sumar(mediosPrevios, leido.medios));
+            Utils.avisar(leido.total >= saldoActual
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
+                : `Cobro registrado. Queda ${Utils.formatCurrency(Math.max(0, saldoActual - leido.total))}`);
+            Utils.enSegundoPlano(() => API.cobrarClienteHoy({
+                fecha: AppState.currentDate,
+                cliente_id: clienteId,
+                medios: leido.lista
+            }), () => {
+                this._aplicarMediosLocal(clienteId, mediosPrevios);
+                Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Cobrar');
+        MediosPago.enganchar(saldoActual);
     }
 };
 
@@ -6206,14 +7327,19 @@ const Pagos = {
             const cachedDias = CacheManager.get('flujo:dias-pendientes');
             if (Array.isArray(cachedDias)) DiaOperativo.diasPendientes = cachedDias;
         }
-        if (AppState.recepcion) this._aplicarRecepcionHoy(AppState.recepcion);
-        const diaListo = this.vista === 'pendientes' || DiaOperativo.diaCerrado(AppState.currentDate);
-        const hasStale = AppState.proveedores.length > 0 && (diaListo || Object.keys(this._montosHoy).length > 0);
-        if (hasStale) {
-            this.render(AppState.proveedores);
-        } else {
-            Utils.showTableLoader(tbody);
+        if (!AppState.proveedores.length) {
+            const cacheProv = CacheManager.get('proveedores');
+            if (Array.isArray(cacheProv)) AppState.proveedores = cacheProv;
         }
+        const recepcionCache = CacheManager.get(`recepcion:${AppState.currentDate}`);
+        if (Array.isArray(recepcionCache)) this._aplicarRecepcionHoy(recepcionCache);
+        else if (AppState.recepcion) this._aplicarRecepcionHoy(AppState.recepcion);
+
+        const sinPedidos = this.vista !== 'pendientes' && DiaOperativo.diaSinPedidos(AppState.currentDate);
+        this.render(AppState.proveedores);
+        if (sinPedidos) return;
+        if (this.vista === 'pendientes' && AppState.proveedores.length) return;
+        if (this.vista !== 'pendientes' && Array.isArray(recepcionCache) && AppState.proveedores.length) return;
 
         try {
             const [proveedores, recepcion] = await Promise.all([
@@ -6227,8 +7353,10 @@ const Pagos = {
             this.render(proveedores);
         } catch (error) {
             console.error('Error loading pagos:', error);
-            if (!hasStale) Utils.hideTableLoader(tbody);
-            Utils.showError('Error al cargar los proveedores. Intente nuevamente.');
+            Utils.hideTableLoader(tbody);
+            if (!AppState.proveedores.length && AppState.currentPage === 'pagos') {
+                Utils.showError('Error al cargar los proveedores. Intente nuevamente.');
+            }
         }
     },
     
@@ -6248,10 +7376,10 @@ const Pagos = {
         if (titulo) titulo.textContent = soloPendientes ? 'Pagos a proveedores (pendientes)' : 'Pagar al proveedor';
         if (hint) {
             hint.textContent = soloPendientes
-                ? 'Acá queda lo que todavía le debés a cada proveedor, de hoy o de días anteriores.'
+                ? 'Acá queda lo que todavía le debés. Podés pagar una parte en efectivo y otra en transferencia, y dejar el resto adeudado.'
                 : (diaCerrado
                     ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
-                    : 'Pagá la mercadería de este día. Al cerrar, lo que quede por pagar pasa a Pagos a proveedores (pendientes).');
+                    : 'Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).');
         }
 
         const lista = [...(proveedores || [])]
@@ -6307,7 +7435,7 @@ const Pagos = {
                 : (diaCerrado
                     ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
                     : 'No hay mercadería confirmada para pagar en este día.');
-            tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:30px;color:#666;">${vacio}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">${vacio}</td></tr>`;
             if (resumen) resumen.hidden = true;
             return;
         }
@@ -6319,21 +7447,18 @@ const Pagos = {
             const saldo = Utils.parsePrice(proveedor.saldo) || 0;
             const pendiente = saldo > 0;
             const puedePagar = pendiente && !pagado;
-            const sinTelefono = !proveedor.telefono || !String(proveedor.telefono).trim();
             const btnPagar = puedePagar
                 ? `<button class="btn btn-primary btn-sm" type="button" onclick="Pagos.registrar('${proveedor.id}')">Pagar</button>`
                 : '';
-            const btnWhatsApp = sinTelefono
-                ? '<button class="btn btn-whatsapp btn-sm" type="button" disabled title="Falta teléfono">WhatsApp</button>'
-                : `<button class="btn btn-whatsapp btn-sm" type="button" onclick="Pagos.enviarWhatsApp('${proveedor.id}')">WhatsApp</button>`;
             tr.innerHTML = `
                 <td data-label="Proveedor">${proveedor.nombre || ''}</td>
                 <td data-label="Le debés" style="${saldo > 0 ? 'color:#dc3545;font-weight:700;' : ''}">${Utils.formatCurrency(saldo)}</td>
+                <td data-label="Cómo pagaste" class="medios-texto">${MediosPago.texto(proveedor.medios)}</td>
                 <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
                 <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span></td>
                 <td data-label="Acciones">
                     <div class="pagos-acciones">
-                        ${btnPagar}${btnWhatsApp}
+                        ${btnPagar}
                     </div>
                 </td>
             `;
@@ -6394,39 +7519,6 @@ const Pagos = {
         return this._estimadoPedidosProveedor(proveedorId);
     },
 
-    _setMontoPago(valor) {
-        const input = document.getElementById('modal-pago-monto');
-        if (!input) return;
-        input.value = valor > 0 ? Utils.formatPrice(valor) : '';
-        this._actualizarPreviewPago();
-    },
-
-    _actualizarPreviewPago() {
-        const preview = document.getElementById('modal-pago-preview');
-        const saldo = Utils.parsePrice(preview?.dataset.saldo || 0);
-        const anticipo = preview?.dataset.anticipo === '1';
-        const monto = Utils.parsePrice(document.getElementById('modal-pago-monto')?.value || 0);
-        if (!preview) return;
-        if (!monto || monto <= 0) {
-            preview.hidden = true;
-            preview.innerHTML = '';
-            return;
-        }
-        preview.hidden = false;
-        if (!anticipo && monto > saldo) {
-            preview.innerHTML = `Ese monto supera lo que le debés (${Utils.formatCurrency(saldo)}).`;
-            return;
-        }
-        if (anticipo || saldo <= 0) {
-            preview.innerHTML = `Vas a pagar <strong>${Utils.formatCurrency(monto)}</strong>.`;
-            return;
-        }
-        const resto = saldo - monto;
-        preview.innerHTML = resto > 0
-            ? `Vas a pagar <strong>${Utils.formatCurrency(monto)}</strong>. Queda ${Utils.formatCurrency(resto)}.`
-            : `Vas a pagar todo (${Utils.formatCurrency(monto)}).`;
-    },
-
     async registrar(proveedorId = null, opciones = {}) {
         const desdePedido = !!opciones.desdePedido;
         if (!proveedorId) return;
@@ -6459,105 +7551,81 @@ const Pagos = {
         const anticipo = desdePedido && saldoPendiente <= 0;
         const mercaderiaHoy = this._montosHoy[String(proveedorId)] || 0;
         const dineroAPagar = this._dineroAPagar(proveedorId, saldoPendiente);
-        const montoSugerido = anticipo ? '' : saldoPendiente;
 
-        const chips = [];
-        if (saldoPendiente > 0) {
-            chips.push(`<button type="button" class="pago-chip" id="pago-chip-todo">Pagar todo (${Utils.formatCurrency(saldoPendiente)})</button>`);
-        }
-        if (mercaderiaHoy > 0 && mercaderiaHoy < saldoPendiente) {
-            chips.push(`<button type="button" class="pago-chip" id="pago-chip-hoy">Pagar lo de hoy (${Utils.formatCurrency(mercaderiaHoy)})</button>`);
-        }
-
+        const inicial = MediosPago.vacio();
+        if (!anticipo && saldoPendiente > 0) inicial.efectivo = saldoPendiente;
+        const chipHoy = mercaderiaHoy > 0 && mercaderiaHoy < saldoPendiente
+            ? `<button type="button" class="pago-chip" id="pago-chip-hoy">Lo de hoy (${Utils.formatCurrency(mercaderiaHoy)})</button>`
+            : '';
         const content = `
             <div class="form-group">
-                <label for="modal-pago-deuda">Dinero a pagar</label>
+                <label for="modal-pago-deuda">Le debés</label>
                 <input type="text" id="modal-pago-deuda" class="form-control" value="${Utils.formatCurrency(dineroAPagar)}" readonly tabindex="-1">
             </div>
-            <div class="form-group">
-                <label for="modal-pago-monto">Monto</label>
-                <input type="text" id="modal-pago-monto" class="form-control" data-price-input="true" value="${anticipo ? '' : Utils.formatPrice(montoSugerido)}" placeholder="0" inputmode="numeric">
-                <div class="pago-chips">${chips.join('')}</div>
-            </div>
-            <div class="form-group">
-                <label for="modal-pago-metodo">Cómo le pagás</label>
-                <select id="modal-pago-metodo" class="form-control">
-                    <option value="efectivo">Efectivo</option>
-                    <option value="transferencia">Transferencia</option>
-                    <option value="cheque">Cheque</option>
-                </select>
-            </div>
-            <p class="pago-preview" id="modal-pago-preview" data-saldo="${saldoPendiente}" data-anticipo="${anticipo ? '1' : '0'}" hidden></p>
+            <p class="modal-hint">Repartí el pago en efectivo y transferencia. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deProveedor, inicial)}
+            <div class="pago-chips">${chipHoy}</div>
         `;
 
         Utils.showModal('Pagar a ' + proveedorNombre, content, async () => {
-            const monto = Utils.parsePrice(document.getElementById('modal-pago-monto').value);
-            const metodo = document.getElementById('modal-pago-metodo').value;
-
-            if (!monto || monto <= 0 || !proveedorId) {
+            const leido = MediosPago.leer();
+            if (leido.total <= 0 || !proveedorId) {
                 Utils.showError('Poné cuánto le pagás.');
                 throw new Error('Monto inválido');
             }
-            if (!anticipo && monto > saldoPendiente) {
-                Utils.showError('El monto supera lo que le debés (' + Utils.formatCurrency(saldoPendiente) + ').');
+            if (!anticipo && leido.total > saldoPendiente + 0.01) {
+                Utils.showError('La suma supera lo que le debés (' + Utils.formatCurrency(saldoPendiente) + ').');
                 throw new Error('Monto mayor al saldo');
             }
 
-            try {
-                await API.registrarPago({
-                    proveedor_id: proveedorId,
-                    monto: monto,
-                    metodo: metodo,
-                    fecha: AppState.currentDate,
-                    anticipo: anticipo,
-                    nota: anticipo ? 'Pago al hacer el pedido' : ''
-                });
-
-                const saldoRestante = anticipo ? Math.max(0, saldoPendiente - monto) : Math.max(0, saldoPendiente - monto);
-                this._ultimoPago = {
-                    proveedorId,
-                    monto,
-                    metodo,
-                    saldoRestante,
-                    anticipo
-                };
-
-                if (!anticipo && monto >= saldoPendiente) {
-                    this._pagados.add(proveedorId);
-                }
-
-                CacheManager.invalidate('proveedores');
-                AppState.proveedores = [];
-                await this.load();
-
-                const proveedorActual = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId))
-                    || proveedorCompleto
-                    || { id: proveedorId, nombre: proveedorNombre, telefono: '', saldo: saldoRestante };
-
-                if (proveedorActual.telefono && String(proveedorActual.telefono).trim()) {
-                    this.programarAvisoWhatsApp(proveedorActual, this._ultimoPago);
-                } else {
-                    Utils.showSuccess(anticipo || monto >= saldoPendiente
-                        ? `Pago de ${Utils.formatCurrency(monto)} registrado a ${proveedorNombre}.`
-                        : `Pago de ${Utils.formatCurrency(monto)} registrado. Queda ${Utils.formatCurrency(saldoPendiente - monto)}.`);
-                }
-            } catch (error) {
-                console.error('Error registering pago:', error);
-                const msg = String(error.message || '');
-                if (anticipo && /saldo pendiente/i.test(msg)) {
-                    Utils.showError('Todavía no hay saldo de recepción para este proveedor. Pagalo después en Pagos a proveedores, cuando confirmes lo que llegó.');
-                } else {
-                    Utils.showError('No se pudo registrar el pago: ' + (error.message || 'intentá de nuevo.'));
-                }
-                throw error;
+            const saldoRestante = Math.max(0, saldoPendiente - leido.total);
+            const proveedorLocal = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+            const saldoPrevio = proveedorLocal ? proveedorLocal.saldo : saldoPendiente;
+            const mediosPrevios = MediosPago.parse(proveedorLocal?.medios);
+            if (proveedorLocal) {
+                proveedorLocal.saldo = saldoRestante;
+                proveedorLocal.medios = MediosPago.sumar(mediosPrevios, leido.medios);
             }
+            if (!anticipo && leido.total >= saldoPendiente) this._pagados.add(proveedorId);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this.render(AppState.proveedores);
+            Utils.avisar(saldoRestante > 0
+                ? `Pago de ${Utils.formatCurrency(leido.total)} registrado. Queda ${Utils.formatCurrency(saldoRestante)}`
+                : `Pago de ${Utils.formatCurrency(leido.total)} registrado`);
+
+            this._ultimoPago = {
+                proveedorId,
+                monto: leido.total,
+                medios: leido.medios,
+                saldoRestante,
+                anticipo
+            };
+
+            Utils.enSegundoPlano(() => API.registrarPago({
+                proveedor_id: proveedorId,
+                medios: leido.lista,
+                fecha: AppState.currentDate,
+                anticipo: anticipo,
+                nota: anticipo ? 'Pago al hacer el pedido' : ''
+            }), () => {
+                if (proveedorLocal) {
+                    proveedorLocal.saldo = saldoPrevio;
+                    proveedorLocal.medios = mediosPrevios;
+                }
+                this._pagados.delete(proveedorId);
+                CacheManager.set('proveedores', AppState.proveedores);
+                this.render(AppState.proveedores);
+                Utils.showError('No se pudo registrar el pago. Publicá el script si todavía no lo hiciste.');
+            });
         }, 'Pagar');
 
-        this._actualizarPreviewPago();
-        document.getElementById('pago-chip-todo')?.addEventListener('click', () => this._setMontoPago(saldoPendiente));
-        document.getElementById('pago-chip-hoy')?.addEventListener('click', () => this._setMontoPago(mercaderiaHoy));
-        document.getElementById('modal-pago-monto')?.addEventListener('input', () => this._actualizarPreviewPago());
-        document.getElementById('modal-pago-monto')?.addEventListener('change', () => this._actualizarPreviewPago());
+        const actualizar = MediosPago.enganchar(saldoPendiente, { tope: !anticipo, ocultarAdeudado: anticipo });
+        document.getElementById('pago-chip-hoy')?.addEventListener('click', () => {
+            const soloHoy = MediosPago.vacio();
+            soloHoy.efectivo = mercaderiaHoy;
+            MediosPago.poner(soloHoy);
+            actualizar();
+        });
     },
 
     metodoPagoLabel(metodo) {
@@ -6574,8 +7642,8 @@ const Pagos = {
         const fechaLabel = DiaOperativo.formatFechaLabel(AppState.currentDate);
 
         if (pago && pago.monto > 0) {
-            const metodo = this.metodoPagoLabel(pago.metodo);
-            let mensaje = `Hola ${nombre}, te confirmamos el pago de ${Utils.formatCurrency(pago.monto)} por ${metodo} del ${fechaLabel}.\n\n`;
+            const detalle = pago.medios ? MediosPago.texto(pago.medios) : this.metodoPagoLabel(pago.metodo);
+            let mensaje = `Hola ${nombre}, te confirmamos el pago de ${Utils.formatCurrency(pago.monto)} (${detalle}) del ${fechaLabel}.\n\n`;
             if (pago.anticipo && !(pago.saldoRestante > 0)) {
                 mensaje += 'Queda registrado como anticipo.\n\n';
             } else if (pago.saldoRestante > 0) {
@@ -6645,7 +7713,7 @@ const Pagos = {
         const saveLabel = AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp';
         const saldo = Utils.parsePrice(proveedor.saldo) || 0;
         const monto = pago?.monto > 0 ? pago.monto : (saldo > 0 ? saldo : 0);
-        const metodo = pago?.metodo ? this.metodoPagoLabel(pago.metodo) : '—';
+        const metodo = pago?.medios ? MediosPago.texto(pago.medios) : (pago?.metodo ? this.metodoPagoLabel(pago.metodo) : '—');
         const saldoDespues = pago ? (pago.saldoRestante || 0) : Math.max(0, saldo - monto);
 
         const content = `
@@ -6740,7 +7808,7 @@ const Stock = {
         const tbody = document.getElementById('stock-tbody');
         if (!tbody) return;
 
-        const cached = CacheManager.get('stock');
+        const cached = CacheManager.peek('stock');
         const hasStale = AppState.stock.length > 0 || cached;
         if (hasStale) {
             if (!AppState.stock.length && cached) AppState.stock = cached;
@@ -7061,8 +8129,13 @@ const Historial = {
         const tbody = document.getElementById('historial-tbody');
         if (!tbody) return;
         
-        // Mostrar loader local
-        Utils.showTableLoader(tbody);
+        const cached = CacheManager.peek('historial');
+        if (Array.isArray(cached)) {
+            AppState.cierres = cached;
+            this.render(cached);
+        } else {
+            Utils.showTableLoader(tbody);
+        }
         
         try {
             const cierres = await API.getHistorial();
@@ -7346,7 +8419,9 @@ const Caja = {
     async load() {
         const tbody = document.getElementById('caja-tbody');
         if (!tbody) return;
-        Utils.showTableLoader(tbody);
+        const cached = CacheManager.peek('caja');
+        if (Array.isArray(cached)) this.render(cached);
+        else Utils.showTableLoader(tbody);
         try {
             const movimientos = await API.getCajaMovimientos();
             this.render(Array.isArray(movimientos) ? movimientos : []);
@@ -7392,6 +8467,356 @@ const Caja = {
     }
 };
 
+const Reparto = {
+    clientes: [],
+    proveedores: [],
+    _listo: false,
+
+    enganchar() {
+        const root = document.getElementById('reparto-root');
+        if (!root || this._listo) return;
+        this._listo = true;
+        root.addEventListener('click', (event) => {
+            const btn = event.target.closest('[data-reparto]');
+            if (!btn) return;
+            if (btn.dataset.reparto === 'agregar') this.agregarLinea();
+            if (btn.dataset.reparto === 'sacar') this.sacarLinea(btn.dataset.id);
+            if (btn.dataset.reparto === 'todo') this.ponerTodo(btn.dataset.id);
+            if (btn.dataset.reparto === 'guardar') this.guardar();
+        });
+        root.addEventListener('input', () => {
+            this._editando = true;
+            this._refrescarResumen();
+        });
+        root.addEventListener('change', (event) => {
+            this._editando = true;
+            if (event.target.id === 'reparto-cliente') {
+                const cliente = this.clientes.find(c => c.id === event.target.value);
+                const monto = document.getElementById('reparto-monto');
+                if (cliente && monto) monto.value = Utils.formatPrice(cliente.deuda);
+            }
+            this._refrescarResumen();
+        });
+    },
+
+    async load() {
+        const root = document.getElementById('reparto-root');
+        if (!root) return;
+        this.enganchar();
+        this._editando = false;
+        const token = (this._carga = (this._carga || 0) + 1);
+        const local = this._datosLocales();
+        if (local.listo) this._aplicar(local.cobranzas, local.proveedores, local.precios);
+        else root.innerHTML = '<p class="camion-vacio">Buscando saldos…</p>';
+
+        Promise.all([
+            API.getCobranzas().catch(() => local.cobranzas),
+            API.getProveedores().catch(() => local.proveedores)
+        ]).then(([cobranzas, proveedores]) => {
+            if (this._carga !== token || AppState.currentPage !== 'reparto' || this._editando) return;
+            if (proveedores && proveedores.length) AppState.proveedores = proveedores;
+            this._aplicar(cobranzas || [], proveedores || [], this._preciosHoy());
+        }).catch(error => console.error('Error cargando reparto:', error));
+    },
+
+    _preciosHoy() {
+        const fecha = AppState.currentDate;
+        return CacheManager.peek(`precios:${fecha}`)
+            || (AppState.fechaCargada === fecha ? AppState.precios : [])
+            || [];
+    },
+
+    _datosLocales() {
+        const cobranzas = CacheManager.peek('cobranzas:all:all') || AppState.cobranzas || [];
+        const proveedores = CacheManager.peek('proveedores') || AppState.proveedores || [];
+        const precios = this._preciosHoy();
+        return {
+            cobranzas: Array.isArray(cobranzas) ? cobranzas : [],
+            proveedores: Array.isArray(proveedores) ? proveedores : [],
+            precios: Array.isArray(precios) ? precios : [],
+            listo: (cobranzas && cobranzas.length) || (proveedores && proveedores.length)
+        };
+    },
+
+    _totalesHoy(precios, cobranzas) {
+        const cubiertos = new Set(
+            (cobranzas || [])
+                .filter(cobranza => Utils.fechaIso(cobranza.fecha) === AppState.currentDate)
+                .map(cobranza => String(cobranza.cliente_id))
+        );
+        const map = new Map();
+        (precios || []).forEach(precio => {
+            const id = String(precio.cliente_id || '');
+            if (!id || cubiertos.has(id)) return;
+            const cantidad = parseFloat(precio.cantidad) || 0;
+            const unit = Utils.parsePrice(precio.precio_cliente);
+            const comision = Utils.parsePrice(precio.comision_unitaria);
+            const subtotal = Math.round(cantidad * unit) + Math.round(cantidad * comision);
+            if (subtotal <= 0) return;
+            map.set(id, (map.get(id) || 0) + subtotal);
+        });
+        return [...map.entries()].map(([cliente_id, saldo]) => ({
+            cliente_id,
+            cliente_nombre: this._nombreCliente(cliente_id),
+            saldo
+        }));
+    },
+
+    _aplicar(cobranzas, proveedores, precios) {
+        if (!AppState.clientes.length) {
+            AppState.clientes = CacheManager.get('clientes') || [];
+        }
+        const clientes = this._deudas(cobranzas, this._totalesHoy(precios, cobranzas));
+        const listaProv = (proveedores || [])
+            .filter(p => Utils.parsePrice(p.saldo) > 0)
+            .sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        const firma = clientes.map(c => c.id + ':' + c.deuda).join('|')
+            + '#' + listaProv.map(p => String(p.id) + ':' + Utils.parsePrice(p.saldo)).join('|');
+        if (firma === this._firma && document.getElementById('reparto-cliente')) return;
+        this._firma = firma;
+        this.clientes = clientes;
+        this.proveedores = listaProv;
+        this.render();
+    },
+
+    _nombreCliente(id) {
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === String(id));
+        return cliente?.nombre || 'Cliente';
+    },
+
+    _deudas(cobranzas, totalesHoy) {
+        const map = new Map();
+        (cobranzas || []).forEach(cobranza => {
+            const saldo = Utils.parsePrice(cobranza.saldo);
+            if (saldo <= 0) return;
+            const id = String(cobranza.cliente_id);
+            const actual = map.get(id) || {
+                id,
+                nombre: cobranza.cliente_nombre || this._nombreCliente(id),
+                deuda: 0,
+                tieneFilaHoy: false
+            };
+            actual.deuda += saldo;
+            if (cobranza.cliente_nombre) actual.nombre = cobranza.cliente_nombre;
+            if (Utils.fechaIso(cobranza.fecha) === AppState.currentDate) actual.tieneFilaHoy = true;
+            map.set(id, actual);
+        });
+        (totalesHoy || []).forEach(total => {
+            const saldo = Utils.parsePrice(total.saldo);
+            if (saldo <= 0) return;
+            const id = String(total.cliente_id);
+            const actual = map.get(id);
+            if (actual?.tieneFilaHoy) return;
+            if (actual) {
+                actual.deuda += saldo;
+                return;
+            }
+            map.set(id, {
+                id,
+                nombre: total.cliente_nombre || this._nombreCliente(id),
+                deuda: saldo,
+                tieneFilaHoy: false
+            });
+        });
+        return [...map.values()]
+            .map(cliente => ({ ...cliente, deuda: Math.round(cliente.deuda) }))
+            .filter(cliente => cliente.deuda > 0)
+            .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    _opcionesProveedor(elegido) {
+        return this.proveedores.map(p => {
+            const id = String(p.id);
+            const selected = id === String(elegido) ? ' selected' : '';
+            return `<option value="${id}"${selected}>${this._esc(p.nombre)} · debe ${this._esc(Utils.formatCurrency(p.saldo))}</option>`;
+        }).join('');
+    },
+
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    render() {
+        const root = document.getElementById('reparto-root');
+        if (!root) return;
+        if (!this.clientes.length) {
+            root.innerHTML = '<p class="camion-vacio">Ningún cliente tiene saldo para descontar. El efectivo se anota cuando ya hay un precio o una cobranza pendiente.</p>';
+            return;
+        }
+        const primero = this.clientes[0];
+        const opciones = this.clientes.map(c =>
+            `<option value="${c.id}">${this._esc(c.nombre)} · debe ${this._esc(Utils.formatCurrency(c.deuda))}</option>`
+        ).join('');
+        const linea = this._lineaHtml({ id: 'l-' + Date.now(), proveedor_id: '', monto: '' });
+        root.innerHTML = `
+            <section class="reparto-card">
+                <label for="reparto-cliente">Entró de</label>
+                <select id="reparto-cliente" class="form-control">${opciones}</select>
+                <p class="reparto-deuda" id="reparto-deuda">Le descontás el saldo a ${this._esc(primero.nombre)}.</p>
+                <label for="reparto-monto">Efectivo que entró</label>
+                <input id="reparto-monto" class="form-control" data-price-input="true" inputmode="numeric" value="${Utils.formatPrice(primero.deuda)}">
+            </section>
+            <section class="reparto-card">
+                <h3>De eso le das</h3>
+                <div id="reparto-lineas">${linea}</div>
+                <button type="button" class="btn btn-secondary" data-reparto="agregar">Agregar proveedor</button>
+            </section>
+            <div class="reparto-resumen" id="reparto-resumen"></div>
+            <button type="button" class="btn btn-primary reparto-guardar" id="btn-reparto-guardar" data-reparto="guardar">Descontar saldos</button>
+        `;
+        Utils.enablePriceInputs(root);
+        this._refrescarResumen();
+    },
+
+    _lineaHtml(linea) {
+        return `
+            <div class="reparto-linea" data-id="${linea.id}">
+                <select class="form-control reparto-prov">
+                    <option value="">Proveedor</option>
+                    ${this._opcionesProveedor(linea.proveedor_id)}
+                </select>
+                <input class="form-control reparto-parte" data-price-input="true" inputmode="numeric" placeholder="0" value="${linea.monto ? this._esc(linea.monto) : ''}">
+                <button type="button" class="btn btn-secondary btn-sm" data-reparto="todo" data-id="${linea.id}">Todo</button>
+                <button type="button" class="btn btn-danger btn-sm" data-reparto="sacar" data-id="${linea.id}" aria-label="Sacar proveedor">×</button>
+            </div>
+        `;
+    },
+
+    _lineasActuales() {
+        return [...document.querySelectorAll('#reparto-lineas .reparto-linea')].map(row => ({
+            id: row.dataset.id,
+            proveedor_id: row.querySelector('select')?.value || '',
+            monto: row.querySelector('input')?.value || ''
+        }));
+    },
+
+    agregarLinea() {
+        const cont = document.getElementById('reparto-lineas');
+        if (!cont) return;
+        cont.insertAdjacentHTML('beforeend', this._lineaHtml({ id: 'l-' + Date.now(), proveedor_id: '', monto: '' }));
+        Utils.enablePriceInputs(cont);
+        this._refrescarResumen();
+    },
+
+    sacarLinea(id) {
+        const filas = this._lineasActuales();
+        if (filas.length <= 1) {
+            const row = document.querySelector(`#reparto-lineas .reparto-linea[data-id="${id}"]`);
+            if (!row) return;
+            row.querySelector('select').value = '';
+            row.querySelector('input').value = '';
+            this._refrescarResumen();
+            return;
+        }
+        document.querySelector(`#reparto-lineas .reparto-linea[data-id="${id}"]`)?.remove();
+        this._refrescarResumen();
+    },
+
+    ponerTodo(id) {
+        const row = document.querySelector(`#reparto-lineas .reparto-linea[data-id="${id}"]`);
+        if (!row) return;
+        const proveedorId = row.querySelector('select')?.value;
+        const proveedor = this.proveedores.find(p => String(p.id) === String(proveedorId));
+        if (!proveedor) {
+            Utils.showError('Elegí el proveedor.');
+            return;
+        }
+        const entro = Utils.parsePrice(document.getElementById('reparto-monto')?.value);
+        const otros = this._lineasActuales()
+            .filter(linea => linea.id !== id)
+            .reduce((suma, linea) => suma + Utils.parsePrice(linea.monto), 0);
+        const disponible = Math.max(0, entro - otros);
+        const saldo = Utils.parsePrice(proveedor.saldo);
+        const monto = Math.min(saldo, disponible || saldo);
+        row.querySelector('input').value = Utils.formatPrice(monto);
+        this._refrescarResumen();
+    },
+
+    _refrescarResumen() {
+        const caja = document.getElementById('reparto-resumen');
+        const deuda = document.getElementById('reparto-deuda');
+        if (!caja) return;
+        const clienteId = document.getElementById('reparto-cliente')?.value;
+        const cliente = this.clientes.find(c => c.id === clienteId);
+        if (deuda && cliente) deuda.textContent = `${cliente.nombre} debe ${Utils.formatCurrency(cliente.deuda)}.`;
+        const entro = Utils.parsePrice(document.getElementById('reparto-monto')?.value);
+        const sale = this._lineasActuales().reduce((suma, linea) => suma + Utils.parsePrice(linea.monto), 0);
+        const queda = entro - sale;
+        let aviso = '';
+        if (cliente && entro > cliente.deuda) aviso = `Supera lo que debe ${cliente.nombre} (${Utils.formatCurrency(cliente.deuda)}).`;
+        else if (sale > entro) aviso = 'Estás repartiendo más de lo que entró.';
+        caja.innerHTML = `
+            <p>Entró <strong>${Utils.formatCurrency(entro)}</strong></p>
+            <p>Repartís <strong>${Utils.formatCurrency(sale)}</strong></p>
+            <p>Queda en la caja <strong>${Utils.formatCurrency(queda)}</strong></p>
+            ${aviso ? `<p class="reparto-aviso">${this._esc(aviso)}</p>` : ''}
+        `;
+    },
+
+    async guardar() {
+        const btn = document.getElementById('btn-reparto-guardar');
+        if (btn?.disabled) return;
+        const clienteId = document.getElementById('reparto-cliente')?.value;
+        const cliente = this.clientes.find(c => c.id === clienteId);
+        const monto = Utils.parsePrice(document.getElementById('reparto-monto')?.value);
+        const pagos = this._lineasActuales()
+            .filter(linea => linea.proveedor_id && Utils.parsePrice(linea.monto) > 0)
+            .map(linea => ({ proveedor_id: linea.proveedor_id, monto: Utils.parsePrice(linea.monto) }));
+        if (!cliente) {
+            Utils.showError('Elegí el cliente.');
+            return;
+        }
+        if (monto <= 0) {
+            Utils.showError('Poné cuánto entró en efectivo.');
+            return;
+        }
+        if (monto > cliente.deuda) {
+            Utils.showError(`${cliente.nombre} debe ${Utils.formatCurrency(cliente.deuda)}.`);
+            return;
+        }
+        const sale = pagos.reduce((suma, pago) => suma + pago.monto, 0);
+        if (sale > monto) {
+            Utils.showError('Estás repartiendo más de lo que entró.');
+            return;
+        }
+        const porProveedor = new Map();
+        pagos.forEach(pago => {
+            porProveedor.set(pago.proveedor_id, (porProveedor.get(pago.proveedor_id) || 0) + pago.monto);
+        });
+        for (const [id, total] of porProveedor) {
+            const proveedor = this.proveedores.find(p => String(p.id) === String(id));
+            const saldo = Utils.parsePrice(proveedor?.saldo);
+            if (total > saldo) {
+                Utils.showError(`${proveedor?.nombre || 'El proveedor'} tiene saldo ${Utils.formatCurrency(saldo)}.`);
+                return;
+            }
+        }
+        if (btn) btn.disabled = true;
+        try {
+            const resultado = await API.repartirEfectivo({
+                fecha: AppState.currentDate,
+                cliente_id: clienteId,
+                monto,
+                pagos
+            });
+            Utils.avisar(`Listo. ${cliente.nombre} bajó ${Utils.formatCurrency(resultado.cobrado)}. En la caja quedan ${Utils.formatCurrency(resultado.queda)}.`);
+            AppState.proveedores = [];
+            await this.load();
+        } catch (error) {
+            const mensaje = error && error.message ? error.message : 'No se pudo repartir';
+            if (mensaje.includes('Endpoint no encontrado')) {
+                Utils.showError('Publicá el script para que el reparto descuente los saldos.');
+            } else {
+                Utils.showError(mensaje);
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+};
+
 // Carga inicial unificada (1 sola llamada JSONP al backend)
 const DataLoader = {
     _bootstrapPromise: null,
@@ -7432,6 +8857,9 @@ const DataLoader = {
 
         const dash = data.dashboard || data;
         if (dash.pedidos) AppState.pedidos = dash.pedidos;
+        if (dash.recepcion) AppState.recepcion = dash.recepcion;
+        if (dash.precios) AppState.precios = dash.precios;
+        if (dash.pedidos || dash.recepcion || dash.precios) AppState.fechaCargada = fecha;
         if (dash.cobranzas) AppState.cobranzas = dash.cobranzas;
         if (dash.stock) AppState.stock = dash.stock;
     },
@@ -7447,13 +8875,43 @@ const DataLoader = {
     _flujoFecha: null,
     _flujoToken: 0,
 
-    getFlujo(fecha = AppState.currentDate) {
+    armarFlujoLocal(fecha = AppState.currentDate) {
         const cacheKey = `flujo:${fecha}`;
         const cached = CacheManager.get(cacheKey);
-        if (cached) {
-            this._hydrateFlujo(cached, fecha);
-            return Promise.resolve(cached);
+        if (cached) return cached;
+
+        const pedidos = CacheManager.get(`pedidos:${fecha}`);
+        const recepcion = CacheManager.get(`recepcion:${fecha}`);
+        const precios = CacheManager.get(`precios:${fecha}`);
+        if (!Array.isArray(pedidos) || !Array.isArray(recepcion) || !Array.isArray(precios)) {
+            return null;
         }
+
+        const armado = { fecha, pedidos, recepcion, precios };
+        CacheManager.set(cacheKey, armado);
+        return armado;
+    },
+
+    getFlujo(fecha = AppState.currentDate) {
+        const local = this.armarFlujoLocal(fecha);
+        if (local) {
+            this._hydrateFlujo(local, fecha);
+            return Promise.resolve(local);
+        }
+        if (this._bootstrapPromise && this._bootstrapFecha === fecha) {
+            return this._bootstrapPromise.then(() => {
+                const despues = this.armarFlujoLocal(fecha);
+                if (despues) {
+                    this._hydrateFlujo(despues, fecha);
+                    return despues;
+                }
+                return this._pedirFlujo(fecha);
+            });
+        }
+        return this._pedirFlujo(fecha);
+    },
+
+    _pedirFlujo(fecha) {
         if (this._flujoPromise && this._flujoFecha === fecha) {
             return this._flujoPromise;
         }
@@ -7491,6 +8949,7 @@ const DataLoader = {
             AppState.precios = data.precios;
             CacheManager.set(`precios:${fecha}`, data.precios);
         }
+        AppState.fechaCargada = fecha;
         CacheManager.set(`flujo:${fecha}`, data);
     },
 
@@ -7581,7 +9040,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
     Utils.enablePriceInputs(document);
-    addButtonListener('btn-seguir-recepcion', () => Navigation.navigateTo('recepcion'), 'Abriendo...');
+    addButtonListener('btn-seguir-recepcion', () => Navigation.navigateTo('camiones'), 'Abriendo...');
+    addButtonListener('btn-camiones-agregar', () => Camiones.agregar(), 'Agregando...', { useButtonLoader: false });
+    addButtonListener('btn-camiones-imprimir', () => Camiones.imprimirTodos(), 'Imprimiendo...', { useButtonLoader: false });
+    addButtonListener('btn-camiones-enviar', () => Camiones.enviarTodos(), 'Preparando...', { useButtonLoader: false });
+    addButtonListener('btn-seguir-desde-camiones', () => Navigation.navigateTo('recepcion'), 'Abriendo...');
+    Camiones.enganchar();
     addButtonListener('btn-seguir-precios', () => Navigation.navigateTo('precios'), 'Abriendo...');
     addButtonListener('btn-seguir-cobros', () => Navigation.navigateTo('cobros-hoy'), 'Abriendo...');
     addButtonListener('btn-seguir-cobranzas', () => Navigation.navigateTo('pagos'), 'Abriendo...');
@@ -7592,6 +9056,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-ajustar-stock', () => Stock.ajustar(), 'Ajustando...');
     addButtonListener('btn-verificar-stock', () => Stock.verificarStockBajo(), 'Verificando...');
     addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
+    addButtonListener('btn-ir-reparto', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-caja-repartir', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-ver-dia', () => {
         // Ver el primer día del historial (se puede mejorar con selección)
         if (AppState.cierres.length > 0) {

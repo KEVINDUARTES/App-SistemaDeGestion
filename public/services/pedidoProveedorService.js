@@ -38,7 +38,7 @@ const PedidoProveedorService = {
                 return;
             }
 
-            const proveedorId = producto.proveedor_default || this.SIN_PROVEEDOR_ID;
+            const proveedorId = pedido.proveedor_id || producto.proveedor_default || this.SIN_PROVEEDOR_ID;
 
             if (!pedidosPorProveedor[proveedorId]) {
                 pedidosPorProveedor[proveedorId] = [];
@@ -79,7 +79,7 @@ const PedidoProveedorService = {
                     producto: producto.nombre,
                     tipo: pedido.tipo || producto.tipo || '',
                     cantidad: 0,
-                    proveedor_id: producto.proveedor_default || '',
+                    proveedor_id: pedido.proveedor_id || producto.proveedor_default || '',
                     totalLineas: 0,
                     lineasEnviadas: 0
                 };

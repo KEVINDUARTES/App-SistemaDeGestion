@@ -217,6 +217,11 @@ body {
     padding: 8px 0 8px 12px;
 }
 
+.nav-category.active .nav-submenu.nav-flow-menu {
+    max-height: 2400px;
+    padding-bottom: 12px;
+}
+
 .nav-submenu li {
     margin: 4px 0;
 }
@@ -566,6 +571,197 @@ body {
     margin-bottom: 36px;
     flex-wrap: wrap;
     gap: 16px;
+}
+
+.page-header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.camion-lista {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.camion-card {
+    background: var(--color-white);
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+}
+
+.camion-card-top,
+.camion-clientes,
+.camion-acciones {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.camion-card-top,
+.camion-clientes {
+    margin-bottom: 12px;
+}
+
+.camion-nombre {
+    font-size: 18px;
+    font-weight: 700;
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-md);
+    padding: 8px 12px;
+    min-width: 180px;
+}
+
+.camion-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #eef6ff;
+    border-radius: 999px;
+    padding: 4px 8px 4px 12px;
+    font-weight: 600;
+}
+
+.camion-chip button {
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    color: var(--color-gray-600);
+}
+
+.camion-agregar {
+    min-width: 180px;
+    width: auto;
+}
+
+.camion-sin {
+    margin-bottom: 16px;
+    padding: 12px 14px;
+    background: #fff7ed;
+    border: 1px solid #fdba74;
+    border-radius: var(--radius-md);
+}
+
+.camion-vacio {
+    padding: 28px;
+    text-align: center;
+    color: var(--color-gray-600);
+}
+
+.camion-card .table-container {
+    overflow-x: auto;
+    margin-top: 0;
+}
+
+.camion-card .data-table {
+    width: max-content;
+    min-width: 100%;
+}
+
+.camion-card .data-table th,
+.camion-card .data-table td {
+    white-space: nowrap;
+}
+
+.camion-card .data-table th:last-child,
+.camion-card .data-table td:last-child {
+    min-width: 120px;
+}
+
+.camion-card .data-table .num {
+    text-align: right;
+}
+
+.camion-card .data-table th:first-child,
+.camion-card .data-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+}
+
+.camion-card .data-table thead th:first-child {
+    z-index: 2;
+    background: var(--color-primary);
+}
+
+.camion-card .data-table td:first-child {
+    background: #fff;
+}
+
+.reparto-acceso {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.reparto-acceso p {
+    margin: 0;
+    color: var(--color-gray-600);
+}
+
+.reparto-card {
+    background: var(--color-white);
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+.reparto-card h3 {
+    margin: 0 0 12px;
+}
+
+.reparto-card label {
+    display: block;
+    margin: 12px 0 6px;
+    font-weight: 600;
+}
+
+.reparto-deuda {
+    margin: 8px 0 0;
+    color: var(--color-gray-600);
+}
+
+.reparto-linea {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.reparto-linea select {
+    flex: 1 1 180px;
+    min-width: 0;
+}
+
+.reparto-linea input {
+    width: 130px;
+}
+
+.reparto-resumen {
+    margin: 8px 0 16px;
+    font-size: 18px;
+}
+
+.reparto-resumen p {
+    margin: 4px 0;
+}
+
+.reparto-aviso {
+    color: #b45309;
+    font-weight: 600;
+}
+
+.reparto-guardar {
+    width: 100%;
 }
 
 .page-header h2 {
@@ -1907,6 +2103,37 @@ body {
     color: var(--color-gray-800);
 }
 
+.medios-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px 16px;
+}
+
+.medios-campo {
+    margin-bottom: 0;
+}
+
+.medios-resumen {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 12px;
+    padding: 12px 14px;
+    background: #f8fafc;
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-md);
+}
+
+.medios-resumen p {
+    margin: 0;
+}
+
+.medios-texto {
+    color: var(--color-gray-600);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
 .pago-preview strong {
     color: var(--color-primary);
 }
@@ -2371,6 +2598,27 @@ html {
 /* ============================================
    🔔 ALERTAS PERSONALIZADAS
    ============================================ */
+
+.aviso-rapido {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10000;
+    max-width: min(90vw, 420px);
+    padding: 12px 16px;
+    border-radius: 10px;
+    background: #1e293b;
+    color: #fff;
+    font-size: 14px;
+    line-height: 1.4;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.28);
+    pointer-events: none;
+}
+
+.aviso-rapido[hidden] {
+    display: none;
+}
 
 .custom-alert-overlay {
     display: none;
@@ -2903,6 +3151,47 @@ html {
 
     .data-table td:last-child {
         border-bottom: 0;
+    }
+
+    .camion-card .data-table thead {
+        display: table-header-group;
+    }
+
+    .camion-card .data-table,
+    .camion-card .data-table tbody {
+        display: table;
+        width: max-content;
+        min-width: 100%;
+    }
+
+    .camion-card .data-table tbody {
+        display: table-row-group;
+    }
+
+    .camion-card .data-table tr {
+        display: table-row;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+    }
+
+    .camion-card .data-table th,
+    .camion-card .data-table td {
+        display: table-cell;
+        width: auto;
+        text-align: left;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--color-gray-200);
+    }
+
+    .camion-card .data-table td::before {
+        content: none;
+    }
+
+    .camion-card .data-table .num {
+        text-align: right;
     }
 
     .row-actions-menu {

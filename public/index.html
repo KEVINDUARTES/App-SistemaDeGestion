@@ -7,7 +7,7 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <title>Luciano Cargas - Sistema de Gestión</title>
-    <link rel="stylesheet" href="styles.css?v=20261001enviados">
+    <link rel="stylesheet" href="styles.css?v=20261002reparto">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -44,10 +44,16 @@
                             <span class="nav-flow-label">Pedidos del día</span>
                         </a>
                     </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="camiones" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">2</span>
+                            <span class="nav-flow-label">Armar camiones</span>
+                        </a>
+                    </li>
                     <li class="nav-flow-phase"><span>Cuando llegue</span></li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="recepcion" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">2</span>
+                            <span class="nav-flow-badge" aria-hidden="true">3</span>
                             <span class="nav-flow-label">Confirmar recepción</span>
                             <span class="nav-pendiente-badge" id="nav-badge-recepcion" hidden>0</span>
                         </a>
@@ -55,38 +61,44 @@
                     <li class="nav-flow-phase"><span>Fase 2</span></li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="precios" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">3</span>
+                            <span class="nav-flow-badge" aria-hidden="true">4</span>
                             <span class="nav-flow-label">Precios al cliente</span>
                         </a>
                     </li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="cobros-hoy" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">4</span>
+                            <span class="nav-flow-badge" aria-hidden="true">5</span>
                             <span class="nav-flow-label">Cobranza al cliente</span>
                         </a>
                     </li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="pagos" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">5</span>
+                            <span class="nav-flow-badge" aria-hidden="true">6</span>
                             <span class="nav-flow-label">Pagar al proveedor</span>
                         </a>
                     </li>
                     <li class="nav-flow-phase"><span>Fase 3</span></li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="cobranzas" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">6</span>
+                            <span class="nav-flow-badge" aria-hidden="true">7</span>
                             <span class="nav-flow-label">Cobranzas a clientes <span class="nav-flow-note">(pendientes)</span></span>
                         </a>
                     </li>
                     <li class="nav-flow-item">
                         <a href="#" data-page="pagos-pendientes" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">7</span>
+                            <span class="nav-flow-badge" aria-hidden="true">8</span>
                             <span class="nav-flow-label">Pagos a proveedores <span class="nav-flow-note">(pendientes)</span></span>
                         </a>
                     </li>
                     <li class="nav-flow-item">
+                        <a href="#" data-page="recepcion-pendientes" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">9</span>
+                            <span class="nav-flow-label">Confirmar recepción <span class="nav-flow-note">(pendientes)</span></span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
                         <a href="#" data-page="cierre" class="nav-link nav-flow-link">
-                            <span class="nav-flow-badge" aria-hidden="true">8</span>
+                            <span class="nav-flow-badge" aria-hidden="true">10</span>
                             <span class="nav-flow-label">Cerrar el día</span>
                         </a>
                     </li>
@@ -118,6 +130,7 @@
                 </a>
                 <ul class="nav-submenu">
                     <li><a href="#" data-page="historial" class="nav-link">Historial de Días</a></li>
+                    <li><a href="#" data-page="reparto" class="nav-link">Repartir efectivo</a></li>
                     <li><a href="#" data-page="caja" class="nav-link">Caja</a></li>
                 </ul>
             </li>
@@ -143,6 +156,10 @@
         <!-- Dashboard -->
         <div id="dashboard" class="page active">
             <div id="dashboard-pendientes-banner" class="pendientes-banner" hidden></div>
+            <div class="reparto-acceso">
+                <button type="button" class="btn btn-primary" id="btn-ir-reparto">Repartir efectivo</button>
+                <p>Anotá el efectivo que entró de un cliente y descontalo a los proveedores.</p>
+            </div>
             <!-- Gráfico de métricas -->
             <div class="metrics-section">
                 <div class="metrics-card">
@@ -284,7 +301,30 @@
             </div>
             <div class="page-actions">
                 <button class="btn btn-primary" id="btn-guardar-pedidos">Enviar pendientes a proveedores</button>
-                <button class="btn btn-secondary" id="btn-seguir-recepcion" type="button">Seguir a recepción</button>
+                <button class="btn btn-secondary" id="btn-seguir-recepcion" type="button">Seguir a camiones</button>
+            </div>
+        </div>
+
+        <!-- Camiones -->
+        <div id="camiones" class="page">
+            <div class="page-header">
+                <h2>Armar camiones</h2>
+                <div class="page-header-actions">
+                    <button class="btn btn-secondary" id="btn-camiones-imprimir" type="button">Imprimir todos</button>
+                    <button class="btn btn-whatsapp" id="btn-camiones-enviar" type="button">Enviar todos</button>
+                    <button class="btn btn-primary" id="btn-camiones-agregar" type="button">Agregar camión</button>
+                </div>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="camiones">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="camiones-fecha-select">Pedido del día:</label>
+                    <select id="camiones-fecha-select" class="form-control dia-operativo-select"></select>
+                </div>
+                <p class="dia-operativo-hint" id="camiones-hint">Repartí los clientes del día en camiones. Cada cliente va en uno solo. La hoja muestra cuánto va a cada uno, el total del camión y el puesto.</p>
+            </div>
+            <div id="camiones-root"></div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-seguir-desde-camiones" type="button">Seguir a recepción</button>
             </div>
         </div>
 
@@ -408,7 +448,7 @@
             <div class="page-actions precios-acciones">
                 <button class="btn btn-secondary" id="btn-generar-lista-precios" type="button" title="Arma la lista con lo que ya confirmaste que llegó">Armar lista</button>
                 <button class="btn btn-primary" id="btn-guardar-precios" type="button">Guardar precios</button>
-                <button class="btn btn-whatsapp" id="btn-enviar-whatsapp-precios" type="button">WhatsApp</button>
+                <button class="btn btn-whatsapp" id="btn-enviar-whatsapp-precios" type="button">WhatsApp PDF</button>
                 <button class="btn btn-secondary" id="btn-exportar-pdf-precios" type="button">PDF</button>
                 <button class="btn btn-secondary" id="btn-seguir-cobros" type="button">Seguir a cobranza</button>
             </div>
@@ -424,7 +464,7 @@
                     <label class="dia-operativo-label" for="cobros-hoy-fecha-select">Pedido del día:</label>
                     <select id="cobros-hoy-fecha-select" class="form-control dia-operativo-select"></select>
                 </div>
-                <p class="dia-operativo-hint" id="cobros-hoy-hint">Cobrás a los clientes de este día. Al cerrar, lo que quede sin cobrar pasa a Cobranzas a clientes (pendientes).</p>
+                <p class="dia-operativo-hint" id="cobros-hoy-hint">Cobrás en efectivo, transferencia, cheque o tarjeta. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).</p>
             </div>
             <div class="table-container">
                 <table class="data-table">
@@ -433,7 +473,8 @@
                             <th>Cliente</th>
                             <th>Total del día</th>
                             <th>Cobrado</th>
-                            <th>Saldo</th>
+                            <th>Cómo cobró</th>
+                            <th>Adeudado</th>
                             <th>Estado</th>
                             <th>Acciones</th>
                         </tr>
@@ -485,13 +526,14 @@
             <div class="page-header">
                 <h2>Cobranzas a clientes (pendientes)</h2>
             </div>
-            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. Cobrás de a uno.</p>
+            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. Podés cobrar una parte en cada medio y dejar el resto adeudado.</p>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
                         <tr>
                             <th>Cliente</th>
                             <th>Te debe</th>
+                            <th>Cómo pagó</th>
                             <th>Fecha</th>
                             <th>Estado</th>
                             <th>Acciones</th>
@@ -518,7 +560,7 @@
                     <select id="pagos-fecha-select" class="form-control dia-operativo-select"></select>
                 </div>
             </div>
-            <p class="dia-operativo-hint" id="pagos-hint">Pagá la mercadería de este día. Al cerrar, lo que quede por pagar pasa a Pagos a proveedores (pendientes).</p>
+            <p class="dia-operativo-hint" id="pagos-hint">Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).</p>
             <div id="pagos-resumen" class="pagos-resumen" hidden></div>
             <div class="table-container">
                 <table class="data-table">
@@ -526,6 +568,7 @@
                         <tr>
                             <th>Proveedor</th>
                             <th>Le debés</th>
+                            <th>Cómo pagaste</th>
                             <th>Mercadería de hoy</th>
                             <th>Estado</th>
                             <th>Acciones</th>
@@ -617,9 +660,18 @@
             </div>
         </div>
 
+        <div id="reparto" class="page">
+            <div class="page-header">
+                <h2>Repartir efectivo</h2>
+            </div>
+            <p class="dia-operativo-hint">Entrá el efectivo de un cliente. Si de eso le das a un proveedor, se descuenta el saldo de cada uno. Lo que no repartís queda en la caja.</p>
+            <div id="reparto-root"></div>
+        </div>
+
         <div id="caja" class="page">
             <div class="page-header">
                 <h2>Caja</h2>
+                <button type="button" class="btn btn-primary" id="btn-caja-repartir">Repartir efectivo</button>
             </div>
             <div class="dia-operativo-bar">
                 <div class="dia-operativo-bar-main">
@@ -703,17 +755,18 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <nav class="bottom-nav" aria-label="Flujo del día">
         <a href="#" data-page="pedidos" class="nav-link"><span>1</span>Pedidos</a>
-        <a href="#" data-page="recepcion" class="nav-link"><span>2</span>Recepción</a>
-        <a href="#" data-page="precios" class="nav-link"><span>3</span>Precios</a>
-        <a href="#" data-page="cobros-hoy" class="nav-link"><span>4</span>Cobro</a>
-        <a href="#" data-page="pagos" class="nav-link"><span>5</span>Pago</a>
-        <a href="#" data-page="cierre" class="nav-link"><span>6</span>Cierre</a>
+        <a href="#" data-page="camiones" class="nav-link"><span>2</span>Camiones</a>
+        <a href="#" data-page="recepcion" class="nav-link"><span>3</span>Recepción</a>
+        <a href="#" data-page="precios" class="nav-link"><span>4</span>Precios</a>
+        <a href="#" data-page="cobros-hoy" class="nav-link"><span>5</span>Cobro</a>
+        <a href="#" data-page="pagos" class="nav-link"><span>6</span>Pago</a>
+        <a href="#" data-page="cierre" class="nav-link"><span>7</span>Cierre</a>
     </nav>
     <script src="auth.js?v=20261002login"></script>
     <script src="services/whatsapp.js?v=20260927sinboton"></script>
-    <script src="services/pedidoProveedorService.js?v=20260927envio"></script>
+    <script src="services/pedidoProveedorService.js?v=20261002prov"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261002login"></script>
+    <script src="app.js?v=20261002rapido2"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

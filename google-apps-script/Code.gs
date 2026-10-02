@@ -12,6 +12,7 @@ const CONFIG = {
     PROVEEDORES: 'Proveedores',
     PRODUCTOS: 'Productos',
     PEDIDOS: 'Pedidos',
+    CAMIONES: 'Camiones',
     RECEPCION: 'Recepcion',
     PRECIOS_CLIENTE: 'PreciosCliente',
     CIERRE_DIA: 'CierreDia',
@@ -234,6 +235,14 @@ function handleRequest(e, method) {
       case 'pedidos/marcar-enviados-por-ids':
         result = marcarPedidosEnviadosPorIds(data.pedidosIds);
         break;
+
+      case 'camiones':
+        if (actualMethod === 'GET') {
+          result = getCamiones(data.fecha);
+        } else if (actualMethod === 'POST') {
+          result = guardarCamiones(data);
+        }
+        break;
       
       // Recepción
       case 'recepcion':
@@ -301,6 +310,10 @@ function handleRequest(e, method) {
         result = cobrarClienteHoy(data);
         break;
 
+      case 'cobranzas/ajustar-cobro':
+        result = ajustarCobroClienteHoy(data);
+        break;
+
       case 'cobranzas/totales-hoy':
         result = getTotalesClientesHoy(data.fecha);
         break;
@@ -362,6 +375,10 @@ function handleRequest(e, method) {
         } else if (actualMethod === 'POST') {
           result = createCajaMovimiento(data);
         }
+        break;
+
+      case 'caja/repartir':
+        result = repartirEfectivo(data);
         break;
       
       // Historial
@@ -532,6 +549,21 @@ function readSheetValues(sheetName) {
   return _sheetValuesCache[sheetName];
 }
 
+function readUsedValues_(sheet) {
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return [[]];
+  return sheet.getRange(1, 1, lastRow, lastCol).getValues();
+}
+
+function findRowById_(sheet, id) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2 || id === undefined || id === null || id === '') return -1;
+  var finder = sheet.getRange(2, 1, lastRow, 1).createTextFinder(String(id)).matchEntireCell(true);
+  var cell = finder.findNext();
+  return cell ? cell.getRow() : -1;
+}
+
 function invalidateSheetCache(sheetName) {
   if (sheetName) {
     delete _sheetValuesCache[sheetName];
@@ -595,7 +627,10 @@ function invalidateServerCacheForSheet(sheetName) {
   }
   if (sheetName === CONFIG.SHEETS.PEDIDOS) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.RECEPCION) keys.push('sc:saldos');
-  if (sheetName === CONFIG.SHEETS.PAGOS_PROVEEDORES) keys.push('sc:saldos');
+  if (sheetName === CONFIG.SHEETS.PAGOS_PROVEEDORES) {
+    keys.push('sc:saldos');
+    keys.push('sc:medios_prov');
+  }
   if (sheetName === CONFIG.SHEETS.CIERRE_DIA) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.PRECIOS_CLIENTE) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.COBRANZAS) keys.push('sc:cobranzas');
@@ -660,6 +695,7 @@ function resetAllDatos(confirmacion) {
     CONFIG.SHEETS.PROVEEDORES,
     CONFIG.SHEETS.PRODUCTOS,
     CONFIG.SHEETS.PEDIDOS,
+    CONFIG.SHEETS.CAMIONES,
     CONFIG.SHEETS.RECEPCION,
     CONFIG.SHEETS.PRECIOS_CLIENTE,
     CONFIG.SHEETS.CIERRE_DIA,
@@ -714,7 +750,8 @@ function initializeSheet(sheet, sheetName) {
     'Clientes': ['id', 'nombre', 'telefono', 'activo'],
     'Proveedores': ['id', 'nombre', 'rubro', 'telefono', 'activo'],
     'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default'],
-    'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado'],
+    'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado', 'proveedor_id'],
+    'Camiones': ['id', 'fecha', 'nombre', 'orden', 'clientes'],
     'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
     'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
@@ -1048,8 +1085,12 @@ function getProveedoresList() {
 function getProveedores() {
   var list = getProveedoresList();
   var saldos = calcularTodosSaldosProveedores();
+  var medios = resumirMediosProveedores();
   return list.map(function(proveedor) {
-    return Object.assign({}, proveedor, { saldo: saldos[proveedor.id] || 0 });
+    return Object.assign({}, proveedor, {
+      saldo: saldos[proveedor.id] || 0,
+      medios: medios[proveedor.id] || null
+    });
   });
 }
 
@@ -1177,6 +1218,123 @@ function calcularTodosSaldosProveedores() {
 function calcularSaldoProveedor(proveedorId) {
   const saldos = calcularTodosSaldosProveedores();
   return saldos[proveedorId] || 0;
+}
+
+var METODOS_CLIENTE_ = ['efectivo', 'transferencia', 'cheque', 'tarjeta'];
+var METODOS_PROVEEDOR_ = ['efectivo', 'transferencia'];
+
+function mediosVacios_() {
+  return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0 };
+}
+
+function parseMedios_(valor) {
+  var medios = mediosVacios_();
+  var raw = valor;
+  if (raw && typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch (e) { raw = null; }
+  }
+  if (!raw || typeof raw !== 'object') return medios;
+  METODOS_CLIENTE_.forEach(function(m) {
+    medios[m] = normalizeAmount(raw[m]);
+  });
+  return medios;
+}
+
+function sumaMedios_(medios) {
+  var total = 0;
+  METODOS_CLIENTE_.forEach(function(m) { total += normalizeAmount(medios[m]); });
+  return Math.round(total * 100) / 100;
+}
+
+function etiquetaMedio_(metodo) {
+  var labels = {
+    efectivo: 'Efectivo',
+    transferencia: 'Transferencia',
+    cheque: 'Cheque',
+    tarjeta: 'Tarjeta'
+  };
+  return labels[metodo] || metodo;
+}
+
+function normalizarMedios_(data, permitidos) {
+  var medios = mediosVacios_();
+  var raw = data && data.medios;
+  if (raw && typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch (e) { raw = null; }
+  }
+  if (Array.isArray(raw)) {
+    raw.forEach(function(item) {
+      if (!item) return;
+      var metodo = String(item.metodo || '');
+      if (permitidos.indexOf(metodo) === -1) return;
+      medios[metodo] += normalizeAmount(item.monto);
+    });
+  } else if (raw && typeof raw === 'object') {
+    permitidos.forEach(function(m) { medios[m] = normalizeAmount(raw[m]); });
+  } else if (data && normalizeAmount(data.monto) > 0) {
+    var metodoUnico = permitidos.indexOf(data.metodo) !== -1 ? data.metodo : 'efectivo';
+    medios[metodoUnico] = normalizeAmount(data.monto);
+  }
+  METODOS_CLIENTE_.forEach(function(m) {
+    medios[m] = Math.round(medios[m] * 100) / 100;
+  });
+  return { medios: medios, total: sumaMedios_(medios) };
+}
+
+function registrarCajaMedios_(fecha, tipo, medios, notaBase, referencia) {
+  var caja = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
+  var wrote = false;
+  METODOS_CLIENTE_.forEach(function(m) {
+    var monto = normalizeAmount(medios[m]);
+    if (monto <= 0.009) return;
+    caja.appendRow([
+      generateId(),
+      fecha,
+      tipo,
+      monto,
+      notaBase + ' · ' + etiquetaMedio_(m),
+      referencia
+    ]);
+    wrote = true;
+  });
+  if (wrote) invalidateSheetCache(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
+}
+
+function resumirMediosProveedores() {
+  var sc = serverCacheGet('sc:medios_prov');
+  if (sc) return sc;
+  var pagos = readSheetValues(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  var headers = pagos.headers;
+  var idxProv = headers.indexOf('proveedor_id');
+  var idxMonto = headers.indexOf('monto');
+  var idxMetodo = headers.indexOf('metodo');
+  if (idxProv === -1) idxProv = 2;
+  if (idxMonto === -1) idxMonto = 3;
+  if (idxMetodo === -1) idxMetodo = 4;
+  var map = {};
+  pagos.rows.forEach(function(row) {
+    var proveedorId = String(row[idxProv] || '');
+    if (!proveedorId) return;
+    if (!map[proveedorId]) map[proveedorId] = mediosVacios_();
+    var metodo = String(row[idxMetodo] || 'efectivo');
+    if (METODOS_CLIENTE_.indexOf(metodo) === -1) metodo = 'efectivo';
+    map[proveedorId][metodo] += normalizeAmount(row[idxMonto]);
+  });
+  Object.keys(map).forEach(function(id) {
+    METODOS_CLIENTE_.forEach(function(m) {
+      map[id][m] = Math.round(map[id][m] * 100) / 100;
+    });
+  });
+  serverCacheSet('sc:medios_prov', map, SERVER_CACHE_TTL.saldos);
+  return map;
+}
+
+function ensureCobranzasMediosColumn_(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return;
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  if (headers.indexOf('medios') !== -1) return;
+  sheet.getRange(1, lastCol + 1).setValue('medios').setFontWeight('bold');
 }
 
 // ========== PRODUCTOS ==========
@@ -1342,6 +1500,14 @@ function getPedidos(fecha = null) {
   return pedidos;
 }
 
+function ensurePedidosProveedorColumn_(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return;
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  if (headers.indexOf('proveedor_id') !== -1) return;
+  sheet.getRange(1, lastCol + 1).setValue('proveedor_id').setFontWeight('bold');
+}
+
 function createPedido(data) {
   if (!data || !data.cliente_id || !data.producto_id) {
     throw new Error('Cliente y producto son requeridos');
@@ -1354,19 +1520,26 @@ function createPedido(data) {
   }
 
   const sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  ensurePedidosProveedorColumn_(sheet);
   const id = generateId();
   const fecha = data.fecha || todayArgentina();
-  
-  const newRow = [
-    id,
-    fecha,
-    data.cliente_id,
-    data.producto_id,
-    data.tipo,
-    data.cantidad,
-    false // enviado = false por defecto
-  ];
-  
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const newRow = headers.map(function() { return ''; });
+
+  function setCol(name, value) {
+    var idx = headers.indexOf(name);
+    if (idx !== -1) newRow[idx] = value;
+  }
+
+  setCol('id', id);
+  setCol('fecha', fecha);
+  setCol('cliente_id', data.cliente_id);
+  setCol('producto_id', data.producto_id);
+  setCol('tipo', data.tipo);
+  setCol('cantidad', data.cantidad);
+  setCol('enviado', false);
+  setCol('proveedor_id', data.proveedor_id || '');
+
   sheet.appendRow(newRow);
   invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
@@ -1380,68 +1553,59 @@ function updatePedido(data) {
   }
 
   var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
-  var values = sheet.getDataRange().getValues();
-  if (values.length < 2) {
-    throw new Error('Pedido no encontrado');
+  ensurePedidosProveedorColumn_(sheet);
+  var row = findRowById_(sheet, data.id);
+  if (row < 0) throw new Error('Pedido no encontrado');
+
+  var lastCol = sheet.getLastColumn();
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var values = sheet.getRange(row, 1, row, lastCol).getValues()[0];
+
+  function setCol(name, value) {
+    var idx = headers.indexOf(name);
+    if (idx !== -1 && value !== undefined) values[idx] = value;
   }
 
-  var headers = values[0];
-  var idIdx = headers.indexOf('id');
+  setCol('cliente_id', data.cliente_id);
+  setCol('producto_id', data.producto_id);
+  setCol('tipo', data.tipo);
+  if (data.cantidad !== undefined && data.cantidad !== null) setCol('cantidad', data.cantidad);
+  if (data.proveedor_id !== undefined) setCol('proveedor_id', data.proveedor_id || '');
+
+  sheet.getRange(row, 1, row, lastCol).setValues([values]);
+
   var fechaIdx = headers.indexOf('fecha');
-  var clienteIdx = headers.indexOf('cliente_id');
-  var productoIdx = headers.indexOf('producto_id');
-  var tipoIdx = headers.indexOf('tipo');
-  var cantidadIdx = headers.indexOf('cantidad');
-  if (idIdx === -1) idIdx = 0;
+  var fecha = normalizeFecha(values[fechaIdx !== -1 ? fechaIdx : 1]);
+  invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+  if (fecha) invalidateServerCacheFecha(fecha);
 
-  for (var i = 1; i < values.length; i++) {
-    if (!idsMatch(values[i][idIdx], data.id)) continue;
-
-    var fecha = normalizeFecha(values[i][fechaIdx !== -1 ? fechaIdx : 1]);
-    if (clienteIdx !== -1 && data.cliente_id) values[i][clienteIdx] = data.cliente_id;
-    if (productoIdx !== -1 && data.producto_id) values[i][productoIdx] = data.producto_id;
-    if (tipoIdx !== -1 && data.tipo) values[i][tipoIdx] = data.tipo;
-    if (cantidadIdx !== -1 && data.cantidad !== undefined && data.cantidad !== null) {
-      values[i][cantidadIdx] = data.cantidad;
-    }
-
-    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
-    invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
-    invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
-    if (fecha) invalidateServerCacheFecha(fecha);
-
-    return {
-      success: true,
-      id: data.id,
-      fecha: fecha,
-      cliente_id: data.cliente_id,
-      producto_id: data.producto_id,
-      tipo: data.tipo,
-      cantidad: data.cantidad,
-      enviado: values[i][headers.indexOf('enviado')]
-    };
-  }
-
-  throw new Error('Pedido no encontrado');
+  var enviadoIdx = headers.indexOf('enviado');
+  var proveedorIdx = headers.indexOf('proveedor_id');
+  return {
+    success: true,
+    id: data.id,
+    fecha: fecha,
+    cliente_id: data.cliente_id,
+    producto_id: data.producto_id,
+    tipo: data.tipo,
+    cantidad: data.cantidad,
+    proveedor_id: proveedorIdx !== -1 ? values[proveedorIdx] : (data.proveedor_id || ''),
+    enviado: enviadoIdx !== -1 ? values[enviadoIdx] : false
+  };
 }
 
 function deletePedido(id) {
   const sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === id) {
-      var fecha = normalizeFecha(values[i][1]);
-      sheet.deleteRow(i + 1);
-      invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
-      invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
-      if (fecha) invalidateServerCacheFecha(fecha);
-      return { success: true };
-    }
-  }
-  
-  throw new Error('Pedido no encontrado');
+  const row = findRowById_(sheet, id);
+  if (row < 0) throw new Error('Pedido no encontrado');
+
+  var fecha = normalizeFecha(sheet.getRange(row, 2).getValue());
+  sheet.deleteRow(row);
+  invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+  if (fecha) invalidateServerCacheFecha(fecha);
+  return { success: true };
 }
 
 /**
@@ -1572,6 +1736,62 @@ function marcarPedidosEnviadosPorIds(pedidosIds) {
   return { success: true, marcados: marcados, mensaje: 'Se marcaron ' + marcados + ' pedido(s) como enviados' };
 }
 
+// ========== CAMIONES ==========
+
+function getCamiones(fecha) {
+  var fechaNorm = normalizeFecha(fecha);
+  if (!fechaNorm) return [];
+  var cached = readSheetValues(CONFIG.SHEETS.CAMIONES);
+  var headers = cached.headers || [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var nombreIdx = headers.indexOf('nombre'); if (nombreIdx < 0) nombreIdx = 2;
+  var ordenIdx = headers.indexOf('orden'); if (ordenIdx < 0) ordenIdx = 3;
+  var clientesIdx = headers.indexOf('clientes'); if (clientesIdx < 0) clientesIdx = 4;
+
+  return cached.rows.filter(function(row) {
+    return normalizeFecha(row[fechaIdx]) === fechaNorm;
+  }).map(function(row) {
+    var clientes = [];
+    try { clientes = JSON.parse(row[clientesIdx] || '[]'); } catch (e) { clientes = []; }
+    if (!Array.isArray(clientes)) clientes = [];
+    return {
+      id: row[idIdx],
+      fecha: fechaNorm,
+      nombre: row[nombreIdx] || '',
+      orden: Number(row[ordenIdx]) || 0,
+      clientes: clientes
+    };
+  }).sort(function(a, b) { return a.orden - b.orden; });
+}
+
+function guardarCamiones(data) {
+  if (!data || !data.fecha) throw new Error('La fecha es requerida');
+  var fechaNorm = normalizeFecha(data.fecha);
+  var sheet = getSheet(CONFIG.SHEETS.CAMIONES);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+
+  for (var i = values.length - 1; i >= 1; i--) {
+    if (normalizeFecha(values[i][fechaIdx]) === fechaNorm) sheet.deleteRow(i + 1);
+  }
+
+  (data.camiones || []).forEach(function(camion, index) {
+    var clientes = Array.isArray(camion.clientes) ? camion.clientes : [];
+    sheet.appendRow([
+      camion.id || generateId(),
+      fechaNorm,
+      camion.nombre || ('Camión ' + (index + 1)),
+      index + 1,
+      JSON.stringify(clientes)
+    ]);
+  });
+
+  invalidateSheetCache(CONFIG.SHEETS.CAMIONES);
+  return { success: true, fecha: fechaNorm };
+}
+
 // ========== RECEPCIÓN ==========
 
 function getRecepcion(fecha = null) {
@@ -1628,16 +1848,8 @@ function getRecepcion(fecha = null) {
 function saveRecepcion(data) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
 
-  const pedidos = getPedidos(data.fecha);
-  const pedidosPorProducto = {};
-  pedidos.forEach(pedido => {
-    if (!pedidosPorProducto[pedido.producto_id]) pedidosPorProducto[pedido.producto_id] = 0;
-    pedidosPorProducto[pedido.producto_id] += pedido.cantidad || 0;
-  });
-
   const fechaNormalizada = normalizeFecha(data.fecha);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
+  const values = readUsedValues_(sheet);
 
   // Leer headers para no depender de índices hardcodeados
   const headers = values.length > 0 ? values[0] : [];
@@ -1679,8 +1891,8 @@ function saveRecepcion(data) {
           generateId(),
           data.fecha,
           item.producto_id,
-          producto.proveedor_default || '',
-          pedidosPorProducto[item.producto_id] || 0,
+          item.proveedor_id || producto.proveedor_default || '',
+          item.pedido_total || 0,
           item.llego || 0,
           normalizeAmount(item.precio_real),
           false
@@ -1703,7 +1915,7 @@ function saveRecepcion(data) {
 
 function findRecepcion(fecha, productoId) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
-  const data = sheet.getDataRange().getValues();
+  const data = readUsedValues_(sheet);
   if (data.length < 2) return null;
 
   const headers = data[0];
@@ -1777,26 +1989,59 @@ function confirmarRecepcionItem(data) {
     throw new Error('Ingresá el precio real cuando llegó mercadería');
   }
 
-  saveRecepcion({
-    fecha: data.fecha,
-    items: [{
-      producto_id: data.producto_id,
-      llego: llego,
-      precio_real: precioReal
-    }]
-  });
+  var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var fechaCol = headers.indexOf('fecha');
+  var productoCol = headers.indexOf('producto_id');
+  var llegoCol = headers.indexOf('llego');
+  var precioCol = headers.indexOf('precio_real');
+  var confirmadoCol = headers.indexOf('confirmado');
+  if (fechaCol < 0) fechaCol = 1;
+  if (productoCol < 0) productoCol = 2;
+  if (llegoCol < 0) llegoCol = 5;
+  if (precioCol < 0) precioCol = 6;
+  if (confirmadoCol < 0) confirmadoCol = Math.max(headers.length - 1, 0);
 
-  var found = findRecepcion(data.fecha, data.producto_id);
-  if (!found) {
-    throw new Error('No se encontró la recepción del producto');
+  var fechaNormalizada = normalizeFecha(data.fecha);
+  var rowIdx = -1;
+  for (var i = 1; i < values.length; i++) {
+    if (normalizeFecha(values[i][fechaCol]) === fechaNormalizada && idsMatch(values[i][productoCol], data.producto_id)) {
+      rowIdx = i;
+      break;
+    }
   }
 
-  var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
-  sheet.getRange(found.rowIndex, found.confirmadoCol + 1).setValue(true);
+  if (rowIdx === -1) {
+    var producto = findInIdMap(getProductosMap(), data.producto_id);
+    if (!producto) {
+      throw new Error('Ese producto no está en el sistema. Actualizá la página y volvé a confirmar.');
+    }
+    var nueva = [];
+    nueva[0] = generateId();
+    nueva[fechaCol] = data.fecha;
+    nueva[productoCol] = data.producto_id;
+    var provCol = headers.indexOf('proveedor_id');
+    if (provCol !== -1) nueva[provCol] = data.proveedor_id || producto.proveedor_default || '';
+    var totalCol = headers.indexOf('pedido_total');
+    if (totalCol !== -1) nueva[totalCol] = data.pedido_total || 0;
+    nueva[llegoCol] = llego;
+    nueva[precioCol] = precioReal;
+    nueva[confirmadoCol] = true;
+    for (var c = 0; c < nueva.length; c++) {
+      if (nueva[c] === undefined) nueva[c] = '';
+    }
+    sheet.appendRow(nueva);
+  } else {
+    values[rowIdx][llegoCol] = llego;
+    values[rowIdx][precioCol] = precioReal;
+    values[rowIdx][confirmadoCol] = true;
+    sheet.getRange(rowIdx + 1, 1, rowIdx + 1, values[rowIdx].length).setValues([values[rowIdx]]);
+  }
+
   invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
   invalidateServerCacheForSheet(CONFIG.SHEETS.RECEPCION);
-  invalidateServerCacheFecha(normalizeFecha(data.fecha));
-
+  invalidateServerCacheFecha(fechaNormalizada);
   return { success: true, producto_id: data.producto_id };
 }
 
@@ -2324,6 +2569,7 @@ function getCobranzas(fecha = null, clienteId = null) {
 
     var cliente = clientesMap[cobranza.cliente_id];
     cobranza.cliente_nombre = cliente ? cliente.nombre : '';
+    cobranza.medios = parseMedios_(cobranza.medios);
 
     cobranzas.push(cobranza);
   });
@@ -2332,45 +2578,47 @@ function getCobranzas(fecha = null, clienteId = null) {
 }
 
 function registrarCobro(data) {
-  const sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  const monto = normalizeAmount(data.monto);
-  
-  for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === data.cobranza_id) {
-      const pagado = normalizeAmount(values[i][4]);
-      const total = normalizeAmount(values[i][3]);
-      const saldoActual = total - pagado;
-      if (monto > saldoActual) {
-        throw new Error('El monto supera el saldo pendiente');
-      }
-      const nuevoPagado = pagado + monto;
-      const nuevoSaldo = total - nuevoPagado;
-      
-      sheet.getRange(i + 1, 5).setValue(nuevoPagado);
-      sheet.getRange(i + 1, 6).setValue(nuevoSaldo);
-      
-      if (nuevoSaldo <= 0) {
-        sheet.getRange(i + 1, 7).setValue('pagado');
-      }
-      
-      // Registrar en caja
-      const cajaSheet = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
-      const id = generateId();
-      cajaSheet.appendRow([
-        id,
-        data.fecha,
-        'ingreso',
-        monto,
-        'Cobranza',
-        data.cobranza_id
-      ]);
-      
-      return { success: true };
-    }
+  var parsed = normalizarMedios_(data, METODOS_CLIENTE_);
+  var monto = parsed.total;
+  if (monto <= 0) throw new Error('Poné cuánto te paga');
+
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  ensureCobranzasMediosColumn_(sheet);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var totalIdx = headers.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+  var pagadoIdx = headers.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+  var saldoIdx = headers.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
+  var estadoIdx = headers.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
+  var mediosIdx = headers.indexOf('medios');
+
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][idIdx], data.cobranza_id)) continue;
+    var pagado = normalizeAmount(values[i][pagadoIdx]);
+    var total = normalizeAmount(values[i][totalIdx]);
+    var saldoActual = Math.max(0, total - pagado);
+    if (monto > saldoActual + 0.01) throw new Error('El monto supera el saldo pendiente');
+
+    var nuevoPagado = Math.round((pagado + monto) * 100) / 100;
+    var nuevoSaldo = Math.max(0, Math.round((total - nuevoPagado) * 100) / 100);
+    var estado = nuevoSaldo <= 0.01 ? 'pagado' : 'parcial';
+    var previos = parseMedios_(mediosIdx >= 0 ? values[i][mediosIdx] : '');
+    METODOS_CLIENTE_.forEach(function(m) {
+      previos[m] = Math.round((previos[m] + parsed.medios[m]) * 100) / 100;
+    });
+
+    sheet.getRange(i + 1, pagadoIdx + 1).setValue(nuevoPagado);
+    sheet.getRange(i + 1, saldoIdx + 1).setValue(nuevoSaldo);
+    sheet.getRange(i + 1, estadoIdx + 1).setValue(estado);
+    if (mediosIdx >= 0) sheet.getRange(i + 1, mediosIdx + 1).setValue(JSON.stringify(previos));
+
+    registrarCajaMedios_(data.fecha, 'ingreso', parsed.medios, 'Cobranza', data.cobranza_id);
+    invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+    return { success: true, pagado: nuevoPagado, saldo: nuevoSaldo, medios: previos };
   }
-  
+
   throw new Error('Cobranza no encontrada');
 }
 
@@ -2426,7 +2674,8 @@ function getTotalesClientesHoy(fecha) {
       cobranza_id: cob ? cob.id : null,
       pagado: pagado,
       saldo: saldo,
-      estado: estado
+      estado: estado,
+      medios: cob ? parseMedios_(cob.medios) : mediosVacios_()
     };
   });
 }
@@ -2478,12 +2727,14 @@ function sincronizarCobranzasConPrecios(fecha) {
 
 /**
  * Crea la cobranza del día para un cliente (si no existe) y registra el cobro.
- * data: { fecha, cliente_id, monto, metodo }
+ * data: { fecha, cliente_id, medios } — medios reparte efectivo, transferencia, cheque y tarjeta.
+ * Lo que no se carga queda como saldo adeudado.
  */
 function cobrarClienteHoy(data) {
   if (!data.fecha || !data.cliente_id) throw new Error('fecha y cliente_id son requeridos');
   var fechaNorm = normalizeFecha(data.fecha);
-  var monto = normalizeAmount(data.monto);
+  var parsed = normalizarMedios_(data, METODOS_CLIENTE_);
+  var monto = parsed.total;
   if (monto <= 0) throw new Error('El monto debe ser mayor a cero');
 
   // Calcular total del cliente para el día
@@ -2534,11 +2785,97 @@ function cobrarClienteHoy(data) {
   // Registrar el cobro
   var resultado = registrarCobro({
     cobranza_id: cobranzaId,
-    monto: monto,
+    medios: parsed.medios,
     fecha: fechaNorm
   });
 
-  return { success: true, cobranza_id: cobranzaId, total: total, monto: monto };
+  return { success: true, cobranza_id: cobranzaId, total: total, monto: monto, medios: resultado.medios, saldo: resultado.saldo };
+}
+
+/**
+ * Deja el cobro del cliente en un monto exacto (no suma).
+ * data: { fecha, cliente_id, pagado }
+ */
+function ajustarCobroClienteHoy(data) {
+  if (!data || !data.fecha || !data.cliente_id) {
+    throw new Error('fecha y cliente_id son requeridos');
+  }
+
+  var fechaNorm = normalizeFecha(data.fecha);
+  var parsedMedios = data.medios != null ? normalizarMedios_(data, METODOS_CLIENTE_) : null;
+  var nuevoPagado = parsedMedios ? parsedMedios.total : normalizeAmount(data.pagado);
+  if (nuevoPagado < 0) throw new Error('El monto cobrado no puede ser negativo');
+
+  var total = 0;
+  getPreciosCliente(fechaNorm).forEach(function(p) {
+    if (idsMatch(p.cliente_id, data.cliente_id)) total += totalPrecioClienteLinea(p);
+  });
+  if (total <= 0) throw new Error('No hay precios para este cliente en ese día');
+  if (nuevoPagado > total + 0.01) throw new Error('El monto supera el total del día');
+
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var clienteIdx = headers.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var totalIdx = headers.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+  var pagadoIdx = headers.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+  var saldoIdx = headers.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
+  var estadoIdx = headers.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
+
+  var rowIdx = -1;
+  for (var i = 1; i < values.length; i++) {
+    if (normalizeFecha(values[i][fechaIdx]) === fechaNorm && idsMatch(values[i][clienteIdx], data.cliente_id)) {
+      rowIdx = i;
+      break;
+    }
+  }
+
+  if (rowIdx === -1) {
+    if (nuevoPagado <= 0) return { success: true, pagado: 0, saldo: total };
+    throw new Error('Todavía no hay un cobro cargado para editar');
+  }
+
+  var pagadoActual = normalizeAmount(values[rowIdx][pagadoIdx]);
+  var saldo = Math.max(0, Math.round((total - nuevoPagado) * 100) / 100);
+  var estado = nuevoPagado <= 0 ? 'pendiente' : (saldo <= 0.01 ? 'pagado' : 'parcial');
+  var mediosIdx = headers.indexOf('medios');
+  ensureCobranzasMediosColumn_(sheet);
+  if (mediosIdx < 0) {
+    values = readUsedValues_(sheet);
+    headers = values.length ? values[0] : [];
+    mediosIdx = headers.indexOf('medios');
+  }
+  var viejos = parseMedios_(mediosIdx >= 0 ? values[rowIdx][mediosIdx] : '');
+  if (sumaMedios_(viejos) <= 0 && pagadoActual > 0) viejos.efectivo = pagadoActual;
+  var nuevos = parsedMedios ? parsedMedios.medios : mediosVacios_();
+  if (!parsedMedios && nuevoPagado > 0) nuevos.efectivo = nuevoPagado;
+
+  values[rowIdx][totalIdx] = total;
+  values[rowIdx][pagadoIdx] = nuevoPagado;
+  values[rowIdx][saldoIdx] = saldo;
+  values[rowIdx][estadoIdx] = estado;
+  if (mediosIdx >= 0) values[rowIdx][mediosIdx] = JSON.stringify(nuevos);
+  sheet.getRange(rowIdx + 1, 1, rowIdx + 1, values[rowIdx].length).setValues([values[rowIdx]]);
+
+  var deltas = mediosVacios_();
+  METODOS_CLIENTE_.forEach(function(m) {
+    deltas[m] = Math.round((normalizeAmount(nuevos[m]) - normalizeAmount(viejos[m])) * 100) / 100;
+  });
+  var ingresos = mediosVacios_();
+  var egresos = mediosVacios_();
+  METODOS_CLIENTE_.forEach(function(m) {
+    if (deltas[m] > 0.009) ingresos[m] = deltas[m];
+    if (deltas[m] < -0.009) egresos[m] = Math.abs(deltas[m]);
+  });
+  registrarCajaMedios_(fechaNorm, 'ingreso', ingresos, 'Cobranza', values[rowIdx][idIdx]);
+  registrarCajaMedios_(fechaNorm, 'egreso', egresos, 'Ajuste de cobranza', values[rowIdx][idIdx]);
+
+  invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+  invalidateServerCacheFecha(fechaNorm);
+  return { success: true, pagado: nuevoPagado, saldo: saldo, estado: estado };
 }
 
 // ========== PAGOS PROVEEDORES ==========
@@ -2562,39 +2899,32 @@ function getPagosProveedores() {
 }
 
 function registrarPago(data) {
-  const sheet = getSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
-  const id = generateId();
-  const monto = normalizeAmount(data.monto);
-  const saldoPendiente = calcularSaldoProveedor(data.proveedor_id);
-  const anticipo = data.anticipo === true || data.anticipo === 'true';
-  if (!anticipo && monto > saldoPendiente) {
+  var parsed = normalizarMedios_(data, METODOS_PROVEEDOR_);
+  var monto = parsed.total;
+  if (monto <= 0) throw new Error('Poné cuánto le pagás');
+  var saldoPendiente = calcularSaldoProveedor(data.proveedor_id);
+  var anticipo = data.anticipo === true || data.anticipo === 'true';
+  if (!anticipo && monto > saldoPendiente + 0.01) {
     throw new Error('El monto supera el saldo pendiente');
   }
-  
-  sheet.appendRow([
-    id,
-    data.fecha || todayArgentina(),
-    data.proveedor_id,
-    monto,
-    data.metodo || 'efectivo',
-    data.nota || (anticipo ? 'Pago al hacer el pedido' : '')
-  ]);
+
+  var sheet = getSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  var fecha = data.fecha || todayArgentina();
+  var nota = data.nota || (anticipo ? 'Pago al hacer el pedido' : '');
+  var primerId = null;
+  METODOS_PROVEEDOR_.forEach(function(metodo) {
+    var parte = normalizeAmount(parsed.medios[metodo]);
+    if (parte <= 0.009) return;
+    var id = generateId();
+    if (!primerId) primerId = id;
+    sheet.appendRow([id, fecha, data.proveedor_id, parte, metodo, nota]);
+  });
   invalidateSheetCache(CONFIG.SHEETS.PAGOS_PROVEEDORES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
-  
-  // Registrar en caja
-  const cajaSheet = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
-  const cajaId = generateId();
-  cajaSheet.appendRow([
-    cajaId,
-    data.fecha,
-    'egreso',
-    monto,
-    'Pago a proveedor',
-    data.proveedor_id
-  ]);
-  
-  return { id: id, ...data, monto: monto };
+
+  registrarCajaMedios_(fecha, 'egreso', parsed.medios, 'Pago a proveedor', data.proveedor_id);
+
+  return { id: primerId, monto: monto, medios: parsed.medios, proveedor_id: data.proveedor_id };
 }
 
 // ========== STOCK ==========
@@ -2653,6 +2983,121 @@ function deleteStock(productoId) {
 }
 
 // ========== CAJA ==========
+
+function formatPesos_(n) {
+  var entero = Math.round(Math.abs(normalizeAmount(n)));
+  var texto = String(entero).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return (normalizeAmount(n) < 0 ? '-$ ' : '$ ') + texto;
+}
+
+/**
+ * El efectivo que entra de un cliente se anota a su saldo y, de ese mismo
+ * dinero, se le puede dar a uno o más proveedores. Cada saldo baja.
+ * Lo que no se reparte queda en la caja.
+ * data: { fecha, cliente_id, monto, pagos: [{ proveedor_id, monto }] }
+ */
+function repartirEfectivo(data) {
+  if (!data || !data.cliente_id) throw new Error('Elegí el cliente');
+  var fecha = normalizeFecha(data.fecha) || todayArgentina();
+  var monto = normalizeAmount(data.monto);
+  if (monto <= 0) throw new Error('Poné cuánto entró en efectivo');
+
+  var pagosMap = {};
+  (data.pagos || []).forEach(function(pago) {
+    if (!pago || !pago.proveedor_id) return;
+    var parte = normalizeAmount(pago.monto);
+    if (parte <= 0) return;
+    var id = String(pago.proveedor_id);
+    pagosMap[id] = Math.round(((pagosMap[id] || 0) + parte) * 100) / 100;
+  });
+  var pagos = Object.keys(pagosMap).map(function(id) {
+    return { proveedor_id: id, monto: pagosMap[id] };
+  });
+  var totalPagos = pagos.reduce(function(suma, pago) { return suma + pago.monto; }, 0);
+  totalPagos = Math.round(totalPagos * 100) / 100;
+  if (totalPagos > monto + 0.01) {
+    throw new Error('Estás repartiendo ' + formatPesos_(totalPagos) + ' y solo entraron ' + formatPesos_(monto));
+  }
+
+  pagos.forEach(function(pago) {
+    var saldo = calcularSaldoProveedor(pago.proveedor_id);
+    if (pago.monto > saldo + 0.01) {
+      throw new Error('Le querés dar ' + formatPesos_(pago.monto) + ' a un proveedor y le debés ' + formatPesos_(saldo));
+    }
+  });
+
+  var plan = planCobroCliente_(data.cliente_id, fecha, monto);
+  plan.partes.forEach(function(parte) {
+    if (parte.cobranza_id) {
+      registrarCobro({
+        cobranza_id: parte.cobranza_id,
+        fecha: fecha,
+        medios: { efectivo: parte.monto }
+      });
+    } else {
+      cobrarClienteHoy({
+        fecha: parte.fecha,
+        cliente_id: data.cliente_id,
+        medios: { efectivo: parte.monto }
+      });
+    }
+  });
+
+  pagos.forEach(function(pago) {
+    registrarPago({
+      fecha: fecha,
+      proveedor_id: pago.proveedor_id,
+      medios: { efectivo: pago.monto },
+      nota: 'Reparto de caja'
+    });
+  });
+
+  return {
+    success: true,
+    cobrado: monto,
+    repartido: totalPagos,
+    queda: Math.round((monto - totalPagos) * 100) / 100
+  };
+}
+
+function planCobroCliente_(clienteId, fechaCaja, monto) {
+  var cobranzas = getCobranzas().filter(function(c) {
+    return idsMatch(c.cliente_id, clienteId) && normalizeAmount(c.saldo) > 0.01;
+  }).sort(function(a, b) {
+    return String(a.fecha || '').localeCompare(String(b.fecha || ''));
+  });
+
+  var cubiertaHoy = cobranzas.some(function(c) { return c.fecha === fechaCaja; });
+  var hoyExtra = 0;
+  if (!cubiertaHoy) {
+    getPreciosCliente(fechaCaja).forEach(function(p) {
+      if (idsMatch(p.cliente_id, clienteId)) hoyExtra += totalPrecioClienteLinea(p);
+    });
+    hoyExtra = Math.round(hoyExtra * 100) / 100;
+  }
+
+  var deuda = cobranzas.reduce(function(suma, c) { return suma + normalizeAmount(c.saldo); }, 0) + hoyExtra;
+  deuda = Math.round(deuda * 100) / 100;
+  if (deuda <= 0.01) throw new Error('Ese cliente no tiene saldo para descontar');
+  if (monto > deuda + 0.01) {
+    throw new Error('El cliente debe ' + formatPesos_(deuda) + '. No podés anotar ' + formatPesos_(monto));
+  }
+
+  var restante = monto;
+  var partes = [];
+  cobranzas.forEach(function(c) {
+    if (restante <= 0.01) return;
+    var parte = Math.min(restante, normalizeAmount(c.saldo));
+    parte = Math.round(parte * 100) / 100;
+    if (parte <= 0) return;
+    partes.push({ cobranza_id: c.id, monto: parte });
+    restante = Math.round((restante - parte) * 100) / 100;
+  });
+  if (restante > 0.01 && hoyExtra > 0.01) {
+    partes.push({ fecha: fechaCaja, monto: Math.round(Math.min(restante, hoyExtra) * 100) / 100 });
+  }
+  return { partes: partes, deuda: deuda };
+}
 
 function getCajaMovimientos() {
   const sheet = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
@@ -3575,6 +4020,8 @@ function getAppBootstrap(fecha, dias, limite) {
     dashboard: {
       fecha: fechaNorm,
       pedidos: getPedidos(fechaNorm),
+      recepcion: getRecepcion(fechaNorm),
+      precios: getPreciosCliente(fechaNorm),
       cobranzas: cobranzas,
       stock: getStock(),
       topProductos: getTopProductosVendidos(dias || 7, limite || 5)
