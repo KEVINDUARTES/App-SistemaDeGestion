@@ -1394,6 +1394,51 @@ function ensureCobranzasMediosColumn_(sheet) {
   sheet.getRange(1, lastCol + 1).setValue('medios').setFontWeight('bold');
 }
 
+function ensureCobranzasColumna_(sheet, nombre) {
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var idx = headers.indexOf(nombre);
+  if (idx !== -1) return idx;
+  sheet.getRange(1, lastCol + 1).setValue(nombre).setFontWeight('bold');
+  return lastCol;
+}
+
+function parseDepositos_(raw) {
+  if (!raw) return [];
+  var data = raw;
+  if (typeof raw === 'string') {
+    var texto = raw.trim();
+    if (!texto) return [];
+    try { data = JSON.parse(texto); } catch (error) { return []; }
+  }
+  if (!Array.isArray(data)) return [];
+  return data.map(function(item) {
+    return {
+      cuenta: String(item && item.cuenta || '').trim(),
+      proveedor_id: String(item && item.proveedor_id || '').trim(),
+      monto: normalizeAmount(item && item.monto)
+    };
+  }).filter(function(item) {
+    return item.monto > 0 && item.cuenta && item.proveedor_id;
+  });
+}
+
+function validarDepositos_(depositos, montoTransferencia) {
+  var monto = Math.round(normalizeAmount(montoTransferencia) * 100) / 100;
+  if (monto <= 0.009) return [];
+  var lista = parseDepositos_(depositos);
+  if (!lista.length) {
+    throw new Error('En la transferencia poné el nombre de la cuenta y a qué proveedor va');
+  }
+  var suma = 0;
+  lista.forEach(function(item) { suma += item.monto; });
+  suma = Math.round(suma * 100) / 100;
+  if (Math.abs(suma - monto) > 0.05) {
+    throw new Error('Los depósitos suman ' + formatPesos_(suma) + ' y la transferencia es ' + formatPesos_(monto));
+  }
+  return lista;
+}
+
 // ========== PRODUCTOS ==========
 
 function getProductos() {
@@ -2624,6 +2669,7 @@ function getCobranzas(fecha = null, clienteId = null) {
     var cliente = clientesMap[cobranza.cliente_id];
     cobranza.cliente_nombre = cliente ? cliente.nombre : '';
     cobranza.medios = parseMedios_(cobranza.medios);
+    cobranza.depositos = parseDepositos_(cobranza.depositos);
 
     cobranzas.push(cobranza);
   });
@@ -2666,6 +2712,13 @@ function registrarCobro(data) {
     sheet.getRange(i + 1, saldoIdx + 1).setValue(nuevoSaldo);
     sheet.getRange(i + 1, estadoIdx + 1).setValue(estado);
     if (mediosIdx >= 0) sheet.getRange(i + 1, mediosIdx + 1).setValue(JSON.stringify(previos));
+
+    var depNuevos = validarDepositos_(data.depositos, parsed.medios.transferencia);
+    if (depNuevos.length) {
+      var depIdx = ensureCobranzasColumna_(sheet, 'depositos');
+      var depPrevios = values[i].length > depIdx ? parseDepositos_(values[i][depIdx]) : [];
+      sheet.getRange(i + 1, depIdx + 1).setValue(JSON.stringify(depPrevios.concat(depNuevos)));
+    }
 
     registrarCajaMedios_(data.fecha, 'ingreso', parsed.medios, 'Cobranza', data.cobranza_id);
     invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
@@ -2729,7 +2782,8 @@ function getTotalesClientesHoy(fecha) {
       pagado: pagado,
       saldo: saldo,
       estado: estado,
-      medios: cob ? parseMedios_(cob.medios) : mediosVacios_()
+      medios: cob ? parseMedios_(cob.medios) : mediosVacios_(),
+      depositos: cob ? parseDepositos_(cob.depositos) : []
     };
   });
 }
@@ -2840,7 +2894,8 @@ function cobrarClienteHoy(data) {
   var resultado = registrarCobro({
     cobranza_id: cobranzaId,
     medios: parsed.medios,
-    fecha: fechaNorm
+    fecha: fechaNorm,
+    depositos: data.depositos
   });
 
   return { success: true, cobranza_id: cobranzaId, total: total, monto: monto, medios: resultado.medios, saldo: resultado.saldo };
@@ -2923,6 +2978,12 @@ function ajustarCobroClienteHoy(data) {
     if (deltas[m] > 0.009) ingresos[m] = deltas[m];
     if (deltas[m] < -0.009) egresos[m] = Math.abs(deltas[m]);
   });
+  if (data.depositos != null) {
+    var depAjustados = validarDepositos_(data.depositos, nuevos.transferencia);
+    var depIdxAjuste = ensureCobranzasColumna_(sheet, 'depositos');
+    sheet.getRange(rowIdx + 1, depIdxAjuste + 1).setValue(JSON.stringify(depAjustados));
+  }
+
   registrarCajaMedios_(fechaNorm, 'ingreso', ingresos, 'Cobranza', values[rowIdx][idIdx]);
   registrarCajaMedios_(fechaNorm, 'egreso', egresos, 'Ajuste de cobranza', values[rowIdx][idIdx]);
 

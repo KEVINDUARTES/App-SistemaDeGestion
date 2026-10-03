@@ -3476,8 +3476,15 @@ const Camiones = {
     },
 
     _documento(lista) {
+        return this._htmlHoja(lista, true);
+    },
+
+    _htmlHoja(lista, imprimir) {
         const fecha = this._fechaHoja();
         const generado = new Date().toLocaleString('es-AR');
+        const fechaCorta = AppState.currentDate
+            ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR')
+            : '';
         const bloques = lista.map(camion => {
             const filas = this._filas(camion);
             const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
@@ -3499,7 +3506,7 @@ const Camiones = {
                 <div class="doc-meta">
                   <strong>Fecha de carga</strong>
                   ${this._esc(fecha)}<br>
-                  <span style="font-size:11px;">Generado: ${this._esc(generado)}</span>
+                  <span>Generado: ${this._esc(generado)}</span>
                 </div>
               </div>
               <div class="cliente-box">
@@ -3525,9 +3532,12 @@ const Camiones = {
                   </tr>
                 </table>
               </div>
-              <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+              <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas · ${this._esc(fechaCorta)}</div>
             </section>`;
         }).join('');
+        const imprimirScript = imprimir
+            ? '<script>window.addEventListener("load", function(){ setTimeout(function(){ window.print(); }, 200); });<\/script>'
+            : '';
         return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Hoja de carga</title>
             <style>
                 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -3540,34 +3550,96 @@ const Camiones = {
                 .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 16px 20px; border-radius: 8px; margin-bottom: 24px; }
                 .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
                 .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
                 thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
                 tbody td { padding: 11px 14px; border-bottom: 1px solid #e2e8f0; }
                 .row-even { background: #fff; }
                 .row-odd { background: #f8fafc; }
-                .col-cant { text-align: center; font-weight: 600; width: 70px; }
+                thead th.col-cant { color: #fff; text-align: center; }
+                tbody td.col-cant { text-align: center; font-weight: 700; color: #1a73e8; width: 70px; }
                 .col-prod { font-weight: 500; }
                 .totals-wrap { margin-top: 20px; display: flex; justify-content: flex-end; }
-                .totals-table { width: 280px; }
-                .totals-table td { padding: 10px 14px; font-size: 16px; font-weight: 700; }
-                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; border: none; }
+                .totals-table { width: 280px; box-shadow: none; }
+                .totals-table td { padding: 10px 14px; font-size: 16px; font-weight: 700; border: none; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; }
+                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
                 .totals-table td:last-child { text-align: right; }
                 .footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
                 .hoja { break-after: page; page-break-after: always; }
                 .hoja:last-child { break-after: auto; page-break-after: auto; }
                 @media print { body { padding: 20px; } @page { margin: 15mm; } }
-            </style></head><body>${bloques}
-            <script>window.addEventListener('load', function(){ setTimeout(function(){ window.print(); }, 200); });<\/script>
-            </body></html>`;
+            </style></head><body>${bloques}${imprimirScript}</body></html>`;
+    },
+
+    async _cargarHtml2Canvas() {
+        if (window.html2canvas) return window.html2canvas;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo armar el PDF'));
+            document.head.appendChild(script);
+        });
+        if (!window.html2canvas) throw new Error('No se pudo armar el PDF');
+        return window.html2canvas;
+    },
+
+    async _pdfHoja(lista) {
+        const JsPDF = await Precios._cargarJsPdf();
+        const html2canvas = await this._cargarHtml2Canvas();
+        const marco = document.createElement('iframe');
+        marco.setAttribute('aria-hidden', 'true');
+        marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+        document.body.appendChild(marco);
+        const docMarco = marco.contentDocument;
+        docMarco.open();
+        docMarco.write(this._htmlHoja(lista, false));
+        docMarco.close();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const alto = Math.max(docMarco.body.scrollHeight, 400);
+        marco.style.height = alto + 'px';
+        try {
+            const canvas = await html2canvas(docMarco.body, {
+                scale: 2,
+                backgroundColor: '#ffffff',
+                windowWidth: 794,
+                width: 794,
+                height: alto,
+                useCORS: true
+            });
+            const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            const pageW = doc.internal.pageSize.getWidth();
+            const pageH = doc.internal.pageSize.getHeight();
+            const img = canvas.toDataURL('image/jpeg', 0.92);
+            const imgH = canvas.height * pageW / canvas.width;
+            let altoRestante = imgH;
+            let posicion = 0;
+            doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+            altoRestante -= pageH;
+            while (altoRestante > 2) {
+                posicion -= pageH;
+                doc.addPage();
+                doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                altoRestante -= pageH;
+            }
+            return doc;
+        } finally {
+            marco.remove();
+        }
     },
 
     async _enviarPdf(lista, telefono) {
-        const JsPDF = await Precios._cargarJsPdf();
-        const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-        lista.forEach((camion, indice) => {
-            if (indice > 0) doc.addPage();
-            this._dibujarPdf(doc, camion);
-        });
+        let doc;
+        try {
+            doc = await this._pdfHoja(lista);
+        } catch (error) {
+            const JsPDF = await Precios._cargarJsPdf();
+            doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            lista.forEach((camion, indice) => {
+                if (indice > 0) doc.addPage();
+                this._dibujarPdf(doc, camion);
+            });
+        }
         const nombre = lista.length === 1
             ? `carga-${String(lista[0].nombre).replace(/[^\w\-]+/g, '-')}.pdf`
             : 'carga-camiones.pdf';
@@ -5800,14 +5872,24 @@ const Precios = {
             let estado = 'sin_cobrar';
             if (pagado > 0 && saldo <= 0) estado = 'pagado';
             else if (pagado > 0) estado = 'parcial';
+            const cob = cobranzasGuardadas.find(c =>
+                String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha
+            );
+            let depositos = Array.isArray(prev?.depositos) ? prev.depositos : [];
+            if (!depositos.length && Array.isArray(cob?.depositos)) depositos = cob.depositos;
+            if (!depositos.length) depositos = Depositos.de(fecha, cid);
             return {
                 ...item,
+                items: prev?.items || [],
                 pagado,
                 saldo,
                 estado,
-                cobranza_id: prev?.cobranza_id || null
+                cobranza_id: prev?.cobranza_id || cob?.id || null,
+                medios: (prev && CobranzasHoy._pagadoConocido !== false) ? (prev.medios || cob?.medios || null) : (cob?.medios || prev?.medios || null),
+                depositos
             };
         });
+        CobranzasHoy._fechaTotales = fecha;
         CobranzasHoy._pagadoConocido = pagadoConocido;
 
         if (AppState.currentPage === 'cobros-hoy' && pagadoConocido) {
@@ -6612,6 +6694,253 @@ const Cierre = {
     }
 };
 
+const Depositos = {
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    _proveedores() {
+        const cache = CacheManager.peek('proveedores');
+        const lista = (AppState.proveedores && AppState.proveedores.length)
+            ? AppState.proveedores
+            : (Array.isArray(cache) ? cache : []);
+        return lista.slice().sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+    },
+
+    _opciones(seleccionado) {
+        const id = String(seleccionado || '');
+        return '<option value="">Proveedor</option>' + this._proveedores().map(p =>
+            `<option value="${this._esc(p.id)}"${String(p.id) === id ? ' selected' : ''}>${this._esc(p.nombre)}</option>`
+        ).join('');
+    },
+
+    html() {
+        return `
+            <div id="deposito-box" class="deposito-box" hidden>
+                <p class="modal-hint">Identificá el depósito: el nombre de la cuenta como figura en el banco, y a qué proveedor va. Si se reparte, sumá una línea por proveedor.</p>
+                <div class="form-group">
+                    <label for="deposito-cuenta">Nombre de la cuenta</label>
+                    <input type="text" id="deposito-cuenta" class="form-control" placeholder="Como figura en el banco">
+                </div>
+                <div id="deposito-lineas"></div>
+                <button type="button" class="btn btn-secondary btn-sm" id="deposito-agregar">Otra línea</button>
+                <p class="pago-preview" id="deposito-aviso" hidden></p>
+            </div>
+        `;
+    },
+
+    _linea(monto, proveedorId) {
+        const fila = document.createElement('div');
+        fila.className = 'deposito-linea';
+        fila.innerHTML = `
+            <select class="form-control deposito-proveedor">${this._opciones(proveedorId)}</select>
+            <input type="text" class="form-control deposito-monto" data-price-input="true" placeholder="0" inputmode="numeric" value="${monto > 0 ? Utils.formatPrice(monto) : ''}">
+            <button type="button" class="btn btn-danger btn-sm deposito-quitar" aria-label="Quitar línea">×</button>
+        `;
+        return fila;
+    },
+
+    agregarLinea(monto, proveedorId) {
+        const caja = document.getElementById('deposito-lineas');
+        if (!caja) return;
+        const fila = this._linea(monto, proveedorId);
+        caja.appendChild(fila);
+        Utils.enablePriceInputs(fila);
+    },
+
+    enganchar() {
+        document.getElementById('deposito-agregar')?.addEventListener('click', () => {
+            this.agregarLinea(0);
+        });
+        document.getElementById('deposito-lineas')?.addEventListener('click', (event) => {
+            const boton = event.target.closest('.deposito-quitar');
+            if (!boton) return;
+            const lineas = document.querySelectorAll('.deposito-linea');
+            if (lineas.length <= 1) {
+                const input = boton.parentElement?.querySelector('.deposito-monto');
+                const select = boton.parentElement?.querySelector('.deposito-proveedor');
+                if (input) input.value = '';
+                if (select) select.value = '';
+                return;
+            }
+            boton.parentElement?.remove();
+        });
+    },
+
+    sync(monto) {
+        const box = document.getElementById('deposito-box');
+        if (!box) return;
+        const visible = (parseFloat(monto) || 0) > 0.009;
+        box.hidden = !visible;
+        if (!visible) return;
+        if (!document.querySelector('.deposito-linea')) this.agregarLinea(monto);
+    },
+
+    precargar(depositos) {
+        const lista = Array.isArray(depositos) ? depositos : [];
+        const cuenta = document.getElementById('deposito-cuenta');
+        const caja = document.getElementById('deposito-lineas');
+        if (!caja) return;
+        if (cuenta) cuenta.value = lista[0]?.cuenta || '';
+        caja.innerHTML = '';
+        lista.forEach(item => this.agregarLinea(item.monto, item.proveedor_id));
+    },
+
+    estado(montoTransferencia) {
+        if (!document.getElementById('deposito-box')) return { lineas: [], error: '' };
+        const monto = Math.round((parseFloat(montoTransferencia) || 0) * 100) / 100;
+        if (monto <= 0.009) return { lineas: [], error: '' };
+        const cuenta = document.getElementById('deposito-cuenta')?.value.trim() || '';
+        const lineas = [];
+        document.querySelectorAll('.deposito-linea').forEach(fila => {
+            const proveedorId = fila.querySelector('.deposito-proveedor')?.value || '';
+            const parte = Utils.parsePrice(fila.querySelector('.deposito-monto')?.value) || 0;
+            if (!proveedorId && parte <= 0) return;
+            lineas.push({ cuenta, proveedor_id: proveedorId, monto: parte });
+        });
+        if (!cuenta || !lineas.length || lineas.some(item => !item.proveedor_id || item.monto <= 0)) {
+            return { lineas: [], error: 'En la transferencia poné el nombre de la cuenta y a qué proveedor va.' };
+        }
+        const suma = Math.round(lineas.reduce((total, item) => total + item.monto, 0) * 100) / 100;
+        if (Math.abs(suma - monto) > 0.05) {
+            return {
+                lineas: [],
+                error: 'Los depósitos suman ' + Utils.formatCurrency(suma) + ' y la transferencia es ' + Utils.formatCurrency(monto) + '.'
+            };
+        }
+        return { lineas, error: '' };
+    },
+
+    _nombreProveedor(id) {
+        const proveedor = this._proveedores().find(item => String(item.id) === String(id));
+        return proveedor?.nombre || 'Proveedor';
+    },
+
+    _nombreCliente(id, respaldo) {
+        const cliente = (AppState.clientes || []).find(item => String(item.id) === String(id));
+        return cliente?.nombre || respaldo || 'Cliente';
+    },
+
+    texto(depositos) {
+        const lista = Array.isArray(depositos) ? depositos : [];
+        if (!lista.length) return '';
+        return lista.map(item =>
+            `${item.cuenta} → ${this._nombreProveedor(item.proveedor_id)} ${Utils.formatCurrency(item.monto)}`
+        ).join(' · ');
+    },
+
+    htmlTexto(depositos) {
+        const texto = this.texto(depositos);
+        return texto ? `<div class="deposito-texto">${this._esc(texto)}</div>` : '';
+    },
+
+    _storageKey: 'sg_depositos_locales',
+
+    _leerMapa() {
+        try {
+            const raw = localStorage.getItem(this._storageKey);
+            const data = raw ? JSON.parse(raw) : {};
+            return data && typeof data === 'object' ? data : {};
+        } catch (e) {
+            return {};
+        }
+    },
+
+    de(fecha, clienteId) {
+        if (!clienteId) return [];
+        const lista = this._leerMapa()[Utils.fechaIso(fecha) + '|' + String(clienteId)];
+        return Array.isArray(lista) ? lista : [];
+    },
+
+    deCobranza(cobranza) {
+        const propios = Array.isArray(cobranza?.depositos) ? cobranza.depositos : [];
+        if (propios.length) return propios;
+        return this.de(cobranza?.fecha || AppState.currentDate, cobranza?.cliente_id);
+    },
+
+    guardar(fecha, clienteId, depositos) {
+        if (!clienteId) return;
+        const mapa = this._leerMapa();
+        const clave = Utils.fechaIso(fecha) + '|' + String(clienteId);
+        if (!depositos || !depositos.length) delete mapa[clave];
+        else mapa[clave] = depositos;
+        try {
+            localStorage.setItem(this._storageKey, JSON.stringify(mapa));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    todos() {
+        const vistos = new Set();
+        const lista = [];
+        const sumar = (cobranza) => {
+            const fecha = Utils.fechaIso(cobranza?.fecha || '');
+            const clienteId = String(cobranza?.cliente_id || '');
+            (cobranza?.depositos || []).forEach(item => {
+                const monto = Math.round((parseFloat(item.monto) || 0) * 100);
+                const base = [clienteId, item.proveedor_id, String(item.cuenta || '').trim().toLowerCase(), monto].join('|');
+                const clave = fecha ? base + '|' + fecha : base;
+                if (vistos.has(base) || vistos.has(clave)) return;
+                if (!fecha) {
+                    let yaConFecha = false;
+                    vistos.forEach(visto => {
+                        if (visto.startsWith(base + '|')) yaConFecha = true;
+                    });
+                    if (yaConFecha) return;
+                }
+                vistos.add(clave);
+                lista.push({
+                    cliente: this._nombreCliente(cobranza.cliente_id, cobranza.cliente_nombre),
+                    cuenta: item.cuenta,
+                    proveedor: this._nombreProveedor(item.proveedor_id),
+                    proveedor_id: item.proveedor_id,
+                    monto: item.monto
+                });
+            });
+        };
+        const cache = CacheManager.peek('cobranzas:all:all');
+        (Array.isArray(cache) ? cache : []).forEach(sumar);
+        (AppState.cobranzas || []).forEach(sumar);
+        (typeof CobranzasHoy !== 'undefined' ? (CobranzasHoy._lastTotales || []) : []).forEach(sumar);
+        const guardados = this._leerMapa();
+        Object.keys(guardados).forEach(clave => {
+            const corte = clave.indexOf('|');
+            if (corte < 0) return;
+            sumar({
+                fecha: clave.slice(0, corte),
+                cliente_id: clave.slice(corte + 1),
+                depositos: guardados[clave]
+            });
+        });
+        return lista;
+    },
+
+    pintarEnPagos() {
+        const caja = document.getElementById('pagos-depositos');
+        if (!caja) return;
+        const lista = this.todos();
+        if (!lista.length) {
+            caja.hidden = true;
+            caja.innerHTML = '';
+            return;
+        }
+        caja.hidden = false;
+        caja.innerHTML = `
+            <strong>Depósitos identificados</strong>
+            <ul>
+                ${lista.map(item => `<li>${this._esc(item.cuenta)} · ${this._esc(item.cliente)} → ${this._esc(item.proveedor)} · ${Utils.formatCurrency(item.monto)}</li>`).join('')}
+            </ul>
+        `;
+    },
+
+    deProveedor(proveedorId) {
+        return this.todos().filter(item => String(item.proveedor_id) === String(proveedorId));
+    }
+};
+
 const MediosPago = {
     deCliente: [
         ['efectivo', 'Efectivo'],
@@ -6682,6 +7011,7 @@ const MediosPago = {
                 </div>
                 <p class="pago-preview" id="medios-aviso" hidden></p>
             </div>
+            ${tipos.some(([id]) => id === 'transferencia') && tipos.length > 2 ? Depositos.html() : ''}
         `;
     },
 
@@ -6696,7 +7026,8 @@ const MediosPago = {
         const lista = Object.keys(medios)
             .filter(id => medios[id] > 0)
             .map(id => ({ metodo: id, monto: medios[id] }));
-        return { medios, lista, total: this.total(medios) };
+        const depositos = Depositos.estado(medios.transferencia);
+        return { medios, lista, total: this.total(medios), depositos };
     },
 
     poner(valores) {
@@ -6740,10 +7071,21 @@ const MediosPago = {
             aviso.hidden = true;
             aviso.textContent = '';
         };
+        const actualizarDepositos = () => {
+            Depositos.sync(this.leer().medios.transferencia);
+        };
         document.querySelectorAll('.medio-monto').forEach(input => {
-            input.addEventListener('input', actualizar);
-            input.addEventListener('change', actualizar);
+            input.addEventListener('input', () => {
+                actualizar();
+                actualizarDepositos();
+            });
+            input.addEventListener('change', () => {
+                actualizar();
+                actualizarDepositos();
+            });
         });
+        Depositos.enganchar();
+        actualizarDepositos();
         document.getElementById('medios-chip-efectivo')?.addEventListener('click', () => {
             const lleno = this.vacio();
             if (saldo > 0) lleno.efectivo = saldo;
@@ -6759,41 +7101,22 @@ const MediosPago = {
 const SaldoCliente = {
     abrir(clienteId) {
         const cliente = this._cliente(clienteId);
-        const filas = this.filas(clienteId);
-        if (!filas.length) {
+        const cargas = this._cargas(clienteId);
+        if (!cargas.length) {
             Utils.showError('Este cliente no tiene saldo pendiente.');
             return;
         }
         const nombre = cliente.nombre || 'Cliente';
         const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
         const content = `
-            <p class="modal-hint">${this._esc(nombre)}. La fila amarilla es cada carga. Si ya pagó una parte, abajo va el faltante. Al final está el total.</p>
-            ${this._tabla(filas)}
+            ${this._vista(cargas)}
             <p class="modal-hint">${sinTelefono
                 ? 'Este cliente no tiene teléfono. El PDF se descarga igual.'
                 : 'Se arma un PDF y se abre WhatsApp. En la computadora tenés que adjuntar el archivo que se descarga.'}</p>
         `;
         Utils.showModal('Saldo de ' + nombre, content, async () => {
-            await this._enviar(cliente, filas);
+            await this._enviar(cliente, cargas);
         }, sinTelefono ? 'Descargar PDF' : 'Enviar PDF');
-    },
-
-    filas(clienteId) {
-        const cargas = this._cargas(clienteId);
-        const filas = [];
-        cargas.forEach(carga => {
-            filas.push({ tipo: 'carga', texto: this._fecha(carga.fecha), monto: carga.total });
-            this._pagos(carga).forEach(pago => {
-                filas.push({ tipo: 'pago', texto: pago.texto, monto: pago.monto });
-            });
-            if (carga.pagado > 0.01) {
-                filas.push({ tipo: 'faltante', texto: 'Faltante', monto: carga.saldo });
-            }
-        });
-        if (!filas.length) return [];
-        const total = cargas.reduce((sum, carga) => sum + carga.saldo, 0);
-        filas.push({ tipo: 'total', texto: 'Total saldo', monto: total });
-        return filas;
     },
 
     _cargas(clienteId) {
@@ -6873,29 +7196,41 @@ const SaldoCliente = {
         return cliente || { id: clienteId, nombre: 'Cliente', telefono: '' };
     },
 
-    _tabla(filas) {
-        return `<table class="saldo-tabla">${filas.map(fila => `
-            <tr class="saldo-${fila.tipo}">
-                <td>${this._esc(fila.texto)}</td>
-                <td>${this._pesos(fila.monto)}</td>
-            </tr>
-        `).join('')}</table>`;
+    _vista(cargas) {
+        const total = cargas.reduce((sum, carga) => sum + carga.saldo, 0);
+        const una = cargas.length === 1;
+        const tarjetas = cargas.map(carga => {
+            const pagos = this._pagos(carga);
+            const detalles = [`<li><span>Carga</span><strong>${Utils.formatCurrency(carga.total)}</strong></li>`]
+                .concat(pagos.map(pago => `<li class="es-pago"><span>${this._esc(pago.texto)}</span><strong>${Utils.formatCurrency(pago.monto)}</strong></li>`));
+            const quedo = !una && carga.pagado > 0.01
+                ? `<p class="saldo-quedo">Quedó de este día <strong>${Utils.formatCurrency(carga.saldo)}</strong></p>`
+                : '';
+            return `
+                <article class="saldo-dia">
+                    <header>${this._esc(this._fechaLarga(carga.fecha))}</header>
+                    <ul>${detalles.join('')}</ul>
+                    ${quedo}
+                </article>`;
+        }).join('');
+        return `
+            <div class="saldo-doc">
+                <div class="saldo-hero">
+                    <span>Saldo a pagar</span>
+                    <strong>${Utils.formatCurrency(total)}</strong>
+                </div>
+                ${tarjetas}
+            </div>`;
     },
 
-    _fecha(iso) {
+    _fechaLarga(iso) {
         const fecha = Utils.fechaIso(iso);
         if (!fecha) return '';
-        const [anio, mes, dia] = fecha.split('-');
-        return `${Number(dia)}/${Number(mes)}/${anio}`;
-    },
-
-    _pesos(valor) {
-        const monto = Math.round(Utils.parsePrice(valor) || 0);
-        const texto = new Intl.NumberFormat('es-AR', {
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2
-        }).format(monto);
-        return `$ ${texto}`;
+        return new Date(fecha + 'T12:00:00').toLocaleDateString('es-AR', {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric'
+        });
     },
 
     _esc(valor) {
@@ -6904,9 +7239,9 @@ const SaldoCliente = {
         }[char]));
     },
 
-    async _enviar(cliente, filas) {
+    async _enviar(cliente, cargas) {
         const nombre = cliente.nombre || 'Cliente';
-        const doc = await this._pdf(nombre, filas);
+        const doc = await this._pdf(cliente, cargas);
         const archivoNombre = `saldo-${nombre.replace(/[^\w\-]+/g, '-')}.pdf`;
         const blob = doc.output('blob');
         const archivo = new File([blob], archivoNombre, { type: 'application/pdf' });
@@ -6929,36 +7264,111 @@ const SaldoCliente = {
         Utils.avisar('Se descargó el PDF del saldo.');
     },
 
-    async _pdf(nombre, filas) {
-        const JsPDF = await Precios._cargarJsPdf();
-        const doc = new JsPDF({ unit: 'mm', format: 'a4' });
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(16);
-        doc.text(String(nombre), 14, 16);
-        doc.setFontSize(11);
-        doc.text('Luciano Cargas', 14, 23);
-        let y = 32;
-        const x = 14;
-        const anchoTexto = 112;
-        const anchoMonto = 70;
-        const alto = 11;
-        filas.forEach(fila => {
-            if (y > 275) {
-                doc.addPage();
-                y = 16;
+    _htmlPdf(cliente, cargas) {
+        const nombre = cliente?.nombre || 'Cliente';
+        const total = cargas.reduce((sum, carga) => sum + carga.saldo, 0);
+        const una = cargas.length === 1;
+        const generado = new Date().toLocaleString('es-AR');
+        const filas = [];
+        cargas.forEach(carga => {
+            const fecha = this._fechaLarga(carga.fecha);
+            filas.push({ fecha, detalle: 'Carga', monto: Utils.formatCurrency(carga.total), pago: false });
+            this._pagos(carga).forEach(pago => {
+                filas.push({ fecha: '', detalle: pago.texto, monto: Utils.formatCurrency(pago.monto), pago: true });
+            });
+            if (!una && carga.pagado > 0.01) {
+                filas.push({ fecha: '', detalle: 'Quedó de este día', monto: Utils.formatCurrency(carga.saldo), pago: false });
             }
-            if (fila.tipo === 'carga') doc.setFillColor(255, 242, 0);
-            else doc.setFillColor(255, 255, 255);
-            doc.setDrawColor(0);
-            doc.rect(x, y, anchoTexto, alto, 'FD');
-            doc.rect(x + anchoTexto, y, anchoMonto, alto, 'FD');
-            doc.setTextColor(0);
-            doc.setFontSize(fila.tipo === 'pago' ? 12 : 14);
-            doc.text(String(fila.texto), x + 3, y + 7.5);
-            doc.text(this._pesos(fila.monto), x + anchoTexto + anchoMonto - 3, y + 7.5, { align: 'right' });
-            y += alto;
         });
-        return doc;
+        const cuerpo = filas.map((fila, indice) => `
+            <tr class="${indice % 2 === 0 ? 'row-even' : 'row-odd'}">
+                <td>${this._esc(fila.fecha)}</td>
+                <td class="${fila.pago ? 'pago' : ''}">${this._esc(fila.detalle)}</td>
+                <td class="col-money ${fila.pago ? 'pago' : ''}">${fila.monto}</td>
+            </tr>`).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Saldo</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 13px; color: #1e293b; padding: 32px 40px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 16px 20px; border-radius: 8px; margin-bottom: 24px; }
+                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+                thead th.col-money { color: #fff; text-align: right; }
+                tbody td { padding: 11px 14px; border-bottom: 1px solid #e2e8f0; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f8fafc; }
+                td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                td.pago, td.col-money.pago { color: #15803d; }
+                .totals-wrap { margin-top: 20px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 280px; box-shadow: none; }
+                .totals-table td { padding: 10px 14px; font-size: 16px; font-weight: 700; border: none; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; }
+                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
+                .totals-table td:last-child { text-align: right; }
+                .footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Saldo del cliente</p></div>
+                <div class="doc-meta"><strong>Saldo a pagar</strong>${Utils.formatCurrency(total)}<br><span>Generado: ${this._esc(generado)}</span></div>
+            </div>
+            <div class="cliente-box"><div class="label">Cliente</div><div class="name">${this._esc(nombre)}</div></div>
+            <table>
+                <thead><tr><th>Fecha</th><th>Detalle</th><th class="col-money">Importe</th></tr></thead>
+                <tbody>${cuerpo}</tbody>
+            </table>
+            <div class="totals-wrap"><table class="totals-table"><tr class="saldo"><td>Saldo a pagar</td><td>${Utils.formatCurrency(total)}</td></tr></table></div>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
+
+    async _pdf(cliente, cargas) {
+        const JsPDF = await Precios._cargarJsPdf();
+        const html2canvas = await Camiones._cargarHtml2Canvas();
+        const marco = document.createElement('iframe');
+        marco.setAttribute('aria-hidden', 'true');
+        marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+        document.body.appendChild(marco);
+        const docMarco = marco.contentDocument;
+        docMarco.open();
+        docMarco.write(this._htmlPdf(cliente, cargas));
+        docMarco.close();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const alto = Math.max(docMarco.body.scrollHeight, 400);
+        marco.style.height = alto + 'px';
+        try {
+            const canvas = await html2canvas(docMarco.body, {
+                scale: 2,
+                backgroundColor: '#ffffff',
+                windowWidth: 794,
+                width: 794,
+                height: alto
+            });
+            const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            const pageW = doc.internal.pageSize.getWidth();
+            const pageH = doc.internal.pageSize.getHeight();
+            const img = canvas.toDataURL('image/jpeg', 0.92);
+            const imgH = canvas.height * pageW / canvas.width;
+            let altoRestante = imgH;
+            let posicion = 0;
+            doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+            altoRestante -= pageH;
+            while (altoRestante > 2) {
+                posicion -= pageH;
+                doc.addPage();
+                doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                altoRestante -= pageH;
+            }
+            return doc;
+        } finally {
+            marco.remove();
+        }
     }
 };
 
@@ -7017,7 +7427,7 @@ const Cobranzas = {
             tr.innerHTML = `
                 <td data-label="Cliente">${cliente.nombre || ''}</td>
                 <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
-                <td data-label="Cómo pagó" class="medios-texto">${MediosPago.texto(cobranza.medios)}</td>
+                <td data-label="Cómo pagó" class="medios-texto">${MediosPago.texto(cobranza.medios)}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</td>
                 <td data-label="Fecha">${Utils.formatDate(cobranza.fecha)}</td>
                 <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span></td>
                 <td data-label="Acciones">
@@ -7077,11 +7487,18 @@ const Cobranzas = {
                 Utils.showError('La suma supera lo que te debe (' + Utils.formatCurrency(saldo) + ').');
                 throw new Error('Monto mayor al saldo');
             }
+            const deposito = leido.depositos;
+            if (deposito.error) {
+                Utils.showError(deposito.error);
+                throw new Error(deposito.error);
+            }
             const saldoAnterior = cobranza.saldo;
             const pagadoAnterior = cobranza.pagado;
             const estadoAnterior = cobranza.estado;
             const mediosAnteriores = MediosPago.parse(cobranza.medios);
+            const depositosAnteriores = Array.isArray(cobranza.depositos) ? cobranza.depositos.slice() : [];
             cobranza.medios = MediosPago.sumar(mediosAnteriores, leido.medios);
+            cobranza.depositos = depositosAnteriores.concat(deposito.lineas);
             cobranza.pagado = (Utils.parsePrice(cobranza.pagado) || 0) + leido.total;
             cobranza.saldo = Math.max(0, saldo - leido.total);
             cobranza.estado = cobranza.saldo > 0.01 ? 'pendiente' : 'pagado';
@@ -7106,12 +7523,14 @@ const Cobranzas = {
             Utils.enSegundoPlano(() => API.registrarCobro({
                 cobranza_id: cobranza.id,
                 medios: leido.lista,
-                fecha: cobranza.fecha || AppState.currentDate
+                fecha: cobranza.fecha || AppState.currentDate,
+                depositos: deposito.lineas
             }), () => {
                 cobranza.saldo = saldoAnterior;
                 cobranza.pagado = pagadoAnterior;
                 cobranza.estado = estadoAnterior;
                 cobranza.medios = mediosAnteriores;
+                cobranza.depositos = depositosAnteriores;
                 CacheManager.set('cobranzas:all:all', AppState.cobranzas);
                 this.render();
                 Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
@@ -7325,8 +7744,11 @@ const CobranzasHoy = {
     _lastTotales: [],
     _revision: 0,
     _pagadoConocido: true,
+    _fechaTotales: null,
+    _optimo: {},
 
     normalizarTotales(totales) {
+        const fecha = AppState.currentDate;
         return (totales || []).map(item => {
             const total = parseFloat(item.total) || 0;
             const pagado = parseFloat(item.pagado) || 0;
@@ -7334,8 +7756,36 @@ const CobranzasHoy = {
             let estado = 'sin_cobrar';
             if (pagado > 0 && saldo <= 0) estado = 'pagado';
             else if (pagado > 0) estado = 'parcial';
-            return { ...item, total, pagado, saldo, estado, medios: MediosPago.parse(item.medios) };
+            let depositos = Array.isArray(item.depositos) ? item.depositos : [];
+            if (!depositos.length) depositos = Depositos.de(fecha, item.cliente_id);
+            return { ...item, total, pagado, saldo, estado, medios: MediosPago.parse(item.medios), depositos };
         });
+    },
+
+    _fusionarServidor(totales) {
+        const fecha = AppState.currentDate;
+        const fusionados = (totales || []).map(row => {
+            const id = String(row.cliente_id || '');
+            const local = this._optimo[id];
+            const serverDepositos = Array.isArray(row.depositos) ? row.depositos : [];
+            if (serverDepositos.length) Depositos.guardar(fecha, id, serverDepositos);
+            const depositos = serverDepositos.length
+                ? serverDepositos
+                : ((local?.depositos && local.depositos.length) ? local.depositos : Depositos.de(fecha, id));
+            if (!local) return { ...row, depositos };
+            const localPagado = parseFloat(local.pagado) || 0;
+            const serverPagado = parseFloat(row.pagado) || 0;
+            if (Math.abs(localPagado - serverPagado) > 0.05) {
+                const total = parseFloat(row.total) || 0;
+                const saldo = Math.max(0, total - localPagado);
+                let estado = 'sin_cobrar';
+                if (localPagado > 0 && saldo <= 0.01) estado = 'pagado';
+                else if (localPagado > 0) estado = 'parcial';
+                return { ...row, pagado: localPagado, saldo, estado, medios: local.medios, depositos };
+            }
+            return { ...row, depositos };
+        });
+        return this.normalizarTotales(fusionados);
     },
 
     async load() {
@@ -7348,6 +7798,7 @@ const CobranzasHoy = {
         }
 
         const revision = this._revision;
+        this._cargarOptimo();
         if (DiaOperativo.diaCerrado(AppState.currentDate)) {
             this.render([]);
             return;
@@ -7359,9 +7810,13 @@ const CobranzasHoy = {
             return;
         }
 
+        const mismaFecha = this._fechaTotales === AppState.currentDate;
         const locales = this._desdePrecios(AppState.currentDate);
-        if (locales) {
-            this._lastTotales = this.normalizarTotales(locales);
+        if (mismaFecha && this._lastTotales.length && this._pagadoConocido !== false) {
+            this.render(this._lastTotales);
+        } else if (locales) {
+            this._lastTotales = this._fusionarServidor(locales);
+            this._fechaTotales = AppState.currentDate;
             this._pagadoConocido = true;
             this.render(this._lastTotales);
         } else if (this._lastTotales.length && this._pagadoConocido !== false) {
@@ -7374,7 +7829,8 @@ const CobranzasHoy = {
             const totales = await API.getTotalesClientesHoy(AppState.currentDate);
             if (revision !== this._revision) return;
             this._pagadoConocido = true;
-            this._lastTotales = this.normalizarTotales(Array.isArray(totales) ? totales : []);
+            this._fechaTotales = AppState.currentDate;
+            this._lastTotales = this._fusionarServidor(Array.isArray(totales) ? totales : []);
             this.render(this._lastTotales);
         } catch (error) {
             console.error('Error loading cobros-hoy:', error);
@@ -7428,13 +7884,15 @@ const CobranzasHoy = {
             let estado = 'sin_cobrar';
             if (pagado > 0 && saldo <= 0) estado = 'pagado';
             else if (pagado > 0) estado = 'parcial';
+            const depositosGuardados = Array.isArray(cobranza?.depositos) ? cobranza.depositos : [];
             return {
                 ...grupo,
                 pagado,
                 saldo,
                 estado,
                 cobranza_id: cobranza ? cobranza.id : null,
-                medios: cobranza ? cobranza.medios : null
+                medios: cobranza ? cobranza.medios : null,
+                depositos: depositosGuardados.length ? depositosGuardados : Depositos.de(fecha, grupo.cliente_id)
             };
         });
     },
@@ -7488,7 +7946,7 @@ const CobranzasHoy = {
                 <td>${Utils.nombreCatalogo(t, 'cliente')}</td>
                 <td>${Utils.formatCurrency(total)}</td>
                 <td>${pagado > 0 ? Utils.formatCurrency(pagado) : '—'}</td>
-                <td class="medios-texto">${MediosPago.texto(t.medios)}</td>
+                <td class="medios-texto">${MediosPago.texto(t.medios)}${Depositos.htmlTexto(t.depositos)}</td>
                 <td style="${saldo > 0 ? 'color:#dc3545;font-weight:bold' : 'color:#28a745'}">${Utils.formatCurrency(saldo)}</td>
                 <td>${estadoBadge}</td>
                 <td>
@@ -7547,6 +8005,7 @@ const CobranzasHoy = {
                 <p>Total ${Utils.formatCurrency(total)} · Cobrado ${Utils.formatCurrency(pagado)}</p>
                 <p class="pedido-acciones-proveedor">Adeudado: ${Utils.formatCurrency(saldo)}</p>
                 <p class="pedido-acciones-proveedor">${MediosPago.texto(fila.medios)}</p>
+                ${Depositos.htmlTexto(fila.depositos)}
             </div>
             <div class="pedido-acciones-lista">
                 ${botones.join('')}
@@ -7588,6 +8047,7 @@ const CobranzasHoy = {
             </div>
             <p>Total del día: <strong>${Utils.formatCurrency(fila.total || 0)}</strong></p>
             <p>Cómo cobró: ${MediosPago.texto(fila.medios)}</p>
+            ${Depositos.htmlTexto(fila.depositos)}
             <p>Adeudado: <strong>${Utils.formatCurrency(fila.saldo || 0)}</strong></p>
         `;
         Utils.showModal('Detalle del cobro', content, null);
@@ -7645,20 +8105,32 @@ const CobranzasHoy = {
                 Utils.showError('La suma supera el total del día (' + Utils.formatCurrency(total) + ').');
                 throw new Error('Monto mayor al total');
             }
+            if (leido.depositos.error) {
+                Utils.showError(leido.depositos.error);
+                throw new Error(leido.depositos.error);
+            }
             const mediosPrevios = MediosPago.parse(fila.medios);
             const pagadoPrevio = parseFloat(fila.pagado) || 0;
-            this._aplicarMediosLocal(clienteId, leido.medios);
+            const depositosPrevios = Array.isArray(fila.depositos) ? fila.depositos.slice() : [];
+            this._aplicarMediosLocal(clienteId, leido.medios, leido.depositos.lineas);
             Utils.avisar('Cobro actualizado');
             Utils.enSegundoPlano(() => API.ajustarCobroClienteHoy({
                 fecha: AppState.currentDate,
                 cliente_id: clienteId,
-                medios: leido.medios
+                medios: leido.medios,
+                depositos: leido.depositos.lineas
             }), () => {
-                this._aplicarMediosLocal(clienteId, MediosPago.total(mediosPrevios) > 0 ? mediosPrevios : Object.assign(MediosPago.vacio(), { efectivo: pagadoPrevio }));
+                this._aplicarMediosLocal(
+                    clienteId,
+                    MediosPago.total(mediosPrevios) > 0 ? mediosPrevios : Object.assign(MediosPago.vacio(), { efectivo: pagadoPrevio }),
+                    depositosPrevios
+                );
                 Utils.showError('No se pudo editar el cobro. Publicá el script si todavía no lo hiciste.');
             });
         }, 'Guardar');
         MediosPago.enganchar(total);
+        Depositos.precargar(fila.depositos);
+        if ((parseFloat(MediosPago.leer().medios.transferencia) || 0) > 0) Depositos.sync(MediosPago.leer().medios.transferencia);
     },
 
     async anularCobro(clienteId) {
@@ -7672,30 +8144,96 @@ const CobranzasHoy = {
         const ok = await Utils.showConfirm(`¿Eliminar el cobro de ${nombre}? Queda de nuevo el saldo completo. El cliente sigue en la lista.`);
         if (!ok) return;
         const mediosPrevios = MediosPago.parse(fila.medios);
-        this._aplicarMediosLocal(clienteId, MediosPago.vacio());
+        const depositosPrevios = Array.isArray(fila.depositos) ? fila.depositos.slice() : [];
+        this._aplicarMediosLocal(clienteId, MediosPago.vacio(), []);
         Utils.avisar('Cobro eliminado');
         Utils.enSegundoPlano(() => API.ajustarCobroClienteHoy({
             fecha: AppState.currentDate,
             cliente_id: clienteId,
-            pagado: 0
+            medios: MediosPago.vacio(),
+            depositos: []
         }), () => {
-            this._aplicarMediosLocal(clienteId, mediosPrevios);
+            this._aplicarMediosLocal(clienteId, mediosPrevios, depositosPrevios);
             Utils.showError('No se pudo eliminar el cobro. Publicá el script si todavía no lo hiciste.');
         });
     },
 
-    _aplicarMediosLocal(clienteId, medios) {
+    _aplicarMediosLocal(clienteId, medios, depositos) {
         const fila = this._fila(clienteId);
         if (!fila) return;
         const total = parseFloat(fila.total) || 0;
         fila.medios = MediosPago.parse(medios);
+        if (depositos !== undefined) fila.depositos = depositos;
         const pagado = MediosPago.total(fila.medios);
         fila.pagado = pagado;
         fila.saldo = Math.max(0, total - pagado);
         fila.estado = pagado <= 0 ? 'sin_cobrar' : (fila.saldo <= 0.01 ? 'pagado' : 'parcial');
         if (fila.saldo <= 0.01) this._cobrados.add(String(clienteId));
         else this._cobrados.delete(String(clienteId));
+        this._fechaTotales = AppState.currentDate;
+        this._revision = (this._revision || 0) + 1;
+        this._optimo[String(clienteId)] = {
+            pagado: fila.pagado,
+            medios: fila.medios,
+            depositos: Array.isArray(fila.depositos) ? fila.depositos.slice() : []
+        };
+        Depositos.guardar(AppState.currentDate, clienteId, fila.depositos);
+        this._guardarOptimo();
+        this._reflejarCobro(fila);
         this.render(this._lastTotales);
+    },
+
+    _cargarOptimo() {
+        if (Object.keys(this._optimo).length) return;
+        try {
+            const raw = sessionStorage.getItem('sg_cobros_optimos');
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (!parsed || parsed.fecha !== AppState.currentDate || !parsed.data) return;
+            this._optimo = parsed.data;
+        } catch (e) {
+            // storage no disponible
+        }
+    },
+
+    _guardarOptimo() {
+        try {
+            sessionStorage.setItem('sg_cobros_optimos', JSON.stringify({
+                fecha: AppState.currentDate,
+                data: this._optimo
+            }));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    _reflejarCobro(fila) {
+        const fecha = Utils.fechaIso(AppState.currentDate);
+        const tocar = (lista) => {
+            if (!Array.isArray(lista)) return false;
+            const index = lista.findIndex(item =>
+                String(item.cliente_id) === String(fila.cliente_id) &&
+                (!item.fecha || Utils.fechaIso(item.fecha) === fecha)
+            );
+            if (index < 0) return false;
+            lista[index] = {
+                ...lista[index],
+                pagado: fila.pagado,
+                saldo: fila.saldo,
+                estado: fila.estado,
+                medios: fila.medios,
+                depositos: fila.depositos || []
+            };
+            return true;
+        };
+        [`cobranzas:all:all`, `cobranzas:${fecha}:all`, `cobranzas:totales:${AppState.currentDate}`].forEach(key => {
+            const lista = CacheManager.peek(key);
+            if (tocar(lista)) CacheManager.set(key, lista);
+        });
+        const boot = CacheManager.peek(`bootstrap:${AppState.currentDate}`);
+        if (boot && tocar((boot.dashboard || boot).cobranzas)) CacheManager.set(`bootstrap:${AppState.currentDate}`, boot);
+        const dash = CacheManager.peek(`dashboard:${AppState.currentDate}`);
+        if (dash && tocar(dash.cobranzas)) CacheManager.set(`dashboard:${AppState.currentDate}`, dash);
+        tocar(AppState.cobranzas);
     },
 
     async cobrar(clienteId, total, saldoActual) {
@@ -7716,18 +8254,24 @@ const CobranzasHoy = {
                 Utils.showError('La suma supera el saldo pendiente (' + Utils.formatCurrency(saldoActual) + ').');
                 throw new Error('Monto mayor al saldo');
             }
+            if (leido.depositos.error) {
+                Utils.showError(leido.depositos.error);
+                throw new Error(leido.depositos.error);
+            }
             const fila = this._fila(clienteId);
             const mediosPrevios = MediosPago.parse(fila?.medios);
-            this._aplicarMediosLocal(clienteId, MediosPago.sumar(mediosPrevios, leido.medios));
+            const depositosPrevios = Array.isArray(fila?.depositos) ? fila.depositos.slice() : [];
+            this._aplicarMediosLocal(clienteId, MediosPago.sumar(mediosPrevios, leido.medios), depositosPrevios.concat(leido.depositos.lineas));
             Utils.avisar(leido.total >= saldoActual
                 ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
                 : `Cobro registrado. Queda ${Utils.formatCurrency(Math.max(0, saldoActual - leido.total))}`);
             Utils.enSegundoPlano(() => API.cobrarClienteHoy({
                 fecha: AppState.currentDate,
                 cliente_id: clienteId,
-                medios: leido.lista
+                medios: leido.lista,
+                depositos: leido.depositos.lineas
             }), () => {
-                this._aplicarMediosLocal(clienteId, mediosPrevios);
+                this._aplicarMediosLocal(clienteId, mediosPrevios, depositosPrevios);
                 Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
             });
         }, 'Cobrar');
@@ -7740,7 +8284,66 @@ const Pagos = {
     _pagados: new Set(),
     _montosHoy: {},
     _ultimoPago: null,
+    _optimo: {},
     vista: 'hoy',
+
+    _cargarOptimo() {
+        if (Object.keys(this._optimo).length) return;
+        try {
+            const raw = sessionStorage.getItem('sg_pagos_optimos');
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (!parsed || typeof parsed !== 'object') return;
+            this._optimo = parsed;
+        } catch (e) {
+            // storage no disponible
+        }
+    },
+
+    _guardarOptimo() {
+        try {
+            sessionStorage.setItem('sg_pagos_optimos', JSON.stringify(this._optimo));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    _fusionar(proveedores) {
+        this._cargarOptimo();
+        return (proveedores || []).map(proveedor => {
+            const local = this._optimo[String(proveedor.id)];
+            if (!local) return proveedor;
+            const serverSaldo = Utils.parsePrice(proveedor.saldo) || 0;
+            const localSaldo = parseFloat(local.saldo) || 0;
+            const mediosServer = MediosPago.total(MediosPago.parse(proveedor.medios));
+            const mediosLocal = MediosPago.total(MediosPago.parse(local.medios));
+            if (mediosLocal > mediosServer + 0.05 && serverSaldo + 0.05 >= localSaldo) {
+                return { ...proveedor, saldo: localSaldo, medios: local.medios };
+            }
+            if (mediosLocal > mediosServer + 0.05) {
+                return { ...proveedor, medios: local.medios };
+            }
+            return proveedor;
+        });
+    },
+
+    _reflejarPago(proveedorId) {
+        const actual = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+        const local = this._optimo[String(proveedorId)] || (actual ? { saldo: actual.saldo, medios: actual.medios } : null);
+        if (!local) return;
+        const tocar = (lista) => {
+            if (!Array.isArray(lista)) return;
+            const index = lista.findIndex(item => String(item.id) === String(proveedorId));
+            if (index < 0) return;
+            lista[index] = { ...lista[index], saldo: local.saldo, medios: local.medios };
+        };
+        tocar(CacheManager.peek('proveedores'));
+        tocar(AppState.proveedores);
+        Object.keys(CacheManager.cache || {}).forEach(key => {
+            if (!key.startsWith('bootstrap:')) return;
+            const boot = CacheManager.cache[key];
+            if (boot) tocar(boot.proveedores);
+        });
+    },
 
     async load() {
         const tbody = document.getElementById('pagos-tbody');
@@ -7759,6 +8362,7 @@ const Pagos = {
         else if (AppState.recepcion) this._aplicarRecepcionHoy(AppState.recepcion);
 
         const sinPedidos = this.vista !== 'pendientes' && DiaOperativo.diaSinPedidos(AppState.currentDate);
+        this._cargarOptimo();
         this.render(AppState.proveedores);
         if (sinPedidos) return;
         if (this.vista === 'pendientes' && AppState.proveedores.length) return;
@@ -7772,8 +8376,9 @@ const Pagos = {
 
             AppState.recepcion = recepcion || [];
             this._aplicarRecepcionHoy(recepcion);
-            AppState.proveedores = proveedores;
-            this.render(proveedores);
+            AppState.proveedores = this._fusionar(proveedores);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this.render(AppState.proveedores);
         } catch (error) {
             console.error('Error loading pagos:', error);
             Utils.hideTableLoader(tbody);
@@ -7805,7 +8410,7 @@ const Pagos = {
                     : 'Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).');
         }
 
-        const lista = [...(proveedores || [])]
+        const lista = [...this._fusionar(proveedores)]
             .filter(p => {
                 const saldo = Utils.parsePrice(p.saldo) || 0;
                 if (soloPendientes) return saldo > 0;
@@ -7860,6 +8465,7 @@ const Pagos = {
                     : 'No hay mercadería confirmada para pagar en este día.');
             tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">${vacio}</td></tr>`;
             if (resumen) resumen.hidden = true;
+            Depositos.pintarEnPagos();
             return;
         }
 
@@ -7873,8 +8479,12 @@ const Pagos = {
             const btnPagar = puedePagar
                 ? `<button class="btn btn-primary btn-sm" type="button" onclick="Pagos.registrar('${proveedor.id}')">Pagar</button>`
                 : '';
+            const identificados = Depositos.deProveedor(proveedor.id);
+            const vino = identificados.length
+                ? `<div class="deposito-texto">${identificados.map(item => `${Depositos._esc(item.cuenta)} · vino de ${Depositos._esc(item.cliente)} ${Utils.formatCurrency(item.monto)}`).join('<br>')}</div>`
+                : '';
             tr.innerHTML = `
-                <td data-label="Proveedor">${proveedor.nombre || ''}</td>
+                <td data-label="Proveedor">${proveedor.nombre || ''}${vino}</td>
                 <td data-label="Le debés" style="${saldo > 0 ? 'color:#dc3545;font-weight:700;' : ''}">${Utils.formatCurrency(saldo)}</td>
                 <td data-label="Cómo pagaste" class="medios-texto">${MediosPago.texto(proveedor.medios)}</td>
                 <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
@@ -7887,6 +8497,7 @@ const Pagos = {
             `;
             tbody.appendChild(tr);
         });
+        Depositos.pintarEnPagos();
     },
 
     _aplicarRecepcionHoy(recepcion) {
@@ -8005,12 +8616,19 @@ const Pagos = {
             const proveedorLocal = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
             const saldoPrevio = proveedorLocal ? proveedorLocal.saldo : saldoPendiente;
             const mediosPrevios = MediosPago.parse(proveedorLocal?.medios);
+            const optimoPrevio = this._optimo[String(proveedorId)];
             if (proveedorLocal) {
                 proveedorLocal.saldo = saldoRestante;
                 proveedorLocal.medios = MediosPago.sumar(mediosPrevios, leido.medios);
             }
+            this._optimo[String(proveedorId)] = {
+                saldo: saldoRestante,
+                medios: proveedorLocal ? proveedorLocal.medios : leido.medios
+            };
+            this._guardarOptimo();
             if (!anticipo && leido.total >= saldoPendiente) this._pagados.add(proveedorId);
             CacheManager.set('proveedores', AppState.proveedores);
+            this._reflejarPago(proveedorId);
             this.render(AppState.proveedores);
             Utils.avisar(saldoRestante > 0
                 ? `Pago de ${Utils.formatCurrency(leido.total)} registrado. Queda ${Utils.formatCurrency(saldoRestante)}`
@@ -8035,8 +8653,12 @@ const Pagos = {
                     proveedorLocal.saldo = saldoPrevio;
                     proveedorLocal.medios = mediosPrevios;
                 }
+                if (optimoPrevio) this._optimo[String(proveedorId)] = optimoPrevio;
+                else delete this._optimo[String(proveedorId)];
+                this._guardarOptimo();
                 this._pagados.delete(proveedorId);
                 CacheManager.set('proveedores', AppState.proveedores);
+                this._reflejarPago(proveedorId);
                 this.render(AppState.proveedores);
                 Utils.showError('No se pudo registrar el pago. Publicá el script si todavía no lo hiciste.');
             });

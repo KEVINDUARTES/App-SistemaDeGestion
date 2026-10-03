@@ -7,7 +7,7 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <title>Luciano Cargas - Sistema de Gestión</title>
-    <link rel="stylesheet" href="styles.css?v=20261002saldo">
+    <link rel="stylesheet" href="styles.css?v=20261003saldo">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -561,6 +561,7 @@
                 </div>
             </div>
             <p class="dia-operativo-hint" id="pagos-hint">Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).</p>
+            <div id="pagos-depositos" class="deposito-lista" hidden></div>
             <div id="pagos-resumen" class="pagos-resumen" hidden></div>
             <div class="table-container">
                 <table class="data-table">
@@ -767,7 +768,7 @@
     <script src="services/whatsapp.js?v=20260927sinboton"></script>
     <script src="services/pedidoProveedorService.js?v=20261002prov"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261002stock"></script>
+    <script src="app.js?v=20261003saldopdf"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

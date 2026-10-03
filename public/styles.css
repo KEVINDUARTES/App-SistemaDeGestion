@@ -764,28 +764,76 @@ body {
     width: 100%;
 }
 
-.saldo-tabla {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 12px 0;
+.saldo-doc {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
 }
 
-.saldo-tabla td {
-    border: 2px solid #111;
-    padding: 8px 10px;
-    font-weight: 700;
-    font-size: 16px;
-    color: #111;
+.saldo-hero {
+    background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%);
+    color: #fff;
+    border-radius: 14px;
+    padding: 16px 18px;
+}
+
+.saldo-hero span {
+    display: block;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    opacity: 0.85;
+}
+
+.saldo-hero strong {
+    display: block;
+    margin-top: 4px;
+    font-size: 28px;
+    letter-spacing: -0.4px;
+}
+
+.saldo-dia {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 12px 14px;
     background: #fff;
 }
 
-.saldo-tabla td:last-child {
-    text-align: right;
-    white-space: nowrap;
+.saldo-dia header {
+    font-size: 14px;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 6px;
 }
 
-.saldo-tabla tr.saldo-carga td {
-    background: #fff200;
+.saldo-dia ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.saldo-dia li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-top: 1px solid #f1f5f9;
+    font-size: 14px;
+}
+
+.saldo-dia li span {
+    color: #64748b;
+}
+
+.saldo-dia li.es-pago strong {
+    color: #15803d;
+}
+
+.saldo-quedo {
+    margin: 8px 0 0;
+    text-align: right;
+    font-size: 13px;
+    color: #475569;
 }
 
 .page-header h2 {
@@ -2156,6 +2204,46 @@ body {
     color: var(--color-gray-600);
     font-size: 13px;
     line-height: 1.4;
+}
+
+.deposito-box {
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: #eff6ff;
+    border-left: 4px solid var(--color-primary);
+    border-radius: var(--radius-md);
+}
+
+.deposito-linea {
+    display: grid;
+    grid-template-columns: 1fr 120px auto;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+
+.deposito-texto {
+    margin-top: 4px;
+    color: var(--color-primary);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.deposito-lista {
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    background: #eff6ff;
+    border-radius: var(--radius-md);
+    font-size: 14px;
+}
+
+.deposito-lista ul {
+    margin: 8px 0 0;
+    padding-left: 18px;
+}
+
+.deposito-lista li {
+    margin: 4px 0;
 }
 
 .pago-preview strong {
