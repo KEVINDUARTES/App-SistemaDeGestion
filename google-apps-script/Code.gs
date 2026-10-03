@@ -812,7 +812,7 @@ function initializeSheet(sheet, sheetName) {
     'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
     'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
-    'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado'],
+    'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos'],
     'PagosProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'metodo', 'nota'],
     'CajaMovimientos': ['id', 'fecha', 'tipo', 'monto', 'nota', 'referencia'],
     'StockBebidas': ['producto_id', 'stock_actual', 'minimo'],

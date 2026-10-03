@@ -436,6 +436,7 @@ body {
 .main-content {
     margin-left: 280px;
     flex: 1;
+    min-width: 0;
     padding: 0;
     min-height: 100vh;
     background: var(--color-background);
@@ -1610,9 +1611,9 @@ body {
     background: rgba(255, 255, 255, 0.98);
     backdrop-filter: blur(20px);
     border-radius: var(--radius-2xl);
-    width: 90%;
+    width: min(550px, calc(100vw - 24px));
     max-width: 550px;
-    max-height: 90vh;
+    max-height: min(90vh, calc(100dvh - 24px));
     overflow-y: auto;
     box-shadow: var(--shadow-2xl);
     border: 1px solid rgba(255, 255, 255, 0.3);
@@ -2010,6 +2011,7 @@ body {
     border: 1px solid var(--color-gray-200);
     border-radius: var(--radius-md);
     min-height: 48px;
+    overflow-x: auto;
 }
 
 .modal-pedido-list {
@@ -2425,21 +2427,7 @@ body {
 /* ============================================
    📱 RESPONSIVE DESIGN
    ============================================ */
-@media (max-width: 1024px) {
-    .sidebar {
-        width: 240px;
-    }
-    
-    .main-content {
-        margin-left: 240px;
-    }
-    
-    .dashboard-grid {
-        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    }
-}
-
-@media (max-width: 768px) {
+@media (max-width: 1100px) {
     .sidebar {
         width: min(320px, 88vw);
         transform: translateX(-105%);
@@ -2464,33 +2452,35 @@ body {
 
     .btn-menu {
         display: inline-flex;
+        flex-shrink: 0;
     }
     
     .main-content {
         margin-left: 0;
-        padding-bottom: 84px;
+        width: 100%;
+        padding-bottom: calc(76px + env(safe-area-inset-bottom));
     }
     
     .header {
-        padding: 20px 24px;
-        flex-direction: column;
-        gap: 12px;
+        padding: 12px 16px;
+        gap: 8px;
+        flex-wrap: nowrap;
     }
     
     .header-left {
-        flex-direction: column;
-        gap: 8px;
-        align-items: flex-start;
-        width: 100%;
+        flex: 1 1 auto;
+        min-width: 0;
+        gap: 10px;
+        flex-wrap: wrap;
     }
     
     .header-right {
-        width: 100%;
-        justify-content: space-between;
+        flex: 0 0 auto;
+        gap: 8px;
     }
     
     .header-title {
-        font-size: 20px;
+        font-size: 18px;
     }
     
     .header-title::after {
@@ -2499,25 +2489,83 @@ body {
     
     .header-subtitle {
         font-size: 10px;
-        padding: 6px 12px;
+        padding: 4px 8px;
+        max-width: 34vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
     
     .user-email {
-        font-size: 11px;
-        padding: 6px 12px;
+        font-size: 12px;
+        padding: 6px 10px;
+        max-width: 160px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
     
     .btn-logout {
         font-size: 12px;
-        padding: 6px 12px;
+        padding: 8px 12px;
+        min-height: 40px;
     }
     
     .page {
-        padding: 20px;
+        padding: 20px 16px;
     }
     
+    .page-header {
+        margin-bottom: 20px;
+        align-items: flex-start;
+    }
+
     .page-header h2 {
         font-size: 24px;
+    }
+
+    .page-header .btn,
+    .page-actions .btn {
+        min-height: 44px;
+    }
+
+    .form-group input,
+    .form-group select,
+    .form-group textarea,
+    .form-control,
+    .dia-operativo-select,
+    .camion-nombre {
+        font-size: 16px;
+    }
+
+    .dia-operativo-select {
+        flex: 1 1 180px;
+        min-width: 0;
+        max-width: none;
+        width: auto;
+    }
+
+    .camion-nombre,
+    .camion-agregar {
+        min-width: 0;
+        flex: 1 1 160px;
+    }
+
+    .reparto-linea input {
+        width: auto;
+        flex: 1 1 120px;
+        min-width: 0;
+    }
+
+    .data-table tbody tr:hover,
+    .dashboard-card:hover,
+    .nav-link:hover,
+    .nav-link.active {
+        transform: none;
+    }
+
+    .aviso-rapido {
+        bottom: calc(84px + env(safe-area-inset-bottom));
     }
     
     .metrics-section {
@@ -2538,7 +2586,7 @@ body {
     }
     
     .dashboard-grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
         gap: 16px;
     }
     
@@ -2552,10 +2600,6 @@ body {
     
     .dashboard-card .card-value {
         font-size: 28px;
-    }
-    
-    .modal {
-        max-width: 95%;
     }
 }
 
@@ -3175,14 +3219,14 @@ html {
     margin-bottom: 20px;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 1100px) {
     .btn-menu {
         display: inline-flex;
     }
 
     .bottom-nav {
         display: grid;
-        grid-template-columns: repeat(7, 1fr);
+        grid-template-columns: repeat(7, minmax(0, 1fr));
         position: fixed;
         left: 0;
         right: 0;
@@ -3191,18 +3235,23 @@ html {
         background: var(--color-white);
         border-top: 1px solid var(--color-gray-200);
         box-shadow: var(--shadow-lg);
+        padding-bottom: env(safe-area-inset-bottom);
     }
 
     .bottom-nav a {
         display: flex;
         flex-direction: column;
         align-items: center;
+        justify-content: center;
         gap: 2px;
-        padding: 8px 2px 10px;
+        min-width: 0;
+        padding: 8px 1px 10px;
         color: var(--color-gray-600);
         text-decoration: none;
-        font-size: 10px;
+        font-size: clamp(8px, 2.5vw, 11px);
         font-weight: 600;
+        line-height: 1.15;
+        text-align: center;
     }
 
     .bottom-nav a span {
@@ -3223,6 +3272,10 @@ html {
     .bottom-nav a.active span {
         background: var(--color-primary);
         color: white;
+    }
+
+    .table-container {
+        overflow: visible;
     }
 
     .data-table thead {
@@ -3247,22 +3300,80 @@ html {
 
     .data-table td {
         display: flex;
+        flex-wrap: wrap;
         justify-content: space-between;
-        gap: 12px;
+        align-items: center;
+        gap: 6px 10px;
         padding: 8px 0;
         border-bottom: 1px solid var(--color-gray-100);
-        text-align: right;
+        text-align: left;
+        overflow-wrap: anywhere;
     }
 
-    .data-table td::before {
+    .data-table td[data-label]::before {
         content: attr(data-label);
+        flex: 1 1 40%;
+        margin-right: auto;
         font-weight: 600;
         color: var(--color-gray-500);
         text-align: left;
     }
 
+    .data-table td .btn {
+        flex: 1 1 auto;
+        white-space: normal;
+    }
+
+    .pedidos-acciones,
+    .recepcion-acciones {
+        white-space: normal;
+        min-width: 0;
+    }
+
     .data-table td:last-child {
         border-bottom: 0;
+    }
+
+    #precios-tfoot:not([hidden]) {
+        display: block;
+    }
+
+    #precios-tfoot tr {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin: 0;
+        padding: 10px 12px;
+        border: 0;
+        border-radius: 0;
+        border-top: 1px solid var(--color-gray-200);
+    }
+
+    #precios-tfoot td {
+        display: block;
+        width: auto;
+        padding: 0;
+        border: 0;
+        text-align: right;
+    }
+
+    #precios-tfoot td[colspan] {
+        flex: 1;
+        text-align: left;
+    }
+
+    #precios-tfoot td:empty {
+        display: none;
+    }
+
+    #precios-tfoot td::before {
+        content: none;
+    }
+
+    .camion-card .table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
     }
 
     .camion-card .data-table thead {
@@ -3296,6 +3407,7 @@ html {
         text-align: left;
         padding: 10px 12px;
         border-bottom: 1px solid var(--color-gray-200);
+        white-space: nowrap;
     }
 
     .camion-card .data-table td::before {
@@ -3311,9 +3423,64 @@ html {
         box-shadow: none;
         border: 0;
         padding: 8px 0 0;
+        min-width: 0;
     }
 
     .page-actions {
         flex-wrap: wrap;
+    }
+
+    .deposito-linea {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 640px) {
+    .page {
+        padding: 16px 12px;
+    }
+
+    .page-header h2 {
+        font-size: 22px;
+    }
+
+    .user-email {
+        display: none;
+    }
+
+    .header-subtitle {
+        max-width: 46vw;
+    }
+
+    .page-actions .btn,
+    .page-header .btn {
+        width: 100%;
+    }
+
+    .modal-header,
+    .modal-body,
+    .modal-footer {
+        padding: 16px;
+    }
+
+    .modal-footer {
+        flex-direction: column;
+    }
+
+    .modal-footer .btn {
+        width: 100%;
+    }
+
+    .danger-panel {
+        flex-direction: column;
+        padding: 16px;
+    }
+
+    .chart-container {
+        height: 220px;
+    }
+
+    .dashboard-card .card-value {
+        font-size: 24px;
     }
 }

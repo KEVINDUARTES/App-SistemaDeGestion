@@ -5499,7 +5499,7 @@ const Precios = {
                 '</td></tr>';
             
             // Ocultar resumen y footer si no hay datos
-            if (tfoot) tfoot.style.display = 'none';
+            if (tfoot) tfoot.hidden = true;
             if (resumenDiv) resumenDiv.style.display = 'none';
             return;
         }
@@ -5605,7 +5605,7 @@ const Precios = {
                     <td>${Utils.formatCurrency(saldoTotal)}</td>
                 </tr>
             `;
-            tfoot.style.display = 'table-footer-group';
+            tfoot.hidden = false;
         }
     },
 
@@ -10175,6 +10175,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
     
     // Cargar página inicial
+    const etiquetarCeldas = (table) => {
+        const headers = [...table.querySelectorAll('thead th')].map(th => (th.textContent || '').replace(/\s+/g, ' ').trim());
+        if (!headers.length) return;
+        table.querySelectorAll('tbody tr').forEach(tr => {
+            [...tr.children].forEach((td, i) => {
+                if (td.tagName !== 'TD' || td.dataset.label || td.hasAttribute('colspan') || !headers[i]) return;
+                td.dataset.label = headers[i];
+            });
+        });
+    };
+    const contenido = document.querySelector('.main-content');
+    if (contenido) {
+        const marcarTablas = () => contenido.querySelectorAll('table.data-table').forEach(etiquetarCeldas);
+        marcarTablas();
+        new MutationObserver(marcarTablas).observe(contenido, { childList: true, subtree: true });
+    }
+
     document.getElementById('btn-menu')?.addEventListener('click', () => {
         document.body.classList.toggle('sidebar-open');
     });
