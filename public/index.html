@@ -116,7 +116,7 @@
                     <li><a href="#" data-page="clientes" class="nav-link">Clientes</a></li>
                     <li><a href="#" data-page="proveedores" class="nav-link">Proveedores</a></li>
                     <li><a href="#" data-page="productos" class="nav-link">Productos</a></li>
-                    <li><a href="#" data-page="stock" class="nav-link">Stock de Bebidas</a></li>
+                    <li><a href="#" data-page="stock" class="nav-link">Stock</a></li>
                     <li><a href="#" data-page="mantenimiento" class="nav-link nav-link-danger">Limpiar datos</a></li>
                 </ul>
             </li>
@@ -587,13 +587,14 @@
         <!-- Stock -->
         <div id="stock" class="page">
             <div class="page-header">
-                <h2>Stock de bebidas</h2>
+                <h2>Stock de productos</h2>
             </div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
                         <tr>
                             <th>Producto</th>
+                            <th>Tipo</th>
                             <th>Stock</th>
                             <th>Estado</th>
                             <th>Acciones</th>
@@ -766,7 +767,7 @@
     <script src="services/whatsapp.js?v=20260927sinboton"></script>
     <script src="services/pedidoProveedorService.js?v=20261002prov"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261002camiones"></script>
+    <script src="app.js?v=20261002stock"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

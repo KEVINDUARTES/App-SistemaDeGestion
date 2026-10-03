@@ -1451,13 +1451,10 @@ function createProducto(data) {
   invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
   
-  // Si es bebida, crear registro de stock
-  if (data.tipo === 'bebida') {
-    const stockSheet = getSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
-    stockSheet.appendRow([id, 0, data.minimo || 10]);
-    invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
-    invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
-  }
+  const stockSheet = getSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
+  stockSheet.appendRow([id, 0, data.minimo || 10]);
+  invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
   
   return { id: id, nombre: nombre, tipo: data.tipo, unidad: data.unidad || '', proveedor_default: data.proveedor_default || '' };
 }
@@ -2488,14 +2485,14 @@ function calcularDeltaStockBebidas(fecha) {
   recepciones.forEach(function(recepcion) {
     var producto = findInIdMap(productosMap, recepcion.producto_id);
     var confirmado = recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1;
-    if (producto && producto.tipo === 'bebida' && confirmado) {
+    if (producto && confirmado) {
       add(recepcion.producto_id, parseFloat(recepcion.llego) || 0);
     }
   });
 
   precios.forEach(function(precio) {
     var producto = findInIdMap(productosMap, precio.producto_id);
-    if (producto && producto.tipo === 'bebida') {
+    if (producto) {
       add(precio.producto_id, -(parseFloat(precio.cantidad) || 0));
     }
   });
@@ -2988,23 +2985,26 @@ function registrarPago(data) {
 
 function getStock() {
   var cached = readSheetValues(CONFIG.SHEETS.STOCK_BEBIDAS);
-  var productosPorId = {};
-  getProductos().forEach(function(p) { productosPorId[p.id] = p; });
-  var stock = [];
-
+  var stockPorId = {};
   cached.rows.forEach(function(row) {
-    var producto = productosPorId[row[0]];
-    if (producto) {
-      stock.push({
-        producto_id: row[0],
-        producto_nombre: producto.nombre,
-        stock_actual: row[1] || 0,
-        minimo: row[2] || 10
-      });
-    }
+    if (!row[0]) return;
+    stockPorId[String(row[0])] = {
+      stock_actual: row[1] || 0,
+      minimo: row[2] || 10
+    };
   });
 
-  return stock;
+  return getProductos().map(function(producto) {
+    var item = stockPorId[String(producto.id)] || { stock_actual: 0, minimo: 10 };
+    return {
+      producto_id: producto.id,
+      producto_nombre: producto.nombre,
+      tipo: producto.tipo || '',
+      unidad: producto.unidad || '',
+      stock_actual: item.stock_actual,
+      minimo: item.minimo
+    };
+  });
 }
 
 function updateStock(data) {
@@ -3015,12 +3015,15 @@ function updateStock(data) {
   for (let i = 1; i < values.length; i++) {
     if (idsMatch(values[i][0], data.producto_id)) {
       sheet.getRange(i + 1, 2).setValue(data.cantidad);
+      invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
       return { success: true };
     }
   }
   
-  // Si no existe, crear
   sheet.appendRow([data.producto_id, data.cantidad, 10]);
+  invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
   return { success: true };
 }
 
@@ -3032,6 +3035,8 @@ function deleteStock(productoId) {
   for (let i = 1; i < values.length; i++) {
     if (idsMatch(values[i][0], productoId)) {
       sheet.deleteRow(i + 1);
+      invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
       return { success: true };
     }
   }

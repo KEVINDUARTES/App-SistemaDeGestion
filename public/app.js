@@ -2031,7 +2031,7 @@ const Navigation = {
             cobranzas: 'Cobranzas a clientes (pendientes)',
             pagos: 'Pagar al proveedor',
             'pagos-pendientes': 'Pagos a proveedores (pendientes)',
-            stock: 'Stock de bebidas',
+            stock: 'Stock',
             historial: 'Historial de días',
             reparto: 'Repartir efectivo',
             caja: 'Caja',
@@ -2179,7 +2179,7 @@ const Dashboard = {
         document.getElementById('dashboard-pagos-count').textContent = Utils.formatCurrency(totalPagos);
         
         // Stock bajo
-        const stockBajo = stock.filter(item => item.stock_actual <= item.minimo);
+        const stockBajo = Stock._filas(stock).filter(item => item.stock_actual <= item.minimo);
         document.getElementById('dashboard-stock-count').textContent = stockBajo.length || 0;
     },
     
@@ -6443,7 +6443,7 @@ const Cierre = {
             ? `<span class="cierre-pendiente">Pendientes (${proveedoresPendientes.length})</span>`
             : '<span class="cierre-ok">Sin pendientes</span>';
 
-        const stockBajo = (stock || []).filter(s => (parseFloat(s.stock_actual ?? s.cantidad) || 0) <= (parseFloat(s.minimo) || 10));
+        const stockBajo = Stock._filas(stock).filter(s => (parseFloat(s.stock_actual) || 0) <= (parseFloat(s.minimo) || 10));
         const estadoStock = stockBajo.length > 0
             ? `<span class="cierre-alerta">Stock bajo (${stockBajo.length} productos)</span>`
             : '<span class="cierre-ok">Actualizado</span>';
@@ -6461,8 +6461,8 @@ const Cierre = {
                 ? `Paso anterior: ${proveedoresPendientes.length} proveedor${proveedoresPendientes.length === 1 ? '' : 'es'} con saldo a pagar.`
                 : 'Paso anterior: ningún proveedor tiene saldo pendiente.'),
             this._itemResumen('Stock', estadoStock, stockBajo.length
-                ? `${stockBajo.length} bebida${stockBajo.length === 1 ? '' : 's'} debajo del mínimo.`
-                : 'Ningún producto de bebidas está debajo del mínimo.')
+                ? `${stockBajo.length} producto${stockBajo.length === 1 ? '' : 's'} debajo del mínimo.`
+                : 'Ningún producto está debajo del mínimo.')
         ].join('');
         resumen.dataset.loaded = 'true';
 
@@ -8227,6 +8227,59 @@ const Pagos = {
 
 // Stock
 const Stock = {
+    _filas(stock) {
+        const lista = Array.isArray(stock) ? stock : (AppState.stock || []);
+        const porId = new Map(lista.map(item => [String(item.producto_id), item]));
+        const productos = AppState.productos || [];
+        const filas = productos.length
+            ? productos.map(producto => {
+                const item = porId.get(String(producto.id)) || {};
+                return {
+                    producto_id: producto.id,
+                    producto_nombre: producto.nombre || item.producto_nombre || '',
+                    tipo: producto.tipo || item.tipo || '',
+                    unidad: producto.unidad || item.unidad || '',
+                    stock_actual: parseFloat(item.stock_actual) || 0,
+                    minimo: item.minimo === undefined || item.minimo === '' ? 10 : (parseFloat(item.minimo) || 0)
+                };
+            })
+            : lista.map(item => ({
+                producto_id: item.producto_id,
+                producto_nombre: item.producto_nombre || '',
+                tipo: item.tipo || '',
+                unidad: item.unidad || '',
+                stock_actual: parseFloat(item.stock_actual) || 0,
+                minimo: parseFloat(item.minimo) || 10
+            }));
+        return filas.sort((a, b) => {
+            const tipo = String(a.tipo).localeCompare(String(b.tipo), 'es');
+            if (tipo) return tipo;
+            return String(a.producto_nombre).localeCompare(String(b.producto_nombre), 'es');
+        });
+    },
+
+    _tipo(tipo) {
+        if (tipo === 'bebida') return 'Bebida';
+        if (tipo === 'verdura') return 'Verdura';
+        return tipo ? String(tipo) : '';
+    },
+
+    _cantidad(valor, unidad) {
+        const numero = Math.round((parseFloat(valor) || 0) * 1000) / 1000;
+        const texto = Number.isInteger(numero) ? String(numero) : String(numero);
+        return unidad ? `${texto} ${unidad}` : texto;
+    },
+
+    async _asegurarProductos() {
+        if (AppState.productos?.length) return;
+        const cache = CacheManager.peek('productos');
+        if (Array.isArray(cache) && cache.length) {
+            AppState.productos = cache;
+            return;
+        }
+        AppState.productos = await API.getProductos();
+    },
+
     async load() {
         const tbody = document.getElementById('stock-tbody');
         if (!tbody) return;
@@ -8235,12 +8288,14 @@ const Stock = {
         const hasStale = AppState.stock.length > 0 || cached;
         if (hasStale) {
             if (!AppState.stock.length && cached) AppState.stock = cached;
+            await this._asegurarProductos();
             this.render();
         } else {
             Utils.showTableLoader(tbody);
         }
 
         try {
+            await this._asegurarProductos();
             AppState.stock = await API.getStock();
             this.render();
         } catch (error) {
@@ -8253,26 +8308,27 @@ const Stock = {
         const tbody = document.getElementById('stock-tbody');
         if (!tbody) return;
         
-        // Ocultar loader local
         Utils.hideTableLoader(tbody);
-        
         tbody.innerHTML = '';
-        
-        if (AppState.stock.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;">No hay productos en stock</td></tr>';
+
+        const filas = this._filas();
+        if (filas.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No hay productos cargados</td></tr>';
             return;
         }
         
-        AppState.stock.forEach(item => {
+        filas.forEach(item => {
             const estado = item.stock_actual <= item.minimo ? 'BAJO' : 'OK';
+            const nombre = String(item.producto_nombre || '').replace(/'/g, "\\'");
             const tr = document.createElement('tr');
             tr.innerHTML = `
                 <td>${item.producto_nombre || ''}</td>
-                <td>${item.stock_actual || 0}</td>
+                <td>${this._tipo(item.tipo)}</td>
+                <td>${this._cantidad(item.stock_actual, item.unidad)}</td>
                 <td><span class="status-badge ${estado === 'BAJO' ? 'status-bajo' : 'status-activo'}">${estado}</span></td>
                 <td>
-                    <button class="btn btn-secondary" onclick="Stock.edit('${item.producto_id}', '${(item.producto_nombre || '').replace(/'/g, "\\'")}', ${item.stock_actual || 0})">Editar</button>
-                    <button class="btn btn-danger" onclick="Stock.delete('${item.producto_id}', '${(item.producto_nombre || '').replace(/'/g, "\\'")}')">Eliminar</button>
+                    <button class="btn btn-secondary" onclick="Stock.edit('${item.producto_id}', '${nombre}', ${item.stock_actual || 0})">Editar</button>
+                    <button class="btn btn-danger" onclick="Stock.delete('${item.producto_id}', '${nombre}')">Eliminar</button>
                 </td>
             `;
             tbody.appendChild(tr);
@@ -8280,28 +8336,30 @@ const Stock = {
     },
     
     async ajustar() {
-        const productos = await API.getProductos();
-        const bebidas = productos.filter(p => p.tipo === 'bebida');
+        await this._asegurarProductos();
+        const productos = (AppState.productos || []).slice().sort((a, b) =>
+            String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es')
+        );
         
         const content = `
             <div class="form-group">
                 <label>Producto</label>
                 <select id="modal-stock-producto" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${bebidas.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('')}
+                    ${productos.map(p => `<option value="${p.id}">${p.nombre} · ${this._tipo(p.tipo)}</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
                 <label>Cantidad</label>
-                <input type="number" id="modal-stock-cantidad" class="form-control" min="0">
+                <input type="number" id="modal-stock-cantidad" class="form-control" min="0" step="0.01">
             </div>
         `;
         
         Utils.showModal('Ajustar stock', content, async () => {
             const productoId = document.getElementById('modal-stock-producto').value;
-            const cantidad = parseInt(document.getElementById('modal-stock-cantidad').value);
+            const cantidad = parseFloat(document.getElementById('modal-stock-cantidad').value);
             
-            if (!productoId || cantidad === null) {
+            if (!productoId || Number.isNaN(cantidad) || cantidad < 0) {
                 Utils.showError('Complete todos los campos');
                 return;
             }
@@ -8324,12 +8382,12 @@ const Stock = {
             </div>
             <div class="form-group">
                 <label>Cantidad en stock</label>
-                <input type="number" id="modal-stock-edit-cantidad" class="form-control" min="0" value="${stockActual}">
+                <input type="number" id="modal-stock-edit-cantidad" class="form-control" min="0" step="0.01" value="${stockActual}">
             </div>
         `;
 
         Utils.showModal('Editar stock', content, async () => {
-            const cantidad = parseInt(document.getElementById('modal-stock-edit-cantidad').value);
+            const cantidad = parseFloat(document.getElementById('modal-stock-edit-cantidad').value);
 
             if (isNaN(cantidad) || cantidad < 0) {
                 Utils.showError('Ingrese una cantidad válida');
