@@ -3445,7 +3445,7 @@ const Camiones = {
         }
         const titulo = lista.length === 1 ? lista[0].nombre : 'todos los camiones';
         const content = `
-            <p class="modal-hint">Se arma el PDF de ${this._esc(titulo)}, con el mismo formato que el de precios, y se abre WhatsApp con ese archivo listo para enviar.</p>
+            <p class="modal-hint">Se arma un solo PDF de ${this._esc(titulo)}. Adentro van todos los clientes y, debajo de cada uno, sus productos. Después se abre WhatsApp para enviarlo.</p>
             <div class="form-group">
                 <label for="modal-camion-telefono">Teléfono de quien carga</label>
                 <input type="tel" id="modal-camion-telefono" class="form-control" placeholder="261...">
@@ -3479,6 +3479,20 @@ const Camiones = {
         return this._htmlHoja(lista, true);
     },
 
+    _porCliente(camion) {
+        const grupos = new Map();
+        this._filas(camion).forEach(fila => {
+            const cliente = fila.cliente || 'Cliente';
+            if (!grupos.has(cliente)) grupos.set(cliente, []);
+            grupos.get(cliente).push(fila);
+        });
+        return [...grupos.entries()].map(([cliente, items]) => ({
+            cliente,
+            items,
+            total: items.reduce((sum, fila) => sum + fila.cantidad, 0)
+        }));
+    },
+
     _htmlHoja(lista, imprimir) {
         const fecha = this._fechaHoja();
         const generado = new Date().toLocaleString('es-AR');
@@ -3486,16 +3500,34 @@ const Camiones = {
             ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR')
             : '';
         const bloques = lista.map(camion => {
-            const filas = this._filas(camion);
-            const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
-            const cuerpo = filas.map((fila, i) => `
-                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
-                    <td class="col-prod">${this._esc(fila.producto)}</td>
-                    <td>${this._esc(fila.cliente)}</td>
-                    <td class="col-cant">${this._esc(this._cant(fila.cantidad))}</td>
-                    <td>${this._esc(fila.puesto)}</td>
-                </tr>
-            `).join('');
+            const grupos = this._porCliente(camion);
+            const total = grupos.reduce((sum, grupo) => sum + grupo.total, 0);
+            const clientesHtml = grupos.map(grupo => {
+                const cuerpo = grupo.items.map((fila, i) => `
+                    <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                        <td class="col-prod">${this._esc(fila.producto)}</td>
+                        <td class="col-cant">${this._esc(this._cant(fila.cantidad))}</td>
+                        <td>${this._esc(fila.puesto)}</td>
+                    </tr>
+                `).join('');
+                return `
+                <div class="cliente-bloque">
+                  <div class="cliente-box">
+                    <div class="label">Cliente</div>
+                    <div class="name">${this._esc(grupo.cliente)}</div>
+                  </div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Producto</th>
+                        <th class="col-cant">Cant.</th>
+                        <th>Puesto</th>
+                      </tr>
+                    </thead>
+                    <tbody>${cuerpo}</tbody>
+                  </table>
+                </div>`;
+            }).join('');
             return `
             <section class="hoja">
               <div class="doc-header">
@@ -3509,21 +3541,11 @@ const Camiones = {
                   <span>Generado: ${this._esc(generado)}</span>
                 </div>
               </div>
-              <div class="cliente-box">
+              <div class="camion-banner">
                 <div class="label">Camión</div>
                 <div class="name">${this._esc(camion.nombre)}</div>
               </div>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Producto</th>
-                    <th>Cliente</th>
-                    <th class="col-cant">Cant.</th>
-                    <th>Puesto</th>
-                  </tr>
-                </thead>
-                <tbody>${cuerpo}</tbody>
-              </table>
+              ${clientesHtml}
               <div class="totals-wrap">
                 <table class="totals-table">
                   <tr class="saldo">
@@ -3547,9 +3569,13 @@ const Camiones = {
                 .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
                 .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
                 .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
-                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 16px 20px; border-radius: 8px; margin-bottom: 24px; }
+                .camion-banner { background: #1a73e8; color: #fff; padding: 14px 18px; border-radius: 8px; margin-bottom: 22px; }
+                .camion-banner .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; font-weight: 600; }
+                .camion-banner .name { font-size: 22px; font-weight: 700; margin-top: 2px; }
+                .cliente-bloque { margin-bottom: 22px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 12px 16px; border-radius: 8px; margin-bottom: 10px; }
                 .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
-                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                .cliente-box .name { font-size: 18px; font-weight: 700; color: #1e293b; margin-top: 2px; }
                 table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
                 thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
                 tbody td { padding: 11px 14px; border-bottom: 1px solid #e2e8f0; }
@@ -3673,16 +3699,15 @@ const Camiones = {
         const pageH = doc.internal.pageSize.getHeight();
         const m = 14;
         const ancho = pageW - (m * 2);
-        const filas = this._filas(camion);
+        const grupos = this._porCliente(camion);
         const fecha = this._fechaHoja();
         const azul = [26, 115, 232];
         const tinta = [30, 41, 59];
         const muted = [100, 116, 139];
         const cols = [
-            { titulo: 'PRODUCTO', ancho: 62, align: 'left', campo: 'producto' },
-            { titulo: 'CLIENTE', ancho: 58, align: 'left', campo: 'cliente' },
-            { titulo: 'CANT.', ancho: 22, align: 'center', campo: 'cantidad' },
-            { titulo: 'PUESTO', ancho: 40, align: 'left', campo: 'puesto' }
+            { titulo: 'PRODUCTO', ancho: 110, align: 'left', campo: 'producto' },
+            { titulo: 'CANT.', ancho: 24, align: 'center', campo: 'cantidad' },
+            { titulo: 'PUESTO', ancho: 48, align: 'left', campo: 'puesto' }
         ];
 
         doc.setFillColor(...azul);
@@ -3729,8 +3754,7 @@ const Camiones = {
             if (campo === 'cantidad') return this._cant(fila.cantidad);
             return String(fila[campo] || '');
         };
-        pintarCabeza();
-        filas.forEach((fila, indice) => {
+        const pintarFila = (fila, indice) => {
             if (y > pageH - 32) {
                 doc.addPage();
                 y = 16;
@@ -3753,9 +3777,27 @@ const Camiones = {
                 x += col.ancho;
             });
             y += 8;
+        };
+        grupos.forEach(grupo => {
+            if (y > pageH - 48) {
+                doc.addPage();
+                y = 16;
+            }
+            doc.setFillColor(239, 246, 255);
+            doc.roundedRect(m, y, ancho, 12, 1.5, 1.5, 'F');
+            doc.setFillColor(...azul);
+            doc.rect(m, y, 1.6, 12, 'F');
+            doc.setTextColor(...tinta);
+            doc.setFont('helvetica', 'bold');
+            doc.setFontSize(11);
+            doc.text(String(grupo.cliente || 'Cliente'), m + 6, y + 8);
+            y += 16;
+            pintarCabeza();
+            grupo.items.forEach((fila, indice) => pintarFila(fila, indice));
+            y += 4;
         });
 
-        const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
+        const total = grupos.reduce((sum, grupo) => sum + grupo.total, 0);
         y += 8;
         doc.setFillColor(...azul);
         doc.roundedRect(pageW - m - 74, y, 74, 12, 1.5, 1.5, 'F');

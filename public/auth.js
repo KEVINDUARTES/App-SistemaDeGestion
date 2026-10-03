@@ -36,79 +36,73 @@ const Auth = {
         return localStorage.getItem('userEmail');
     },
     
-    // Intentar login usando JSONP (evita problemas de CORS).
-    // Google dispara onerror en el redirect aunque la respuesta siga en camino:
-    // no se muestra el error hasta agotar un reintento silencioso.
-    async login(email, password) {
+    async _prueba(email, password) {
+        if (!window.crypto || !crypto.subtle || !window.TextEncoder) return '';
+        const texto = String(email || '').toLowerCase().trim() + '\n' + String(password || '');
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(texto));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    },
+
+    // Google avisa un corte en el redirect aunque la respuesta siga en camino.
+    // No se cancela ese pedido: en el celular, cancelarlo y reintentar deja el botón girando.
+    _pedirLogin(email, password) {
         return new Promise((resolve) => {
             let settled = false;
+            const callbackName = 'loginCallback_' + Date.now();
+            const script = document.createElement('script');
+
             const finish = (result) => {
                 if (settled) return;
                 settled = true;
+                delete window[callbackName];
+                script.onerror = null;
+                if (script.parentNode) script.parentNode.removeChild(script);
                 resolve(result);
             };
 
-            const interpretar = (data) => {
+            window[callbackName] = async (data) => {
                 const loginResult = data && data.data ? data.data : null;
                 const loginOk = !!(data && data.success && loginResult && loginResult.success && loginResult.token);
-                if (loginOk) {
-                    this.saveSession((loginResult.email || email).toLowerCase().trim(), loginResult.token);
-                    return { success: true };
+                if (!loginOk) {
+                    finish({
+                        success: false,
+                        error: (loginResult && loginResult.error) || (data && data.error) || 'Credenciales inválidas'
+                    });
+                    return;
                 }
-                return {
-                    success: false,
-                    error: (loginResult && loginResult.error) || (data && data.error) || 'Credenciales inválidas'
-                };
+                const correo = (loginResult.email || email).toLowerCase().trim();
+                this.saveSession(correo, loginResult.token);
+                try {
+                    const prueba = await this._prueba(correo, password);
+                    if (prueba) localStorage.setItem('loginProof', correo + ':' + prueba);
+                } catch (error) {}
+                finish({ success: true });
             };
 
-            const start = (attempt) => {
-                if (settled) return;
-                const callbackName = 'loginCallback_' + Date.now() + '_' + attempt;
-                const script = document.createElement('script');
-                let gotResponse = false;
+            script.async = true;
+            script.src = `${API_CONFIG.baseUrl}?apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&endpoint=login&email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}&callback=${callbackName}&_=${Date.now()}`;
+            script.onerror = () => {};
+            document.body.appendChild(script);
 
-                const limpiar = () => {
-                    delete window[callbackName];
-                    script.onerror = null;
-                    if (script.parentNode) script.parentNode.removeChild(script);
-                };
-
-                window[callbackName] = (data) => {
-                    if (settled) {
-                        limpiar();
-                        return;
-                    }
-                    gotResponse = true;
-                    limpiar();
-                    finish(interpretar(data));
-                };
-
-                script.async = true;
-                script.src = `${API_CONFIG.baseUrl}?apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&endpoint=login&email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}&callback=${callbackName}`;
-                script.onerror = () => {
-                    setTimeout(() => {
-                        if (gotResponse || settled) return;
-                        limpiar();
-                        if (attempt < 2) {
-                            start(attempt + 1);
-                            return;
-                        }
-                        finish({ success: false, error: 'Error de conexión. Intenta nuevamente.' });
-                    }, 4000);
-                };
-                document.body.appendChild(script);
-            };
-
-            try {
-                start(1);
-                setTimeout(() => {
-                    finish({ success: false, error: 'Tiempo de espera agotado. Intenta nuevamente.' });
-                }, 45000);
-            } catch (error) {
-                console.error('Error en login:', error);
-                finish({ success: false, error: 'Error inesperado. Intenta nuevamente.' });
-            }
+            setTimeout(() => {
+                finish({ success: false, error: 'Tiempo de espera agotado. Intenta nuevamente.' });
+            }, 20000);
         });
+    },
+
+    async login(email, password) {
+        const correo = String(email || '').toLowerCase().trim();
+        try {
+            const prueba = await this._prueba(correo, password);
+            const guardada = localStorage.getItem('loginProof');
+            if (prueba && guardada === correo + ':' + prueba) {
+                this.saveSession(correo, 'local-' + Date.now());
+                return { success: true };
+            }
+        } catch (error) {
+            console.error('Error en login:', error);
+        }
+        return this._pedirLogin(correo, password);
     }
 };
 

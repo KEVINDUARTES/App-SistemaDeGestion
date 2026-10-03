@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Login - Luciano Cargas</title>
-    <link rel="stylesheet" href="login.css?v=20261003responsive">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
+    <link rel="stylesheet" href="login.css?v=20261003login">
 </head>
 <body>
     <!-- Fondo animado -->
@@ -64,7 +67,7 @@
         </div>
     </div>
     
-    <script src="auth.js?v=20261002login"></script>
+    <script src="auth.js?v=20261003login"></script>
     <script>
         // Manejo del formulario de login
         document.addEventListener('DOMContentLoaded', () => {
@@ -102,7 +105,7 @@
                     
                     if (result.success) {
                         // Login exitoso - redirigir a la app
-                        window.location.href = 'index.html';
+                        window.location.replace('index.html');
                     } else {
                         // Mostrar error
                         showError(result.error);
