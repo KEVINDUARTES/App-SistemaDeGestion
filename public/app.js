@@ -5838,7 +5838,6 @@ const Precios = {
     },
 
     onPrecioChange() {
-        // Actualizar el precio en AppState.precios antes de renderizar
         document.querySelectorAll('.precio-cliente').forEach(input => {
             const id = input.getAttribute('data-id');
             const value = Utils.parsePrice(input.value) || 0;
@@ -5850,8 +5849,98 @@ const Precios = {
             }
         });
         
-        // Re-renderizar para actualizar totales
         this.render();
+    },
+
+    // Actualiza ganancia y totales sin rearmar los inputs.
+    // En el celular el teclado no dispara "change", y rearmar el campo lo cierra.
+    refrescarCalculo() {
+        const tbody = document.getElementById('precios-tbody');
+        const tfoot = document.getElementById('precios-tfoot');
+        if (!tbody) return;
+
+        let totalProductos = 0;
+        let totalCantidad = 0;
+        let totalGanancia = 0;
+
+        tbody.querySelectorAll('tr').forEach(tr => {
+            const input = tr.querySelector('.precio-cliente');
+            if (!input) return;
+            const precio = (AppState.precios || []).find(p => p.id === input.getAttribute('data-id'));
+            if (!precio) return;
+
+            const cantidad = parseFloat(precio.cantidad || 0);
+            totalCantidad += cantidad;
+            const recepcion = (this.recepciones || []).find(r => String(r.producto_id) === String(precio.producto_id));
+            const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
+            const precioReal = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
+            const precioUnitario = Utils.parsePrice(input.value) || 0;
+            const pareceAutomatico = precioReal > 0 && extra > 0 && precioUnitario === precioReal + extra;
+            const precioManual = pareceAutomatico ? 0 : precioUnitario;
+            const gananciaTotal = precioManual > 0 ? (precioManual - precioReal) * cantidad : 0;
+            const total = cantidad * precioManual;
+
+            totalProductos += total;
+            totalGanancia += gananciaTotal;
+            precio.precio_cliente = precioManual;
+
+            const celdas = tr.querySelectorAll('td');
+            const gananciaTd = celdas[5];
+            const totalTd = celdas[6];
+            if (gananciaTd) {
+                gananciaTd.style.color = gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)';
+                gananciaTd.style.fontWeight = '600';
+                gananciaTd.textContent = precioManual > 0 ? `${gananciaTotal > 0 ? '+' : ''}${Utils.formatCurrency(gananciaTotal)}` : '—';
+            }
+            if (totalTd) {
+                totalTd.textContent = precioManual > 0 ? Utils.formatCurrency(total) : '—';
+            }
+        });
+
+        const comision = totalCantidad * this.comisionPorUnidad;
+        const saldoTotal = totalProductos + comision;
+        const resumenDiv = document.getElementById('precios-resumen-cliente');
+        if (resumenDiv && resumenDiv.style.display !== 'none') {
+            const productosEl = document.getElementById('resumen-total-productos');
+            const gananciaEl = document.getElementById('resumen-ganancia');
+            const comisionEl = document.getElementById('resumen-comision');
+            const saldoEl = document.getElementById('resumen-saldo-total');
+            if (productosEl) productosEl.textContent = Utils.formatCurrency(totalProductos);
+            if (gananciaEl) {
+                gananciaEl.textContent = `${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}`;
+                gananciaEl.classList.toggle('resumen-ganancia-positiva', totalGanancia > 0);
+                gananciaEl.classList.toggle('resumen-ganancia-negativa', totalGanancia < 0);
+            }
+            if (comisionEl) comisionEl.textContent = Utils.formatCurrency(comision);
+            if (saldoEl) saldoEl.textContent = Utils.formatCurrency(saldoTotal);
+        }
+
+        if (tfoot && !tfoot.hidden) {
+            tfoot.innerHTML = `
+                <tr style="background-color: #f8f9fa; font-weight: bold;">
+                    <td colspan="3" style="text-align: right;">TOTAL PRODUCTOS:</td>
+                    <td></td>
+                    <td></td>
+                    <td style="color: ${totalGanancia >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}</td>
+                    <td>${Utils.formatCurrency(totalProductos)}</td>
+                </tr>
+                <tr style="background-color: #fff3cd; font-weight: bold;">
+                    <td colspan="3" style="text-align: right;">COMISIÓN (${totalCantidad} × ${Utils.formatCurrency(this.comisionPorUnidad)}):</td>
+                    <td></td>
+                    <td>${Utils.formatCurrency(this.comisionPorUnidad)}</td>
+                    <td></td>
+                    <td>${Utils.formatCurrency(comision)}</td>
+                </tr>
+                <tr style="background-color: #d4edda; font-weight: bold; font-size: 16px;">
+                    <td colspan="3" style="text-align: right;">SALDO TOTAL:</td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td>${Utils.formatCurrency(saldoTotal)}</td>
+                </tr>
+            `;
+        }
     },
     
     async armarLista(opciones = {}) {
@@ -6348,6 +6437,49 @@ const Precios = {
         return doc;
     },
 
+    async _pdfDesdeHtml(html) {
+        const JsPDF = await this._cargarJsPdf();
+        const html2canvas = await Camiones._cargarHtml2Canvas();
+        const marco = document.createElement('iframe');
+        marco.setAttribute('aria-hidden', 'true');
+        marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+        document.body.appendChild(marco);
+        const docMarco = marco.contentDocument;
+        docMarco.open();
+        docMarco.write(html);
+        docMarco.close();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const alto = Math.max(docMarco.body.scrollHeight, 400);
+        marco.style.height = alto + 'px';
+        try {
+            const canvas = await html2canvas(docMarco.body, {
+                scale: 2,
+                backgroundColor: '#ffffff',
+                windowWidth: 794,
+                width: 794,
+                height: alto
+            });
+            const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            const pageW = doc.internal.pageSize.getWidth();
+            const pageH = doc.internal.pageSize.getHeight();
+            const img = canvas.toDataURL('image/jpeg', 0.92);
+            const imgH = canvas.height * pageW / canvas.width;
+            let altoRestante = imgH;
+            let posicion = 0;
+            doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+            altoRestante -= pageH;
+            while (altoRestante > 8) {
+                posicion -= pageH;
+                doc.addPage();
+                doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                altoRestante -= pageH;
+            }
+            return doc;
+        } finally {
+            marco.remove();
+        }
+    },
+
     async ejecutarEnvioPdfWhatsApp(cliente, datos) {
         try {
             PrecioClienteService.validarEnvio(cliente, datos);
@@ -6575,20 +6707,37 @@ const Precios = {
   <div class="footer">
     Documento generado por el Sistema de Gestión Luciano Cargas · ${fechaCorta}
   </div>
-
-  <script>window.onload = () => window.print();<\/script>
 </body>
 </html>`;
 
-            const printResult = Utils.openPrintHtml(html);
-            if (printResult.mode === 'iframe') {
-                Utils.showInfo('Diálogo de impresión abierto en esta pestaña. Elegí "Guardar como PDF".');
-            } else {
-                Utils.showSuccess('Reporte abierto. Usá "Guardar como PDF" en la impresión.');
+            await this.ensureDatosWhatsApp();
+            const cliente = (AppState.clientes || []).find(
+                c => String(c.id) === String(this.selectedClienteId)
+            );
+            PrecioClienteService.validarEnvio(cliente, datos);
+            const doc = await this._pdfDesdeHtml(html);
+            const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.pdf`;
+            const blob = doc.output('blob');
+            const archivo = new File([blob], nombre, { type: 'application/pdf' });
+            const texto = 'Te envío la lista de precios en el PDF.';
+
+            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                await navigator.share({
+                    files: [archivo],
+                    title: 'Lista de precios',
+                    text: texto
+                });
+                Utils.showSuccess(`PDF listo para enviar a ${cliente.nombre}. Elegí WhatsApp.`);
+                return;
             }
+
+            doc.save(nombre);
+            WhatsAppService.openChat(cliente.telefono, texto);
+            Utils.showSuccess(`Se descargó el PDF. Adjuntalo en el chat de ${cliente.nombre}.`);
         } catch (error) {
+            if (error && error.name === 'AbortError') return;
             console.error('Error exporting PDF:', error);
-            Utils.showError('Error al exportar PDF: ' + error.message);
+            this.handleWhatsAppError(error);
         }
     }
 };
@@ -10335,8 +10484,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-generar-lista-precios', () => Precios.generarLista(), 'Generando...');
     addButtonListener('btn-guardar-precios', () => Precios.save(), 'Guardando...');
     addButtonListener('btn-limpiar-filtro', () => Precios.limpiarFiltro(), 'Limpiando...');
-    addButtonListener('btn-exportar-pdf-precios', () => Precios.exportarPDF(), 'Generando PDF...');
-    addButtonListener('btn-enviar-whatsapp-precios', () => Precios.enviarWhatsApp(), 'Preparando...');
+    addButtonListener('btn-exportar-pdf-precios', () => Precios.exportarPDF(), 'Preparando...');
     addButtonListener('btn-reset-todos-datos', () => Mantenimiento.solicitarReset(), 'Eliminando...', { useButtonLoader: false });
     
     // Event listeners para filtros de precios
@@ -10354,6 +10502,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
         preciosComision.addEventListener('input', () => {
             Precios.updateComision();
+        });
+    }
+    const preciosTbody = document.getElementById('precios-tbody');
+    if (preciosTbody) {
+        preciosTbody.addEventListener('input', (e) => {
+            if (!e.target.classList || !e.target.classList.contains('precio-cliente')) return;
+            Precios.refrescarCalculo();
+        });
+        preciosTbody.addEventListener('focusout', (e) => {
+            if (!e.target.classList || !e.target.classList.contains('precio-cliente')) return;
+            Precios.onPrecioChange();
         });
     }
     Utils.enablePriceInputs(document);
