@@ -3205,6 +3205,7 @@ const Camiones = {
             if (!grupos.has(key)) {
                 grupos.set(key, {
                     producto: pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto'),
+                    clienteId,
                     cliente: this._nombreCliente(clienteId),
                     puesto: nombreProveedor,
                     cantidad: 0
@@ -3445,7 +3446,7 @@ const Camiones = {
         }
         const titulo = lista.length === 1 ? lista[0].nombre : 'todos los camiones';
         const content = `
-            <p class="modal-hint">Se arma un solo PDF de ${this._esc(titulo)}. Adentro van todos los clientes y, debajo de cada uno, sus productos. Después se abre WhatsApp para enviarlo.</p>
+            <p class="modal-hint">Se arma un solo PDF de ${this._esc(titulo)}. Cada camión entra en una hoja: los productos van en filas, cada cliente en su columna, el total y el proveedor. Después se abre WhatsApp para enviarlo.</p>
             <div class="form-group">
                 <label for="modal-camion-telefono">Teléfono de quien carga</label>
                 <input type="tel" id="modal-camion-telefono" class="form-control" placeholder="261...">
@@ -3493,43 +3494,58 @@ const Camiones = {
         }));
     },
 
+    _matriz(camion) {
+        const filas = this._filas(camion);
+        const clientes = [];
+        const vistos = new Set();
+        const sumarCliente = (id, nombre) => {
+            const clave = String(id || '');
+            if (!clave || vistos.has(clave)) return;
+            vistos.add(clave);
+            clientes.push({ id: clave, nombre: nombre || this._nombreCliente(clave) || 'Cliente' });
+        };
+        (camion.clientes || []).forEach(id => {
+            const clave = String(id);
+            if (filas.some(fila => fila.clienteId === clave)) sumarCliente(clave, this._nombreCliente(clave));
+        });
+        filas.forEach(fila => sumarCliente(fila.clienteId, fila.cliente));
+        const mapa = new Map();
+        filas.forEach(fila => {
+            const clave = `${fila.producto}\n${fila.puesto}`;
+            if (!mapa.has(clave)) {
+                mapa.set(clave, { producto: fila.producto, puesto: fila.puesto, cants: {} });
+            }
+            const row = mapa.get(clave);
+            row.cants[fila.clienteId] = (row.cants[fila.clienteId] || 0) + fila.cantidad;
+        });
+        const productos = [...mapa.values()].map(row => ({
+            ...row,
+            total: clientes.reduce((sum, cliente) => sum + (row.cants[cliente.id] || 0), 0)
+        }));
+        const total = productos.reduce((sum, row) => sum + row.total, 0);
+        return { clientes, productos, total };
+    },
+
     _htmlHoja(lista, imprimir) {
         const fecha = this._fechaHoja();
-        const generado = new Date().toLocaleString('es-AR');
         const fechaCorta = AppState.currentDate
             ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR')
             : '';
         const bloques = lista.map(camion => {
-            const grupos = this._porCliente(camion);
-            const total = grupos.reduce((sum, grupo) => sum + grupo.total, 0);
-            const clientesHtml = grupos.map(grupo => {
-                const cuerpo = grupo.items.map((fila, i) => `
-                    <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
-                        <td class="col-prod">${this._esc(fila.producto)}</td>
-                        <td class="col-cant">${this._esc(this._cant(fila.cantidad))}</td>
-                        <td>${this._esc(fila.puesto)}</td>
-                    </tr>
-                `).join('');
-                return `
-                <div class="cliente-bloque">
-                  <div class="cliente-box">
-                    <div class="label">Cliente</div>
-                    <div class="name">${this._esc(grupo.cliente)}</div>
-                  </div>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Producto</th>
-                        <th class="col-cant">Cant.</th>
-                        <th>Puesto</th>
-                      </tr>
-                    </thead>
-                    <tbody>${cuerpo}</tbody>
-                  </table>
-                </div>`;
-            }).join('');
+            const { clientes, productos, total } = this._matriz(camion);
+            const n = Math.max(productos.length, 1);
+            const filaPx = n > 100 ? 6.2 : n > 70 ? 7.4 : n > 45 ? 9 : n > 28 ? 12 : 15;
+            const fuente = n > 100 ? 6 : n > 70 ? 6.5 : n > 45 ? 7.5 : n > 28 ? 9 : 11;
+            const cabeza = clientes.length > 7 ? 6 : clientes.length > 4 ? 7 : 8;
+            const columnas = clientes.map(cliente => `<th class="cli">${this._esc(cliente.nombre)}</th>`).join('');
+            const cuerpo = productos.length
+                ? productos.map((row, i) => {
+                    const celdas = clientes.map(cliente => `<td class="n">${this._esc(this._cant(row.cants[cliente.id] || 0))}</td>`).join('');
+                    return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td class="prod">${this._esc(row.producto)}</td>${celdas}<td class="tot">${this._esc(this._cant(row.total))}</td><td class="prov">${this._esc(row.puesto)}</td></tr>`;
+                }).join('')
+                : `<tr><td class="vacio" colspan="${clientes.length + 3}">Este camión no tiene pedidos.</td></tr>`;
             return `
-            <section class="hoja">
+            <section class="hoja" style="--fila:${filaPx}px;--fuente:${fuente}px;--cabeza:${cabeza}px;">
               <div class="doc-header">
                 <div class="brand">
                   <h1>Luciano Cargas</h1>
@@ -3537,15 +3553,24 @@ const Camiones = {
                 </div>
                 <div class="doc-meta">
                   <strong>Fecha de carga</strong>
-                  ${this._esc(fecha)}<br>
-                  <span>Generado: ${this._esc(generado)}</span>
+                  ${this._esc(fecha)}
                 </div>
               </div>
               <div class="camion-banner">
                 <div class="label">Camión</div>
                 <div class="name">${this._esc(camion.nombre)}</div>
               </div>
-              ${clientesHtml}
+              <table>
+                <thead>
+                  <tr>
+                    <th class="prod">Producto</th>
+                    ${columnas}
+                    <th class="tot">Total</th>
+                    <th class="prov">Proveedor</th>
+                  </tr>
+                </thead>
+                <tbody>${cuerpo}</tbody>
+              </table>
               <div class="totals-wrap">
                 <table class="totals-table">
                   <tr class="saldo">
@@ -3563,37 +3588,36 @@ const Camiones = {
         return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Hoja de carga</title>
             <style>
                 * { margin: 0; padding: 0; box-sizing: border-box; }
-                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 13px; color: #1e293b; padding: 32px 40px; background: #fff; }
-                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 3px solid #1a73e8; }
-                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
-                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
-                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
-                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
-                .camion-banner { background: #1a73e8; color: #fff; padding: 14px 18px; border-radius: 8px; margin-bottom: 22px; }
-                .camion-banner .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; font-weight: 600; }
-                .camion-banner .name { font-size: 22px; font-weight: 700; margin-top: 2px; }
-                .cliente-bloque { margin-bottom: 22px; }
-                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 12px 16px; border-radius: 8px; margin-bottom: 10px; }
-                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
-                .cliente-box .name { font-size: 18px; font-weight: 700; color: #1e293b; margin-top: 2px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
-                tbody td { padding: 11px 14px; border-bottom: 1px solid #e2e8f0; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #1e293b; background: #fff; width: 794px; padding: 8px 10px 6px; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 6px; padding-bottom: 4px; border-bottom: 2px solid #1a73e8; }
+                .brand h1 { font-size: 16px; font-weight: 700; color: #1a73e8; letter-spacing: -0.3px; line-height: 1; }
+                .brand p { font-size: 9px; color: #64748b; margin-top: 2px; }
+                .doc-meta { text-align: right; font-size: 9px; color: #475569; line-height: 1.3; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 11px; }
+                .camion-banner { background: #1a73e8; color: #fff; padding: 5px 10px; border-radius: 6px; margin-bottom: 6px; display: flex; align-items: baseline; gap: 8px; }
+                .camion-banner .label { font-size: 8px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; font-weight: 600; }
+                .camion-banner .name { font-size: 13px; font-weight: 700; }
+                table { width: 100%; border-collapse: collapse; }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; text-align: center; font-weight: 700; line-height: 1.1; padding: 3px 2px; font-size: var(--cabeza, 8px); }
+                thead th.prod, thead th.prov { text-align: left; padding-left: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+                thead th.cli { white-space: normal; }
+                tbody td { padding: 0 2px; font-size: var(--fuente, 9px); line-height: 1.05; border-bottom: 1px solid #e8eef5; height: var(--fila, 14px); white-space: nowrap; }
                 .row-even { background: #fff; }
                 .row-odd { background: #f8fafc; }
-                thead th.col-cant { color: #fff; text-align: center; }
-                tbody td.col-cant { text-align: center; font-weight: 700; color: #1a73e8; width: 70px; }
-                .col-prod { font-weight: 500; }
-                .totals-wrap { margin-top: 20px; display: flex; justify-content: flex-end; }
-                .totals-table { width: 280px; box-shadow: none; }
-                .totals-table td { padding: 10px 14px; font-size: 16px; font-weight: 700; border: none; }
-                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; }
-                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
+                td.prod { font-weight: 600; text-align: left; width: 128px; overflow: hidden; text-overflow: ellipsis; }
+                td.n { text-align: center; color: #334155; }
+                td.tot { text-align: center; width: 38px; font-weight: 700; color: #1a73e8; background: #e8f1fd; }
+                td.prov { text-align: left; font-weight: 600; padding-left: 4px; width: 92px; overflow: hidden; text-overflow: ellipsis; }
+                td.vacio { text-align: center; color: #64748b; padding: 12px; }
+                .totals-wrap { margin-top: 6px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 220px; border-collapse: collapse; }
+                .totals-table td { padding: 4px 8px; font-size: 11px; font-weight: 700; border: none; background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; }
+                .totals-table td:first-child { font-weight: 500; }
                 .totals-table td:last-child { text-align: right; }
-                .footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+                .footer { margin-top: 4px; padding-top: 3px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 8px; color: #94a3b8; }
                 .hoja { break-after: page; page-break-after: always; }
                 .hoja:last-child { break-after: auto; page-break-after: auto; }
-                @media print { body { padding: 20px; } @page { margin: 15mm; } }
+                @media print { body { padding: 6px 8px; } @page { margin: 8mm; } }
             </style></head><body>${bloques}${imprimirScript}</body></html>`;
     },
 
@@ -3613,45 +3637,50 @@ const Camiones = {
     async _pdfHoja(lista) {
         const JsPDF = await Precios._cargarJsPdf();
         const html2canvas = await this._cargarHtml2Canvas();
-        const marco = document.createElement('iframe');
-        marco.setAttribute('aria-hidden', 'true');
-        marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
-        document.body.appendChild(marco);
-        const docMarco = marco.contentDocument;
-        docMarco.open();
-        docMarco.write(this._htmlHoja(lista, false));
-        docMarco.close();
-        await new Promise(resolve => setTimeout(resolve, 80));
-        const alto = Math.max(docMarco.body.scrollHeight, 400);
-        marco.style.height = alto + 'px';
-        try {
-            const canvas = await html2canvas(docMarco.body, {
-                scale: 2,
-                backgroundColor: '#ffffff',
-                windowWidth: 794,
-                width: 794,
-                height: alto,
-                useCORS: true
-            });
-            const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-            const pageW = doc.internal.pageSize.getWidth();
-            const pageH = doc.internal.pageSize.getHeight();
-            const img = canvas.toDataURL('image/jpeg', 0.92);
-            const imgH = canvas.height * pageW / canvas.width;
-            let altoRestante = imgH;
-            let posicion = 0;
-            doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
-            altoRestante -= pageH;
-            while (altoRestante > 2) {
-                posicion -= pageH;
-                doc.addPage();
+        const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+        const pageW = doc.internal.pageSize.getWidth();
+        const pageH = doc.internal.pageSize.getHeight();
+        const camiones = lista.filter(camion => this._filas(camion).length);
+        const usar = camiones.length ? camiones : lista;
+        for (let i = 0; i < usar.length; i++) {
+            const marco = document.createElement('iframe');
+            marco.setAttribute('aria-hidden', 'true');
+            marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+            document.body.appendChild(marco);
+            const docMarco = marco.contentDocument;
+            docMarco.open();
+            docMarco.write(this._htmlHoja([usar[i]], false));
+            docMarco.close();
+            await new Promise(resolve => setTimeout(resolve, 60));
+            const alto = Math.max(docMarco.body.scrollHeight, 400);
+            marco.style.height = alto + 'px';
+            try {
+                const canvas = await html2canvas(docMarco.body, {
+                    scale: 2,
+                    backgroundColor: '#ffffff',
+                    windowWidth: 794,
+                    width: 794,
+                    height: alto,
+                    useCORS: true
+                });
+                const img = canvas.toDataURL('image/jpeg', 0.92);
+                const imgH = canvas.height * pageW / canvas.width;
+                if (i > 0) doc.addPage();
+                let resto = imgH;
+                let posicion = 0;
                 doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
-                altoRestante -= pageH;
+                resto -= pageH;
+                while (resto > 8) {
+                    posicion -= pageH;
+                    doc.addPage();
+                    doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                    resto -= pageH;
+                }
+            } finally {
+                marco.remove();
             }
-            return doc;
-        } finally {
-            marco.remove();
         }
+        return doc;
     },
 
     async _enviarPdf(lista, telefono) {
@@ -3699,15 +3728,23 @@ const Camiones = {
         const pageH = doc.internal.pageSize.getHeight();
         const m = 14;
         const ancho = pageW - (m * 2);
-        const grupos = this._porCliente(camion);
+        const matriz = this._matriz(camion);
         const fecha = this._fechaHoja();
         const azul = [26, 115, 232];
         const tinta = [30, 41, 59];
         const muted = [100, 116, 139];
+        const anchoClientes = Math.max(ancho - 92, 40);
+        const anchoCliente = matriz.clientes.length ? anchoClientes / matriz.clientes.length : anchoClientes;
         const cols = [
-            { titulo: 'PRODUCTO', ancho: 110, align: 'left', campo: 'producto' },
-            { titulo: 'CANT.', ancho: 24, align: 'center', campo: 'cantidad' },
-            { titulo: 'PUESTO', ancho: 48, align: 'left', campo: 'puesto' }
+            { titulo: 'PRODUCTO', ancho: 52, align: 'left', valor: row => row.producto },
+            ...matriz.clientes.map(cliente => ({
+                titulo: cliente.nombre,
+                ancho: anchoCliente,
+                align: 'center',
+                valor: row => this._cant(row.cants[cliente.id] || 0)
+            })),
+            { titulo: 'TOTAL', ancho: 16, align: 'center', valor: row => this._cant(row.total) },
+            { titulo: 'PROVEEDOR', ancho: 24, align: 'left', valor: row => row.puesto }
         ];
 
         doc.setFillColor(...azul);
@@ -3750,10 +3787,6 @@ const Camiones = {
             });
             y += 9;
         };
-        const valorFila = (fila, campo) => {
-            if (campo === 'cantidad') return this._cant(fila.cantidad);
-            return String(fila[campo] || '');
-        };
         const pintarFila = (fila, indice) => {
             if (y > pageH - 32) {
                 doc.addPage();
@@ -3768,36 +3801,20 @@ const Camiones = {
             doc.line(m, y + 8, m + ancho, y + 8);
             doc.setTextColor(...tinta);
             doc.setFont('helvetica', 'normal');
-            doc.setFontSize(9);
+            doc.setFontSize(8);
             let x = m;
             cols.forEach(col => {
-                const texto = doc.splitTextToSize(valorFila(fila, col.campo), col.ancho - 6)[0] || '';
-                const tx = col.align === 'center' ? x + (col.ancho / 2) : x + 3;
+                const texto = doc.splitTextToSize(String(col.valor(fila) || ''), Math.max(col.ancho - 2, 4))[0] || '';
+                const tx = col.align === 'center' ? x + (col.ancho / 2) : x + 1.5;
                 doc.text(texto, tx, y + 5.4, { align: col.align === 'center' ? 'center' : 'left' });
                 x += col.ancho;
             });
             y += 8;
         };
-        grupos.forEach(grupo => {
-            if (y > pageH - 48) {
-                doc.addPage();
-                y = 16;
-            }
-            doc.setFillColor(239, 246, 255);
-            doc.roundedRect(m, y, ancho, 12, 1.5, 1.5, 'F');
-            doc.setFillColor(...azul);
-            doc.rect(m, y, 1.6, 12, 'F');
-            doc.setTextColor(...tinta);
-            doc.setFont('helvetica', 'bold');
-            doc.setFontSize(11);
-            doc.text(String(grupo.cliente || 'Cliente'), m + 6, y + 8);
-            y += 16;
-            pintarCabeza();
-            grupo.items.forEach((fila, indice) => pintarFila(fila, indice));
-            y += 4;
-        });
+        pintarCabeza();
+        matriz.productos.forEach((fila, indice) => pintarFila(fila, indice));
 
-        const total = grupos.reduce((sum, grupo) => sum + grupo.total, 0);
+        const total = matriz.total;
         y += 8;
         doc.setFillColor(...azul);
         doc.roundedRect(pageW - m - 74, y, 74, 12, 1.5, 1.5, 'F');
@@ -4834,7 +4851,136 @@ const Recepcion = {
                 }
             }
         });
+
+        const guardarCampo = (e) => {
+            const input = e.target.closest('.recepcion-llego, .recepcion-precio');
+            if (!input || input.disabled) return;
+            const productoId = input.getAttribute('data-producto-id');
+            if (!productoId) return;
+            const { llego, precio } = this.getValoresProducto(productoId);
+            this._aplicarCambio(productoId, llego, precio);
+        };
+        tbody.addEventListener('input', guardarCampo);
+        tbody.addEventListener('change', guardarCampo);
+
+        if (!this._salidaEnganchada) {
+            this._salidaEnganchada = true;
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') this._flush();
+            });
+            window.addEventListener('pagehide', () => this._flush());
+        }
         this._actionsBound = true;
+    },
+
+    _claveBorrador(fecha) {
+        return 'sg_recepcion_borrador:' + fecha;
+    },
+
+    _leerBorrador(fecha) {
+        try {
+            const raw = localStorage.getItem(this._claveBorrador(fecha));
+            const data = raw ? JSON.parse(raw) : {};
+            return data && typeof data === 'object' ? data : {};
+        } catch (error) {
+            return {};
+        }
+    },
+
+    _guardarBorrador(fecha, map) {
+        localStorage.setItem(this._claveBorrador(fecha), JSON.stringify(map || {}));
+    },
+
+    _ponerBorrador(fecha, productoId, llego, precio) {
+        const map = this._leerBorrador(fecha);
+        map[String(productoId)] = { llego, precio };
+        this._guardarBorrador(fecha, map);
+    },
+
+    _quitarBorrador(fecha, productoId) {
+        const map = this._leerBorrador(fecha);
+        if (!map[String(productoId)]) return;
+        delete map[String(productoId)];
+        this._guardarBorrador(fecha, map);
+    },
+
+    _fusionarBorrador(lista, fecha) {
+        const map = this._leerBorrador(fecha);
+        return (lista || []).map(item => {
+            const confirmado = item.confirmado === true || item.confirmado === 'true';
+            const borrador = map[String(item.producto_id)];
+            if (!borrador || confirmado) return item;
+            return { ...item, llego: borrador.llego, precio_real: borrador.precio };
+        });
+    },
+
+    _reflejarEnCache(fecha) {
+        const recepcion = AppState.recepcion || [];
+        CacheManager.set(`recepcion:${fecha}`, recepcion);
+        const flujo = CacheManager.peek(`flujo:${fecha}`) || {
+            fecha,
+            pedidos: AppState.pedidos || [],
+            recepcion,
+            precios: AppState.precios || []
+        };
+        flujo.recepcion = recepcion;
+        CacheManager.set(`flujo:${fecha}`, flujo);
+        if (Array.isArray(flujo.pedidos) && flujo.pedidos.length) CacheManager.set(`pedidos:${fecha}`, flujo.pedidos);
+        if (Array.isArray(flujo.precios)) CacheManager.set(`precios:${fecha}`, flujo.precios);
+    },
+
+    _aplicarCambio(productoId, llego, precio) {
+        const fecha = AppState.currentDate;
+        this._ponerBorrador(fecha, productoId, llego, precio);
+        const idx = (AppState.recepcion || []).findIndex(r => String(r.producto_id) === String(productoId));
+        if (idx !== -1) {
+            AppState.recepcion[idx] = {
+                ...AppState.recepcion[idx],
+                llego,
+                precio_real: precio
+            };
+        }
+        this._reflejarEnCache(fecha);
+        this._programarGuardado();
+    },
+
+    _programarGuardado() {
+        clearTimeout(this._guardarTimer);
+        this._guardarTimer = setTimeout(() => this._guardarEnServidor(), 500);
+    },
+
+    _flush() {
+        if (!this._guardarTimer) return;
+        clearTimeout(this._guardarTimer);
+        this._guardarTimer = null;
+        this._guardarEnServidor();
+    },
+
+    async _guardarEnServidor() {
+        this._guardarTimer = null;
+        const fecha = AppState.currentDate;
+        const map = this._leerBorrador(fecha);
+        const items = Object.keys(map).map(productoId => {
+            const item = (AppState.recepcion || []).find(r => String(r.producto_id) === String(productoId));
+            if (item && (item.confirmado === true || item.confirmado === 'true')) return null;
+            return {
+                producto_id: productoId,
+                llego: map[productoId].llego,
+                precio_real: map[productoId].precio,
+                pedido_total: item?.pedido_total || 0,
+                proveedor_id: item?.proveedor_id || ''
+            };
+        }).filter(Boolean);
+        if (!items.length) return;
+
+        const marca = JSON.stringify(map);
+        try {
+            await API.saveRecepcion({ fecha, items });
+            if (AppState.currentDate === fecha) this._reflejarEnCache(fecha);
+            if (JSON.stringify(this._leerBorrador(fecha)) !== marca) this._programarGuardado();
+        } catch (error) {
+            console.error('Error guardando recepción:', error);
+        }
     },
 
     _subtotal(llego, precio) {
@@ -4891,8 +5037,11 @@ const Recepcion = {
         const flujoLocal = DataLoader.armarFlujoLocal(fecha);
         const flujoRecordado = flujoLocal || CacheManager.peek(`flujo:${fecha}`);
         if (flujoRecordado && !flujoLocal) {
-            AppState.recepcion = flujoRecordado.recepcion || [];
+            AppState.recepcion = this._fusionarBorrador(flujoRecordado.recepcion || [], fecha);
             if (Array.isArray(flujoRecordado.pedidos)) AppState.pedidos = flujoRecordado.pedidos;
+            this.render();
+        } else if (AppState.fechaCargada === fecha && (AppState.recepcion || []).length) {
+            AppState.recepcion = this._fusionarBorrador(AppState.recepcion, fecha);
             this.render();
         } else if (!flujoLocal && AppState.fechaCargada !== fecha) {
             tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">Buscando recepción…</td></tr>';
@@ -4934,6 +5083,7 @@ const Recepcion = {
             });
 
             const recepcionesFinales = [];
+            let pendiente = false;
 
             Object.keys(pedidosPorProducto).forEach(productoId => {
                 const pedidoInfo = pedidosPorProducto[productoId];
@@ -4946,13 +5096,22 @@ const Recepcion = {
                 const local = (AppState.recepcion || []).find(r => String(r.producto_id) === String(productoId));
                 const confirmado = rec?.confirmado === true || rec?.confirmado === 'true';
                 const edicion = ediciones[String(productoId)];
+                const borrador = this._leerBorrador(fecha)[String(productoId)];
                 const conservarLocal = local && (local.confirmado === true || local.confirmado === 'true') && !confirmado;
                 let llego = rec?.llego ?? 0;
                 let precioReal = rec?.precio_real ?? 0;
-                if (conservarLocal) {
+                if (confirmado) {
+                    this._quitarBorrador(fecha, productoId);
+                } else if (borrador) {
+                    const precioServidor = Utils.parsePrice(precioReal) || 0;
+                    const precioBorrador = Utils.parsePrice(borrador.precio) || 0;
+                    if (Number(borrador.llego) !== Number(llego) || precioBorrador !== precioServidor) pendiente = true;
+                    llego = borrador.llego;
+                    precioReal = borrador.precio;
+                } else if (conservarLocal) {
                     llego = local.llego ?? llego;
                     precioReal = local.precio_real ?? precioReal;
-                } else if (!confirmado && edicion) {
+                } else if (edicion) {
                     llego = edicion.llego;
                     precioReal = edicion.precio;
                 }
@@ -4971,10 +5130,16 @@ const Recepcion = {
             });
 
             AppState.recepcion = recepcionesFinales;
-            
+            this._reflejarEnCache(fecha);
             this.render();
+            if (pendiente) this._programarGuardado();
         } catch (error) {
             console.error('Error loading recepcion:', error);
+            if ((AppState.recepcion || []).length) {
+                AppState.recepcion = this._fusionarBorrador(AppState.recepcion, fecha);
+                this.render();
+                return;
+            }
             Utils.hideTableLoader(tbody);
             tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 30px; color: #d32f2f;">Error al cargar recepción. Por favor, intenta nuevamente.</td></tr>';
         }
@@ -5258,6 +5423,7 @@ const Recepcion = {
                 };
             }
             this._ajustarSaldoProveedor(item.proveedor_id, delta);
+            this._ponerBorrador(AppState.currentDate, productoId, llego, precio);
             CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
             CacheManager.invalidate(`flujo:${AppState.currentDate}`);
             this.render();
@@ -5285,6 +5451,7 @@ const Recepcion = {
                     };
                 }
                 this._ajustarSaldoProveedor(item.proveedor_id, -delta);
+                this._ponerBorrador(AppState.currentDate, productoId, anterior.llego, anterior.precio_real);
                 CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
                 this.render();
                 Utils.showError('No se pudo guardar la recepción.');
@@ -5324,6 +5491,7 @@ const Recepcion = {
         }
         CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
         CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this._ponerBorrador(AppState.currentDate, productoId, 0, 0);
         this.render();
         Utils.avisar(`Recepción de "${nombre}" eliminada`);
         DiaOperativo.refreshSoon();
@@ -5341,6 +5509,7 @@ const Recepcion = {
                 this._ajustarSaldoProveedor(anterior.proveedor_id, this._subtotal(anterior.llego, anterior.precio_real));
             }
             CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+            this._ponerBorrador(AppState.currentDate, productoId, anterior.llego, anterior.precio_real);
             this.render();
             Utils.showError('No se pudo eliminar la recepción.');
         });
@@ -10162,7 +10331,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     ProveedoresGestion.initActions();
     addButtonListener('btn-agregar-pedido', () => Pedidos.add(), 'Cargando...');
     addButtonListener('btn-guardar-pedidos', () => Pedidos.enviarPendientes(), 'Preparando...');
-    addButtonListener('btn-guardar-recepcion', () => Recepcion.save(), 'Guardando...');
     addButtonListener('btn-confirmar-recepcion-todo', () => Recepcion.confirmarCompletos(), 'Confirmando...', { useButtonLoader: false });
     addButtonListener('btn-generar-lista-precios', () => Precios.generarLista(), 'Generando...');
     addButtonListener('btn-guardar-precios', () => Precios.save(), 'Guardando...');
