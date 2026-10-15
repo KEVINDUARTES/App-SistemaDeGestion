@@ -1,6 +1,38 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
+    <script>
+        // Freno de seguridad: si esta pestaña se recarga 8 veces o más en 10 segundos, se detienen
+        // las redirecciones automáticas (en vez de parpadear sin parar) y se explica qué está pasando.
+        // Para empezar de cero: abrir login.html?limpiar=1
+        (function () {
+            try {
+                if (/[?&]limpiar=1/.test(location.search)) {
+                    localStorage.clear();
+                    sessionStorage.clear();
+                    history.replaceState(null, '', location.pathname);
+                }
+                // window.name sobrevive a las redirecciones y a cualquier limpieza de storage.
+                var ahora = Date.now();
+                var previas = [];
+                if (window.name.indexOf('sg_cargas:') === 0) { try { previas = JSON.parse(window.name.substring(10)); } catch (e) {} }
+                var cargas = previas.filter(function (t) { return ahora - t < 10000; });
+                cargas.push(ahora);
+                window.name = 'sg_cargas:' + JSON.stringify(cargas);
+                window.__bucle = cargas.length >= 8;
+            } catch (error) {}
+        })();
+    </script>
+    <script>
+        // Sin sesión válida no se arma la pantalla: se va directo al ingreso (evita el parpadeo).
+        (function() {
+            var token = localStorage.getItem('authToken') || '';
+            if (!localStorage.getItem('userEmail') || token.indexOf('.') < 1) {
+                window.__sinSesion = true;
+                if (!window.__bucle) window.location.replace('login.html');
+            }
+        })();
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -765,17 +797,17 @@
         <a href="#" data-page="pagos" class="nav-link"><span>6</span>Pago</a>
         <a href="#" data-page="cierre" class="nav-link"><span>7</span>Cierre</a>
     </nav>
-    <script src="auth.js?v=20261003login"></script>
+    <script src="auth.js?v=20261013hoja"></script>
     <script src="services/whatsapp.js?v=20260927sinboton"></script>
     <script src="services/pedidoProveedorService.js?v=20261002prov"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261004wspprecio"></script>
+    <script src="app.js?v=20261015cobpend"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {
             // Verificar autenticación inmediatamente
-            if (!Auth.isAuthenticated()) {
-                window.location.href = 'login.html';
+            if (window.__sinSesion || !Auth.isAuthenticated()) {
+                Auth.navegar('login.html');
                 return;
             }
             
@@ -785,7 +817,9 @@
                 const userEmail = Auth.getUserEmail();
                 const userEmailEl = document.getElementById('user-email');
                 if (userEmailEl) {
-                    userEmailEl.textContent = userEmail;
+                    const hoja = Auth.getHoja();
+                    userEmailEl.textContent = userEmail + (hoja ? ' · hoja ' + hoja : '');
+                    userEmailEl.title = 'Cada usuario trabaja con su propia hoja de cálculo. Si dos usuarios muestran la misma hoja, comparten datos.';
                 }
                 
                 // Manejar logout

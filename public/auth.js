@@ -9,29 +9,107 @@ const API_CONFIG = {
 console.log('🔐 auth.js cargado correctamente');
 
 const Auth = {
-    // Verificar si el usuario está autenticado
+    // Todo lo que el navegador recuerda (listas, borradores, caché) es del usuario que lo cargó.
+    // Se borra al entrar, al salir y si cambia el usuario: nadie ve datos de otro.
+    limpiarDatosLocales() {
+        try { localStorage.clear(); } catch (error) {}
+        try { sessionStorage.clear(); } catch (error) {}
+    },
+
+    // Verificar si el usuario está autenticado.
+    // El token real es "datos.firma": los viejos (sin firma) ya no sirven y obligan a entrar de nuevo.
     isAuthenticated() {
         const token = localStorage.getItem('authToken');
         const email = localStorage.getItem('userEmail');
-        return !!(token && email);
+        return !!(token && email && token.indexOf('.') > 0);
     },
     
-    // Guardar sesión
-    saveSession(email, token) {
+    // Guardar sesión (siempre sobre un navegador limpio)
+    saveSession(email, token, hoja) {
+        this.limpiarDatosLocales();
         localStorage.setItem('authToken', token);
         localStorage.setItem('userEmail', email);
+        localStorage.setItem('sg_owner', email);
+        localStorage.setItem('sg_hoja', hoja || '');
         localStorage.setItem('loginTime', new Date().toISOString());
+        try { sessionStorage.setItem('sg_session_owner', email); } catch (error) {}
     },
     
     // Cerrar sesión
     logout() {
-        localStorage.removeItem('authToken');
-        localStorage.removeItem('userEmail');
-        localStorage.removeItem('loginTime');
-        window.location.href = 'login.html';
+        this.limpiarDatosLocales();
+        this.navegar('login.html');
+    },
+
+    // Todas las redirecciones pasan por acá: si la página está en un bucle de recargas, se frena y se explica.
+    navegar(destino) {
+        if (window.__bucle) {
+            this.mostrarAvisoDeBucle(destino);
+            return;
+        }
+        window.location.replace(destino);
+    },
+
+    mostrarAvisoDeBucle(destino) {
+        if (document.getElementById('aviso-bucle')) return;
+        let token = '', email = '', dueno = '';
+        try {
+            token = localStorage.getItem('authToken') || '';
+            email = localStorage.getItem('userEmail') || '';
+            dueno = localStorage.getItem('sg_owner') || '';
+        } catch (error) {}
+        const caja = document.createElement('div');
+        caja.id = 'aviso-bucle';
+        caja.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#fff;color:#111;font:15px system-ui,sans-serif;padding:32px;overflow:auto';
+        caja.innerHTML = '<h2>La página se estaba recargando sin parar</h2>'
+            + '<p>Se frenó para que no parpadee. Intentaba ir a <b>' + destino + '</b>.</p>'
+            + '<p style="font-family:monospace;font-size:13px;background:#f3f4f6;padding:12px;border-radius:8px">'
+            + 'usuario guardado: ' + (email || '(ninguno)') + '<br>'
+            + 'sesión con firma: ' + (token.indexOf('.') > 0 ? 'sí' : 'no') + '<br>'
+            + 'dueño de los datos: ' + (dueno || '(ninguno)') + '<br>'
+            + 'página: ' + location.pathname + '</p>'
+            + '<button id="aviso-bucle-limpiar" style="font-size:16px;padding:12px 20px;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer">Borrar datos locales y empezar de nuevo</button>';
+        document.body.appendChild(caja);
+        document.getElementById('aviso-bucle-limpiar').addEventListener('click', () => {
+            try { localStorage.clear(); sessionStorage.clear(); } catch (error) {}
+            window.location.href = 'login.html';
+        });
+    },
+
+    getToken() {
+        return localStorage.getItem('authToken') || '';
+    },
+
+    // Si lo guardado en el navegador no es de este usuario, se descarta antes de mostrar nada.
+    // Son dos lugares: localStorage (compartido por todas las pestañas) y sessionStorage
+    // (propio de cada pestaña: una pestaña vieja puede conservar la caché del usuario anterior).
+    verificarDuenioDeDatos() {
+        try {
+            const email = localStorage.getItem('userEmail');
+            if (!email) return;
+            if (localStorage.getItem('sg_owner') !== email) {
+                const token = localStorage.getItem('authToken');
+                const loginTime = localStorage.getItem('loginTime');
+                const hoja = localStorage.getItem('sg_hoja');
+                try { localStorage.clear(); } catch (error) {}
+                if (token) localStorage.setItem('authToken', token);
+                localStorage.setItem('userEmail', email);
+                localStorage.setItem('sg_owner', email);
+                if (loginTime) localStorage.setItem('loginTime', loginTime);
+                if (hoja) localStorage.setItem('sg_hoja', hoja);
+            }
+            if (sessionStorage.getItem('sg_session_owner') !== email) {
+                try { sessionStorage.clear(); } catch (error) {}
+                sessionStorage.setItem('sg_session_owner', email);
+            }
+        } catch (error) {}
     },
     
     // Obtener email del usuario
+    getHoja() {
+        return localStorage.getItem('sg_hoja') || '';
+    },
+
     getUserEmail() {
         return localStorage.getItem('userEmail');
     },
@@ -70,12 +148,17 @@ const Auth = {
                     });
                     return;
                 }
+                if (String(loginResult.token).indexOf('.') < 0) {
+                    // Un servidor con el Code.gs viejo entrega tokens sin firma: con ellos la app rebotaría
+                    // entre el ingreso y la pantalla principal. Mejor decirlo claro.
+                    finish({
+                        success: false,
+                        error: 'El servidor todavía tiene una versión vieja de Code.gs. En Apps Script: Implementar → Administrar implementaciones → editar → Versión: Nueva versión → Implementar. Después volvé a intentar.'
+                    });
+                    return;
+                }
                 const correo = (loginResult.email || email).toLowerCase().trim();
-                this.saveSession(correo, loginResult.token);
-                try {
-                    const prueba = await this._prueba(correo, password);
-                    if (prueba) localStorage.setItem('loginProof', correo + ':' + prueba);
-                } catch (error) {}
+                this.saveSession(correo, loginResult.token, loginResult.hoja);
                 finish({ success: true });
             };
 
@@ -90,21 +173,25 @@ const Auth = {
         });
     },
 
+    // Siempre se valida en el servidor: sin eso no habría sesión firmada ni hoja propia.
     async login(email, password) {
         const correo = String(email || '').toLowerCase().trim();
-        try {
-            const prueba = await this._prueba(correo, password);
-            const guardada = localStorage.getItem('loginProof');
-            if (prueba && guardada === correo + ':' + prueba) {
-                this.saveSession(correo, 'local-' + Date.now());
-                return { success: true };
-            }
-        } catch (error) {
-            console.error('Error en login:', error);
-        }
         return this._pedirLogin(correo, password);
     }
 };
+
+Auth.verificarDuenioDeDatos();
+
+// Si en otra pestaña se entra o se sale con otro usuario, esta pestaña no puede seguir
+// mostrando datos del anterior: se recarga y cada una queda con lo suyo.
+let recargaPorOtraPestana = null;
+window.addEventListener('storage', (evento) => {
+    if (evento.key === null || evento.key === 'authToken' || evento.key === 'userEmail') {
+        // Se espera a que la otra pestaña termine de guardar la sesión antes de mirar el resultado.
+        clearTimeout(recargaPorOtraPestana);
+        recargaPorOtraPestana = setTimeout(() => { if (!window.__bucle) window.location.reload(); }, 600);
+    }
+});
 
 // Este archivo ahora solo contiene las funciones de Auth
 // El código específico del formulario de login está en login.html

@@ -1,6 +1,28 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
+    <script>
+        // Freno de seguridad: si esta pestaña se recarga 8 veces o más en 10 segundos, se detienen
+        // las redirecciones automáticas (en vez de parpadear sin parar) y se explica qué está pasando.
+        // Para empezar de cero: abrir login.html?limpiar=1
+        (function () {
+            try {
+                if (/[?&]limpiar=1/.test(location.search)) {
+                    localStorage.clear();
+                    sessionStorage.clear();
+                    history.replaceState(null, '', location.pathname);
+                }
+                // window.name sobrevive a las redirecciones y a cualquier limpieza de storage.
+                var ahora = Date.now();
+                var previas = [];
+                if (window.name.indexOf('sg_cargas:') === 0) { try { previas = JSON.parse(window.name.substring(10)); } catch (e) {} }
+                var cargas = previas.filter(function (t) { return ahora - t < 10000; });
+                cargas.push(ahora);
+                window.name = 'sg_cargas:' + JSON.stringify(cargas);
+                window.__bucle = cargas.length >= 8;
+            } catch (error) {}
+        })();
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Login - Luciano Cargas</title>
@@ -67,7 +89,7 @@
         </div>
     </div>
     
-    <script src="auth.js?v=20261003login"></script>
+    <script src="auth.js?v=20261013hoja"></script>
     <script>
         // Manejo del formulario de login
         document.addEventListener('DOMContentLoaded', () => {
@@ -77,7 +99,7 @@
             
             // Si ya está autenticado, redirigir a la app
             if (Auth.isAuthenticated()) {
-                window.location.href = 'index.html';
+                Auth.navegar('index.html');
                 return;
             }
             
@@ -105,7 +127,7 @@
                     
                     if (result.success) {
                         // Login exitoso - redirigir a la app
-                        window.location.replace('index.html');
+                        Auth.navegar('index.html');
                     } else {
                         // Mostrar error
                         showError(result.error);

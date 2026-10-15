@@ -5,7 +5,6 @@
 
 // Configuración
 const CONFIG = {
-  SPREADSHEET_ID: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY', // Se debe configurar
   API_KEY: 'TMiToken89899', // Token de seguridad
   SHEETS: {
     CLIENTES: 'Clientes',
@@ -22,15 +21,146 @@ const CONFIG = {
     STOCK_BEBIDAS: 'StockBebidas',
     CONFIGURACION: 'Configuracion'
   },
-  // Email por defecto para notificaciones (se puede cambiar en la hoja Configuracion)
-  DEFAULT_EMAIL: 'admin@lucianocargas.com',
+  // Las alertas de stock NO tienen email por defecto: cada usuario pone el suyo en
+  // "Configurar notificaciones". Sin email no se envía nada.
+  DEFAULT_EMAIL: '',
   
-  // USUARIOS AUTORIZADOS - Configurar con los emails y passwords reales
+  // USUARIOS AUTORIZADOS. Cada usuario trabaja con SU PROPIA hoja de cálculo:
+  // nadie ve los clientes, pedidos ni cobros de otro.
+  //  - spreadsheetId: la hoja de ese usuario. Si queda vacío, se crea sola la primera vez que entra.
+  //  - Los datos que ya existían (la hoja de siempre) son de Nicol. Kevin arranca con una hoja nueva y vacía.
   USERS: {
-    'kevindurtes792@gmail.com': 'kevinpassword123',  // CAMBIAR: Email y password del usuario 1
-    'nicolirina.rosascharny@gmail.com': 'nicolpassword456'   // CAMBIAR: Email y password del usuario 2
+    'kevindurtes792@gmail.com': { password: 'kevinpassword123', spreadsheetId: '' },
+    'nicolirina.rosascharny@gmail.com': { password: 'nicolpassword456', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' }
   }
 };
+
+// Cuánto espera una escritura su turno (el cliente corta a los 30 s).
+const LOCK_WAIT_MS = 20000;
+
+/**
+ * Contador que sube con cada escritura. El navegador lo compara para saber
+ * si otra persona cambió algo y así refrescar lo que muestra.
+ */
+function getDataVersion_() {
+  return Number(PropertiesService.getScriptProperties().getProperty('DATA_VERSION_' + tenantClave_())) || 0;
+}
+
+function bumpDataVersion_() {
+  var props = PropertiesService.getScriptProperties();
+  var key = 'DATA_VERSION_' + tenantClave_();
+  props.setProperty(key, String((Number(props.getProperty(key)) || 0) + 1));
+}
+
+// ========== USUARIOS: cada uno con su hoja y su sesión firmada ==========
+
+const SESION_DURACION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Usuario y hoja con los que corre esta ejecución. */
+let _tenant = null;
+
+function usuarioConfig_(email) {
+  var u = CONFIG.USERS[email];
+  if (!u) return null;
+  return typeof u === 'string' ? { password: u, spreadsheetId: '' } : u;
+}
+
+function tenantClave_() {
+  if (!_tenant) throw new Error('No hay un usuario identificado para esta operación');
+  return _tenant.clave;
+}
+
+/** Hoja de cálculo del usuario; si todavía no tiene, se crea (una sola vez). */
+function resolverHojaDeUsuario_(email) {
+  var cfg = usuarioConfig_(email);
+  if (!cfg) throw new Error('Usuario desconocido');
+  if (cfg.spreadsheetId) return cfg.spreadsheetId;
+
+  var props = PropertiesService.getScriptProperties();
+  var key = 'SS_ID_' + email;
+  var id = props.getProperty(key);
+  if (id) return id;
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_WAIT_MS);
+  try {
+    id = props.getProperty(key); // otra ejecución pudo crearla mientras esperábamos
+    if (id) return id;
+    var ss = SpreadsheetApp.create('Luciano Cargas - ' + email);
+    props.setProperty(key, ss.getId());
+    return ss.getId();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Deja la ejecución trabajando para un usuario y descarta toda memoria de otro. */
+function setTenant_(email) {
+  var id = resolverHojaDeUsuario_(email);
+  _tenant = { email: email, spreadsheetId: id, clave: String(id).substring(0, 16) };
+  _spreadsheetCache = null;
+  _sheetValuesCache = {};
+  invalidateCatalogMemo();
+  return _tenant;
+}
+
+/** Corre algo (por ejemplo un aviso programado) una vez por cada usuario. */
+function paraCadaUsuario_(fn) {
+  Object.keys(CONFIG.USERS).forEach(function(email) {
+    try {
+      setTenant_(email);
+      fn(email);
+    } catch (error) {
+      Logger.log('❌ Falló para ' + email + ': ' + error.toString());
+    }
+  });
+}
+
+function secretoDeSesion_() {
+  var props = PropertiesService.getScriptProperties();
+  var secreto = props.getProperty('TOKEN_SECRET');
+  if (secreto) return secreto;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_WAIT_MS);
+  try {
+    secreto = props.getProperty('TOKEN_SECRET');
+    if (!secreto) {
+      secreto = Utilities.getUuid() + Utilities.getUuid() + Utilities.getUuid();
+      props.setProperty('TOKEN_SECRET', secreto);
+    }
+    return secreto;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function firmar_(texto) {
+  return Utilities.base64EncodeWebSafe(Utilities.computeHmacSha256Signature(texto, secretoDeSesion_()));
+}
+
+/** Token firmado: no se puede inventar ni cambiar el usuario sin conocer el secreto. */
+function crearToken_(email) {
+  var carga = Utilities.base64EncodeWebSafe(email + '|' + (new Date().getTime() + SESION_DURACION_MS));
+  return carga + '.' + firmar_(carga);
+}
+
+/** Devuelve el email del token, o null si es falso, está alterado o venció. */
+function verificarToken_(token) {
+  try {
+    if (!token || typeof token !== 'string') return null;
+    var partes = token.split('.');
+    if (partes.length !== 2) return null;
+    if (firmar_(partes[0]) !== partes[1]) return null;
+    var bytes = Utilities.base64DecodeWebSafe(partes[0]);
+    var texto = Utilities.newBlob(bytes).getDataAsString();
+    var corte = texto.lastIndexOf('|');
+    var email = texto.substring(0, corte);
+    if (Number(texto.substring(corte + 1)) < new Date().getTime()) return null;
+    return usuarioConfig_(email) ? email : null;
+  } catch (error) {
+    return null;
+  }
+}
 
 /**
  * Función principal para manejar peticiones HTTP
@@ -71,6 +201,8 @@ function handleRequest(e, method) {
   let callback = null;
   let endpoint = null;
   let actualMethod = method;
+  let lock = null;
+  let versionAvanzada = false;
   
   try {
     // Manejar caso cuando e es undefined o null
@@ -104,6 +236,19 @@ function handleRequest(e, method) {
     
     if (!endpoint) {
       return createResponse({ success: false, error: 'Endpoint no especificado' }, 400, callback);
+    }
+
+    // Todo, salvo el login, es de un usuario identificado: cada uno ve solo su hoja.
+    if (endpoint !== 'login') {
+      let tokenSesion = e.parameter['token'];
+      if (!tokenSesion && e.postData) {
+        try { tokenSesion = JSON.parse(e.postData.contents).token; } catch (err) { /* sin token */ }
+      }
+      const emailSesion = verificarToken_(tokenSesion);
+      if (!emailSesion) {
+        return createResponse({ success: false, error: 'Tu sesión venció. Volvé a iniciar sesión.', sesion: false }, 401, callback);
+      }
+      setTenant_(emailSesion);
     }
     
     // IMPORTANTE: Para JSONP, el método HTTP real siempre es GET
@@ -147,11 +292,47 @@ function handleRequest(e, method) {
     });
     
     // Remover apiKey, endpoint, callback y method de los datos (ya se validaron y guardaron)
+    const rid = data.rid ? String(data.rid) : '';
     delete data.apiKey;
+    delete data.token;
+    delete data.rid;
     delete data.endpoint;
     delete data.callback;
     delete data.method;
+
+    // Ningún texto que se guarde puede llevar < o >: después se muestra en pantalla.
+    if (endpoint !== 'login' && endpoint !== 'whatsapp/enviar' && endpoint !== 'notificaciones/config') {
+      Object.keys(data).forEach(key => { data[key] = sanitizarEntrada_(data[key]); });
+    }
     
+    // Varias personas usan la app a la vez: toda escritura espera su turno.
+    // Sin esto, dos pedidos que leen la misma hoja se pisan (cobros dobles, precios perdidos).
+    // Las lecturas no esperan.
+    if (actualMethod !== 'GET') {
+      lock = LockService.getScriptLock();
+      try {
+        lock.waitLock(LOCK_WAIT_MS);
+      } catch (lockError) {
+        lock = null;
+        return createResponse({
+          success: false,
+          error: 'Hay mucha actividad en este momento. Esperá unos segundos y volvé a intentar.',
+          busy: true
+        }, 503, callback);
+      }
+    }
+
+    // Cada escritura trae un identificador propio (rid). Si el navegador (o la red) repite el mismo
+    // pedido —pasa cuando Google tarda y la conexión se corta—, no se ejecuta de nuevo: se devuelve
+    // lo que ya se respondió. Sin esto, un pedido o un cobro podían quedar duplicados.
+    if (lock && rid) {
+      const previa = serverCacheGet('rid:' + rid);
+      if (previa) {
+        versionAvanzada = true;
+        return createResponse({ success: true, data: previa, ver: getDataVersion_(), repetido: true }, 200, callback);
+      }
+    }
+
     // Enrutar según endpoint
     let result;
     switch (endpoint) {
@@ -327,6 +508,10 @@ function handleRequest(e, method) {
         result = getDashboardResumen(data.fecha, data.dias || 7, data.limite || 5);
         break;
 
+      case 'app/version':
+        result = { ver: getDataVersion_() };
+        break;
+
       case 'app/bootstrap':
         result = getAppBootstrap(data.fecha, data.dias || 7, data.limite || 5);
         break;
@@ -415,7 +600,12 @@ function handleRequest(e, method) {
         return createResponse({ success: false, error: 'Endpoint no encontrado' }, 404, callback);
     }
     
-    return createResponse({ success: true, data: result }, 200, callback);
+    if (lock) {
+      bumpDataVersion_();
+      versionAvanzada = true;
+      if (rid) serverCacheSet('rid:' + rid, result === undefined ? null : result, 600);
+    }
+    return createResponse({ success: true, data: result, ver: _tenant ? getDataVersion_() : undefined }, 200, callback);
     
   } catch (error) {
     Logger.log('❌ [ERROR] Error en handleRequest: ' + error.toString());
@@ -448,6 +638,14 @@ function handleRequest(e, method) {
         Logger.log('❌ [ERROR FATAL] No se pudo crear ninguna respuesta');
         throw finalError;
       }
+    }
+  } finally {
+    if (lock) {
+      // Aunque la escritura haya fallado a medias, el resto tiene que volver a leer.
+      if (!versionAvanzada) {
+        try { bumpDataVersion_(); } catch (versionError) {}
+      }
+      lock.releaseLock();
     }
   }
 }
@@ -487,7 +685,8 @@ let _spreadsheetCache = null;
  */
 function getSpreadsheet() {
   if (!_spreadsheetCache) {
-    _spreadsheetCache = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    if (!_tenant) throw new Error('No hay un usuario identificado para esta operación');
+    _spreadsheetCache = SpreadsheetApp.openById(_tenant.spreadsheetId);
   }
   return _spreadsheetCache;
 }
@@ -589,7 +788,7 @@ var SERVER_CACHE_TTL = {
 
 function serverCacheGet(key) {
   try {
-    var raw = CacheService.getScriptCache().get(key);
+    var raw = CacheService.getScriptCache().get(tenantClave_() + ':' + key);
     if (!raw) return null;
     return JSON.parse(raw);
   } catch (e) {
@@ -601,7 +800,7 @@ function serverCacheSet(key, value, ttlSeconds) {
   try {
     var json = JSON.stringify(value);
     if (json.length > 95000) return;
-    CacheService.getScriptCache().put(key, json, ttlSeconds || SERVER_CACHE_TTL.catalog);
+    CacheService.getScriptCache().put(tenantClave_() + ':' + key, json, ttlSeconds || SERVER_CACHE_TTL.catalog);
   } catch (e) {
     // Cuota o valor demasiado grande
   }
@@ -609,7 +808,7 @@ function serverCacheSet(key, value, ttlSeconds) {
 
 function serverCacheRemove(key) {
   try {
-    CacheService.getScriptCache().remove(key);
+    CacheService.getScriptCache().remove(tenantClave_() + ':' + key);
   } catch (e) {}
 }
 
@@ -825,8 +1024,8 @@ function initializeSheet(sheet, sheetName) {
     
     // Inicializar configuración por defecto si es la hoja de Configuracion
     if (sheetName === 'Configuracion') {
-      sheet.appendRow(['email_notificaciones', CONFIG.DEFAULT_EMAIL]);
-      sheet.appendRow(['notificaciones_activas', 'true']);
+      sheet.appendRow(['email_notificaciones', '']);
+      sheet.appendRow(['notificaciones_activas', 'false']);
       sheet.appendRow(['hora_verificacion', '09:00']);
       sheet.appendRow(['whatsapp_auto_envio', 'false']);
       sheet.appendRow(['whatsapp_modo', 'manual']);
@@ -940,11 +1139,98 @@ function normalizeAmount(value) {
   if (!raw) return 0;
 
   const isNegative = raw.charAt(0) === '-';
+
+  // Con 1 o 2 decimales ("10,5", "1.500,50", "10.5") el separador es decimal.
+  // Con 3 dígitos ("5.000") es separador de miles.
+  const limpio = raw.replace(/[^\d.,]/g, '');
+  let decimal = null;
+  if (/^[\d.]*\d,\d{1,2}$/.test(limpio)) {
+    decimal = parseFloat(limpio.replace(/\./g, '').replace(',', '.'));
+  } else if (/^\d+\.\d{1,2}$/.test(limpio)) {
+    decimal = parseFloat(limpio);
+  }
+  if (decimal !== null && !isNaN(decimal)) {
+    const redondeado = Math.round(decimal);
+    return isNegative ? -redondeado : redondeado;
+  }
+
   const digits = raw.replace(/\D/g, '');
   if (!digits) return 0;
 
   const parsed = parseInt(digits, 10);
   return isNegative ? -parsed : parsed;
+}
+
+function sanitizarEntrada_(valor) {
+  if (typeof valor === 'string') return valor.replace(/[<>]/g, '');
+  if (Array.isArray(valor)) return valor.map(sanitizarEntrada_);
+  if (valor && typeof valor === 'object') {
+    var limpio = {};
+    Object.keys(valor).forEach(function(k) { limpio[k] = sanitizarEntrada_(valor[k]); });
+    return limpio;
+  }
+  return valor;
+}
+
+/** Saca < y > de los textos que se guardan: después se muestran en pantalla. */
+function limpiarTexto_(valor) {
+  return String(valor === undefined || valor === null ? '' : valor).replace(/[<>]/g, '').trim();
+}
+
+/** La cantidad de un pedido tiene que ser un número mayor a cero. */
+function validarCantidad_(valor) {
+  var n = Number(String(valor === undefined || valor === null ? '' : valor).replace(',', '.'));
+  if (valor === '' || valor === null || valor === undefined || !isFinite(n) || n <= 0) {
+    throw new Error('La cantidad tiene que ser un número mayor a cero');
+  }
+  return n;
+}
+
+/** Un día cerrado ya generó cobranzas y stock: no se le cambian pedidos, recepción ni precios. */
+function assertDiaAbierto_(fecha) {
+  var f = normalizeFecha(fecha);
+  if (!f) return;
+  var cierre = findCierreRow(f);
+  if (cierre.row && cierre.estado === 'cerrado') {
+    throw new Error('El día ' + f + ' ya está cerrado: no se pueden cambiar sus pedidos, recepción ni precios.');
+  }
+}
+
+/**
+ * Nombre y teléfono se guardan como texto: Sheets si no convierte "011..." en número
+ * (pierde el 0) y "+54..." o "=..." en fórmula. Se hace una sola vez por hoja.
+ */
+function ensureTextColumns_(sheet, sheetName, columnas) {
+  var props = PropertiesService.getScriptProperties();
+  var key = 'FMT_TEXTO_' + tenantClave_() + '_' + sheetName;
+  if (props.getProperty(key) === '1') return;
+  var headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  columnas.forEach(function(nombre) {
+    var i = headers.indexOf(nombre);
+    if (i !== -1) sheet.getRange(1, i + 1, Math.max(sheet.getMaxRows(), 2), 1).setNumberFormat('@');
+  });
+  props.setProperty(key, '1');
+}
+
+/** Cuántas filas de otra hoja apuntan a este registro. */
+function contarReferencias_(sheetName, columna, id) {
+  var hoja = readSheetValues(sheetName);
+  var idx = hoja.headers.indexOf(columna);
+  if (idx === -1) return 0;
+  var n = 0;
+  hoja.rows.forEach(function(fila) {
+    if (fila[idx] !== '' && fila[idx] !== null && idsMatch(fila[idx], id)) n++;
+  });
+  return n;
+}
+
+function bloquearBorradoSiHayHistorial_(tipo, referencias) {
+  var partes = referencias.filter(function(r) { return r.cantidad > 0; }).map(function(r) {
+    return r.cantidad + ' ' + r.etiqueta;
+  });
+  if (!partes.length) return;
+  throw new Error('No se puede eliminar ' + tipo + ': tiene ' + partes.join(', ') + '. ' +
+    (tipo.indexOf('producto') !== -1 ? 'Borrá primero esos registros.' : 'Desactivalo para que no aparezca más y se conserve el historial.'));
 }
 
 // ========== CLIENTES ==========
@@ -988,10 +1274,12 @@ function ensureClientesSchema(sheet) {
   if (headers.indexOf('activo') === -1) {
     sheet.getRange(1, sheet.getLastColumn() + 1).setValue('activo');
   }
+
+  ensureTextColumns_(sheet, CONFIG.SHEETS.CLIENTES, ['nombre', 'telefono']);
 }
 
 function createCliente(data) {
-  var nombre = String(data.nombre || '').trim();
+  var nombre = limpiarTexto_(data.nombre);
   if (!nombre) throw new Error('El nombre del cliente es requerido');
 
   var existente = getClientes().find(function(cliente) {
@@ -1014,52 +1302,60 @@ function createCliente(data) {
   const newRow = [
     id,
     nombre,
-    String(data.telefono || '').trim(),
+    limpiarTexto_(data.telefono),
     true
   ];
   
   sheet.appendRow(newRow);
   invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
-  return { id: id, nombre: nombre, telefono: data.telefono || '', activo: true };
+  return { id: id, nombre: nombre, telefono: limpiarTexto_(data.telefono), activo: true };
 }
 
 function updateCliente(data) {
+  if (!data || !data.id) {
+    throw new Error('ID de cliente no proporcionado');
+  }
+
   const sheet = getSheet(CONFIG.SHEETS.CLIENTES);
   ensureClientesSchema(sheet);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  const headers = values[0];
-  const idIdx     = headers.indexOf('id');
+  const values = readUsedValues_(sheet);
+  const headers = values.length ? values[0] : [];
+  const idIdx = headers.indexOf('id') !== -1 ? headers.indexOf('id') : 0;
   const nombreIdx = headers.indexOf('nombre');
-  const telIdx    = headers.indexOf('telefono');
+  const telIdx = headers.indexOf('telefono');
   const activoIdx = headers.indexOf('activo');
+  // Solo se cambia lo que llega: desactivar no debe pisar un nombre editado por otra persona.
+  const traeActivo = data.activo !== undefined && data.activo !== null && data.activo !== '';
+  const activoValue = traeActivo ? parseActivoValue(data.activo) : undefined;
 
   for (let i = 1; i < values.length; i++) {
-    if (idsMatch(values[i][idIdx !== -1 ? idIdx : 0], data.id)) {
-      if (nombreIdx !== -1) sheet.getRange(i + 1, nombreIdx + 1).setValue(data.nombre);
-      if (telIdx    !== -1) sheet.getRange(i + 1, telIdx + 1).setValue(String(data.telefono || '').trim());
+    if (!idsMatch(values[i][idIdx], data.id)) continue;
 
-      let activoValue;
-      if (data.activo === 'false' || data.activo === false || data.activo === 0 || data.activo === '0') {
-        activoValue = false;
-      } else if (data.activo === 'true' || data.activo === true || data.activo === 1 || data.activo === '1') {
-        activoValue = true;
-      } else {
-        activoValue = true;
-      }
-      if (activoIdx !== -1) sheet.getRange(i + 1, activoIdx + 1).setValue(activoValue);
-
-      invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
-      invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
-      return { success: true };
+    const row = values[i].slice();
+    if (nombreIdx !== -1 && data.nombre !== undefined) {
+      const nombreLimpio = limpiarTexto_(data.nombre);
+      if (!nombreLimpio) throw new Error('El nombre es obligatorio');
+      row[nombreIdx] = nombreLimpio;
     }
+    if (telIdx !== -1 && data.telefono !== undefined) row[telIdx] = limpiarTexto_(data.telefono);
+    if (activoIdx !== -1 && traeActivo) row[activoIdx] = activoValue;
+    sheet.getRange(i + 1, 1, 1, row.length).setValues([row]);
+
+    invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
+    return { success: true, id: data.id, activo: activoIdx !== -1 ? parseActivoValue(row[activoIdx]) : activoValue };
   }
-  
+
   throw new Error('Cliente no encontrado');
 }
 
 function deleteCliente(id) {
+  bloquearBorradoSiHayHistorial_('al cliente', [
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PEDIDOS, 'cliente_id', id), etiqueta: 'pedido(s)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PRECIOS_CLIENTE, 'cliente_id', id), etiqueta: 'precio(s) cargado(s)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.COBRANZAS, 'cliente_id', id), etiqueta: 'cobranza(s)' }
+  ]);
   const sheet = getSheet(CONFIG.SHEETS.CLIENTES);
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1104,6 +1400,8 @@ function ensureProveedoresSchema(sheet) {
   if (headers.indexOf('activo') === -1) {
     sheet.getRange(1, sheet.getLastColumn() + 1).setValue('activo');
   }
+
+  ensureTextColumns_(sheet, CONFIG.SHEETS.PROVEEDORES, ['nombre', 'rubro', 'telefono']);
 }
 
 function getProveedorHeaderIndexes(headers) {
@@ -1152,6 +1450,10 @@ function getProveedores() {
 }
 
 function createProveedor(data) {
+  const nombreProveedor = limpiarTexto_(data.nombre);
+  if (!nombreProveedor) throw new Error('El nombre del proveedor es requerido');
+  const rubroProveedor = limpiarTexto_(data.rubro);
+  const telefonoProveedor = limpiarTexto_(data.telefono);
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
   ensureProveedoresSchema(sheet);
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -1160,10 +1462,10 @@ function createProveedor(data) {
 
   const row = new Array(headers.length).fill('');
   row[cols.id] = id;
-  row[cols.nombre] = data.nombre;
-  row[cols.rubro] = data.rubro || '';
+  row[cols.nombre] = nombreProveedor;
+  row[cols.rubro] = rubroProveedor;
   if (cols.telefono !== -1) {
-    row[cols.telefono] = String(data.telefono || '').trim();
+    row[cols.telefono] = telefonoProveedor;
   }
   if (cols.activo !== -1) {
     row[cols.activo] = true;
@@ -1172,7 +1474,7 @@ function createProveedor(data) {
   sheet.appendRow(row);
   invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
-  return { id: id, ...data, activo: true };
+  return { id: id, nombre: nombreProveedor, rubro: rubroProveedor, telefono: telefonoProveedor, activo: true };
 }
 
 function updateProveedor(data) {
@@ -1182,32 +1484,41 @@ function updateProveedor(data) {
 
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
   ensureProveedoresSchema(sheet);
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const values = readUsedValues_(sheet);
+  const headers = values.length ? values[0] : [];
   const cols = getProveedorHeaderIndexes(headers);
-  const values = sheet.getDataRange().getValues();
-  const activoValue = parseActivoValue(data.activo);
+  const traeActivo = data.activo !== undefined && data.activo !== null && data.activo !== '';
+  const activoValue = traeActivo ? parseActivoValue(data.activo) : undefined;
 
   for (let i = 1; i < values.length; i++) {
-    if (idsMatch(values[i][cols.id], data.id)) {
-      const rowNumber = i + 1;
-      sheet.getRange(rowNumber, cols.nombre + 1).setValue(data.nombre);
-      sheet.getRange(rowNumber, cols.rubro + 1).setValue(data.rubro || '');
-      if (cols.telefono !== -1) {
-        sheet.getRange(rowNumber, cols.telefono + 1).setValue(String(data.telefono || '').trim());
-      }
-      if (cols.activo !== -1) {
-        sheet.getRange(rowNumber, cols.activo + 1).setValue(activoValue);
-      }
-      invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
-      invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
-      return { success: true, id: data.id, activo: activoValue };
+    if (!idsMatch(values[i][cols.id], data.id)) continue;
+
+    const row = values[i].slice();
+    if (cols.nombre !== -1 && data.nombre !== undefined) {
+      const nombreLimpio = limpiarTexto_(data.nombre);
+      if (!nombreLimpio) throw new Error('El nombre es obligatorio');
+      row[cols.nombre] = nombreLimpio;
     }
+    if (cols.rubro !== -1 && data.rubro !== undefined) row[cols.rubro] = limpiarTexto_(data.rubro);
+    if (cols.telefono !== -1 && data.telefono !== undefined) row[cols.telefono] = limpiarTexto_(data.telefono);
+    if (cols.activo !== -1 && traeActivo) row[cols.activo] = activoValue;
+    sheet.getRange(i + 1, 1, 1, row.length).setValues([row]);
+
+    invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
+    return { success: true, id: data.id, activo: cols.activo !== -1 ? parseActivoValue(row[cols.activo]) : activoValue };
   }
 
   throw new Error('Proveedor no encontrado');
 }
 
 function deleteProveedor(id) {
+  bloquearBorradoSiHayHistorial_('al proveedor', [
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PEDIDOS, 'proveedor_id', id), etiqueta: 'pedido(s)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.RECEPCION, 'proveedor_id', id), etiqueta: 'recepción(es)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PAGOS_PROVEEDORES, 'proveedor_id', id), etiqueta: 'pago(s)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PRODUCTOS, 'proveedor_default', id), etiqueta: 'producto(s) que lo usan como habitual' }
+  ]);
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
   ensureProveedoresSchema(sheet);
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -1464,7 +1775,7 @@ function getProductosMap() {
 }
 
 function createProducto(data) {
-  var nombre = String(data.nombre || '').trim();
+  var nombre = limpiarTexto_(data.nombre);
   if (!nombre) throw new Error('El nombre del producto es requerido');
 
   var existente = getProductos().find(function(producto) {
@@ -1488,7 +1799,7 @@ function createProducto(data) {
     id,
     nombre,
     data.tipo,
-    data.unidad || '',
+    limpiarTexto_(data.unidad),
     data.proveedor_default || ''
   ];
   
@@ -1517,9 +1828,11 @@ function updateProducto(data) {
   
   for (let i = 1; i < values.length; i++) {
     if (idsMatch(values[i][colId], data.id)) {
-      sheet.getRange(i + 1, 2).setValue(data.nombre);
+      var nombreProducto = limpiarTexto_(data.nombre);
+      if (!nombreProducto) throw new Error('El nombre del producto es requerido');
+      sheet.getRange(i + 1, 2).setValue(nombreProducto);
       sheet.getRange(i + 1, 3).setValue(data.tipo);
-      sheet.getRange(i + 1, 4).setValue(data.unidad || '');
+      sheet.getRange(i + 1, 4).setValue(limpiarTexto_(data.unidad));
       sheet.getRange(i + 1, 5).setValue(data.proveedor_default || '');
       invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
       invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
@@ -1531,6 +1844,11 @@ function updateProducto(data) {
 }
 
 function deleteProducto(id) {
+  bloquearBorradoSiHayHistorial_('el producto', [
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PEDIDOS, 'producto_id', id), etiqueta: 'pedido(s)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.RECEPCION, 'producto_id', id), etiqueta: 'recepción(es)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.PRECIOS_CLIENTE, 'producto_id', id), etiqueta: 'precio(s) al cliente' }
+  ]);
   const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
   const dataRange = sheet.getDataRange();
   const values = dataRange.getValues();
@@ -1618,6 +1936,9 @@ function createPedido(data) {
     throw new Error('Ese producto no está en el sistema. Actualizá la página y volvé a elegirlo.');
   }
 
+  const cantidadPedido = validarCantidad_(data.cantidad);
+  assertDiaAbierto_(data.fecha || todayArgentina());
+
   const sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
   ensurePedidosProveedorColumn_(sheet);
   const id = generateId();
@@ -1635,7 +1956,7 @@ function createPedido(data) {
   setCol('cliente_id', data.cliente_id);
   setCol('producto_id', data.producto_id);
   setCol('tipo', data.tipo);
-  setCol('cantidad', data.cantidad);
+  setCol('cantidad', cantidadPedido);
   setCol('enviado', false);
   setCol('proveedor_id', data.proveedor_id || '');
 
@@ -1643,7 +1964,7 @@ function createPedido(data) {
   invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
   invalidateServerCacheFecha(fecha);
-  return { id: id, ...data, fecha: fecha, enviado: false };
+  return { id: id, ...data, cantidad: cantidadPedido, fecha: fecha, enviado: false };
 }
 
 function updatePedido(data) {
@@ -1668,9 +1989,11 @@ function updatePedido(data) {
   setCol('cliente_id', data.cliente_id);
   setCol('producto_id', data.producto_id);
   setCol('tipo', data.tipo);
-  if (data.cantidad !== undefined && data.cantidad !== null) setCol('cantidad', data.cantidad);
+  if (data.cantidad !== undefined && data.cantidad !== null) setCol('cantidad', validarCantidad_(data.cantidad));
   if (data.proveedor_id !== undefined) setCol('proveedor_id', data.proveedor_id || '');
 
+  var fechaFilaIdx = headers.indexOf('fecha');
+  assertDiaAbierto_(values[fechaFilaIdx !== -1 ? fechaFilaIdx : 1]);
   sheet.getRange(row, 1, 1, lastCol).setValues([values]);
 
   var fechaIdx = headers.indexOf('fecha');
@@ -1700,6 +2023,7 @@ function deletePedido(id) {
   if (row < 0) throw new Error('Pedido no encontrado');
 
   var fecha = normalizeFecha(sheet.getRange(row, 2).getValue());
+  assertDiaAbierto_(fecha);
   sheet.deleteRow(row);
   invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
@@ -1948,6 +2272,7 @@ function saveRecepcion(data) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
 
   const fechaNormalizada = normalizeFecha(data.fecha);
+  assertDiaAbierto_(fechaNormalizada);
   const values = readUsedValues_(sheet);
 
   // Leer headers para no depender de índices hardcodeados
@@ -2087,6 +2412,7 @@ function confirmarRecepcionItem(data) {
   if (llego > 0 && !precioReal) {
     throw new Error('Ingresá el precio real cuando llegó mercadería');
   }
+  assertDiaAbierto_(data.fecha);
 
   var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
   var values = readUsedValues_(sheet);
@@ -2149,6 +2475,7 @@ function desconfirmarRecepcionItem(data) {
     throw new Error('fecha y producto_id son requeridos');
   }
 
+  assertDiaAbierto_(data.fecha);
   var found = findRecepcion(data.fecha, data.producto_id);
   if (!found) {
     throw new Error('No se encontró la recepción del producto');
@@ -2168,6 +2495,7 @@ function deleteRecepcionItem(data) {
     throw new Error('fecha y producto_id son requeridos');
   }
 
+  assertDiaAbierto_(data.fecha);
   var found = findRecepcion(data.fecha, data.producto_id);
   if (!found) {
     throw new Error('No se encontró la recepción del producto');
@@ -2183,6 +2511,7 @@ function deleteRecepcionItem(data) {
 }
 
 function confirmarRecepcion(fecha) {
+  assertDiaAbierto_(fecha);
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return { success: true };
@@ -2256,6 +2585,7 @@ function savePreciosCliente(data) {
   
   // Normalizar fecha una sola vez
   const fechaNormalizada = normalizeFecha(data.fecha);
+  assertDiaAbierto_(fechaNormalizada);
   
   // Leer todos los precios existentes y construir un índice por (fecha, cliente_id, producto_id)
   const dataRange = sheet.getDataRange();
@@ -2348,6 +2678,13 @@ function cerrarDia(fecha) {
       throw new Error('Fecha inválida o no proporcionada para el cierre del día');
     }
     
+    if (normalizeFecha(fecha) > todayArgentina()) {
+      throw new Error('No se puede cerrar un día que todavía no llegó.');
+    }
+    if (getPedidos(fecha).length === 0) {
+      throw new Error('No hay pedidos en ese día para cerrar.');
+    }
+
     Logger.log('🔄 [CIERRE] Iniciando cierre del día para fecha: ' + fecha);
     Logger.log('🔄 [CIERRE] Timestamp inicio: ' + new Date().toISOString());
     
@@ -2418,7 +2755,7 @@ function cerrarDia(fecha) {
     }
 
     Logger.log('📦 [CIERRE] Actualizando stock de bebidas (entra lo recibido, sale lo vendido)...');
-    aplicarStockCierre(fecha, cierreInfo);
+    var faltantesCierre = aplicarStockCierre(fecha, cierreInfo) || [];
     Logger.log('✅ [CIERRE] Stock actualizado');
 
     Logger.log('💵 [CIERRE] Generando cobranzas...');
@@ -2437,7 +2774,12 @@ function cerrarDia(fecha) {
     
     const elapsed = ((new Date().getTime() - startTime) / 1000).toFixed(2);
     Logger.log('🎉 [CIERRE] Cierre del día completado exitosamente en ' + elapsed + ' segundos');
-    return { success: true, message: 'Día cerrado correctamente', tiempo: elapsed + 's' };
+    var productosCierre = getProductosMap();
+    var faltantesStock = faltantesCierre.map(function(item) {
+      var prod = findInIdMap(productosCierre, item.producto_id);
+      return { producto_id: item.producto_id, producto_nombre: prod ? prod.nombre : '', faltante: item.faltante };
+    });
+    return { success: true, message: 'Día cerrado correctamente', tiempo: elapsed + 's', faltantes_stock: faltantesStock };
     
   } catch (error) {
     const elapsed = ((new Date().getTime() - startTime) / 1000).toFixed(2);
@@ -2561,15 +2903,20 @@ function leerStockMap(sheet) {
 
 function escribirStockDesdeBase(sheet, base, delta) {
   var map = leerStockMap(sheet);
+  var faltantes = [];
   Object.keys(delta).forEach(function(productoId) {
     var baseQty = base && base[productoId] !== undefined ? Number(base[productoId]) : 0;
-    var nuevo = Math.max(0, Math.round((baseQty + Number(delta[productoId] || 0)) * 1000) / 1000);
+    var bruto = Math.round((baseQty + Number(delta[productoId] || 0)) * 1000) / 1000;
+    // El stock no baja de 0, pero se avisa cuánto se vendió de más (no estaba cargado).
+    if (bruto < 0) faltantes.push({ producto_id: productoId, faltante: -bruto });
+    var nuevo = Math.max(0, bruto);
     if (map[productoId]) {
       sheet.getRange(map[productoId].rowIndex, 2).setValue(nuevo);
     } else {
       sheet.appendRow([productoId, nuevo, 10]);
     }
   });
+  return faltantes;
 }
 
 function aplicarStockCierre(fecha, cierreInfo) {
@@ -2599,9 +2946,10 @@ function aplicarStockCierre(fecha, cierreInfo) {
     cierreInfo.notas = 'stock_before:' + JSON.stringify(base);
   }
 
-  escribirStockDesdeBase(stockSheet, base, delta);
+  var faltantes = escribirStockDesdeBase(stockSheet, base, delta);
   cierreInfo.sheet.getRange(cierreInfo.row, cierreInfo.notasIdx + 1).setValue('stock_ok');
   cierreInfo.notas = 'stock_ok';
+  return faltantes;
 }
 
 function actualizarStockBebidas(fecha) {
@@ -3244,17 +3592,22 @@ function createCajaMovimiento(data) {
   const sheet = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
   const id = generateId();
   const monto = normalizeAmount(data.monto);
+  const tipoMovimiento = String(data.tipo || '').toLowerCase();
+  if (tipoMovimiento !== 'ingreso' && tipoMovimiento !== 'egreso') {
+    throw new Error('El tipo de movimiento tiene que ser ingreso o egreso');
+  }
+  if (monto <= 0) throw new Error('El monto tiene que ser mayor a cero');
   
   sheet.appendRow([
     id,
     data.fecha || todayArgentina(),
-    data.tipo,
+    tipoMovimiento,
     monto,
     data.nota || '',
     data.referencia || ''
   ]);
   
-  return { id: id, ...data, monto: monto };
+  return { id: id, ...data, tipo: tipoMovimiento, monto: monto };
 }
 
 // ========== FLUJO — DÍAS PENDIENTES ==========
@@ -3550,6 +3903,7 @@ function deleteHistorial(id) {
 function testConexion() {
   try {
     Logger.log('🧪 Iniciando prueba de conexión...');
+    setTenant_(Object.keys(CONFIG.USERS)[0]);
     
     // Probar obtener la hoja de cálculo
     const ss = getSpreadsheet();
@@ -3861,12 +4215,16 @@ function getConfiguracionNotificaciones() {
     config[clave] = valor;
   }
   
-  // Valores por defecto si no existen
-  if (!config.email_notificaciones) {
-    config.email_notificaciones = CONFIG.DEFAULT_EMAIL;
+  // Las hojas creadas antes de este cambio guardaron como "email" una dirección ajena
+  // (admin@lucianocargas.com) con las alertas activadas: se la trata como no configurada.
+  if (String(config.email_notificaciones || '').trim().toLowerCase() === 'admin@lucianocargas.com') {
+    config.email_notificaciones = '';
   }
-  if (config.notificaciones_activas === undefined) {
-    config.notificaciones_activas = true;
+  if (!config.email_notificaciones) {
+    config.email_notificaciones = '';
+  }
+  if (config.notificaciones_activas === undefined || !config.email_notificaciones) {
+    config.notificaciones_activas = false;
   }
   if (!config.hora_verificacion) {
     config.hora_verificacion = '09:00';
@@ -3911,9 +4269,13 @@ function verificarStockBajo() {
     // Obtener configuración
     const config = getConfiguracionNotificaciones();
     
+    if (!config.email_notificaciones) {
+      Logger.log('⚠️ No hay email configurado: no se envía nada');
+      return { success: false, message: 'Todavía no configuraste un email para las alertas. Entrá a "Configurar notificaciones", poné tu email y activalas.', productos: [] };
+    }
     if (!config.notificaciones_activas) {
       Logger.log('⚠️ Notificaciones desactivadas');
-      return { success: false, message: 'Notificaciones desactivadas' };
+      return { success: false, message: 'Las notificaciones están desactivadas. Activalas en "Configurar notificaciones".', productos: [] };
     }
     
     // Obtener stock
@@ -3959,7 +4321,7 @@ function enviarEmailStockBajo(productos, destinatario) {
     
     // Validar que hay un email de destinatario
     if (!destinatario || destinatario === '') {
-      destinatario = CONFIG.DEFAULT_EMAIL;
+      throw new Error('No hay email de destino: configurá uno en "Configurar notificaciones".');
     }
     
     // Limpiar y procesar múltiples emails
@@ -4074,10 +4436,12 @@ function enviarEmailStockBajo(productos, destinatario) {
 function verificarStockBajoProgramado() {
   Logger.log('🔔 Ejecutando verificación programada de stock...');
   try {
-    const resultado = ejecutarConReintentos(function() {
-      return verificarStockBajo();
-    }, 3, 4000);
-    Logger.log('✅ Verificación programada OK: ' + JSON.stringify(resultado));
+    paraCadaUsuario_(function(email) {
+      const resultado = ejecutarConReintentos(function() {
+        return verificarStockBajo();
+      }, 3, 4000);
+      Logger.log('✅ Verificación programada OK para ' + email + ': ' + JSON.stringify(resultado));
+    });
   } catch (error) {
     Logger.log('❌ Verificación programada falló tras reintentos: ' + error.toString());
     Logger.log(error.stack || '');
@@ -4092,6 +4456,7 @@ function verificarStockBajoProgramado() {
 function testNotificaciones() {
   try {
     Logger.log('🧪 Probando sistema de notificaciones...');
+    setTenant_(Object.keys(CONFIG.USERS)[0]);
     
     const config = getConfiguracionNotificaciones();
     Logger.log('📧 Email configurado: ' + config.email_notificaciones);
@@ -4246,7 +4611,7 @@ function handleLogin(email, password) {
     email = email.toLowerCase().trim();
     
     // Verificar si el usuario existe en CONFIG.USERS
-    if (!CONFIG.USERS[email]) {
+    if (!usuarioConfig_(email)) {
       Logger.log('❌ Usuario no encontrado: ' + email);
       return {
         success: false,
@@ -4255,7 +4620,7 @@ function handleLogin(email, password) {
     }
     
     // Verificar contraseña
-    if (CONFIG.USERS[email] !== password) {
+    if (usuarioConfig_(email).password !== password) {
       Logger.log('❌ Contraseña incorrecta para: ' + email);
       return {
         success: false,
@@ -4264,7 +4629,8 @@ function handleLogin(email, password) {
     }
     
     // Login exitoso - generar token simple
-    const token = Utilities.base64Encode(email + ':' + new Date().getTime());
+    setTenant_(email); // si es su primera vez, se crea su hoja ahora
+    const token = crearToken_(email);
     
     Logger.log('✅ Login exitoso para: ' + email);
     
@@ -4272,6 +4638,9 @@ function handleLogin(email, password) {
       success: true,
       token: token,
       email: email,
+      // Primeros caracteres del ID de la hoja de este usuario: la pantalla lo muestra para poder
+      // comprobar a simple vista que cada usuario trabaja con una hoja distinta.
+      hoja: String(_tenant.spreadsheetId).substring(0, 6),
       message: 'Login exitoso'
     };
     

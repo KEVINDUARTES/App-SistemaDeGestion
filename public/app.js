@@ -460,7 +460,7 @@ const DiaOperativo = {
         banner.hidden = false;
         banner.innerHTML = `
             <div class="pendientes-banner-text">
-                <strong>${paso.detalle}</strong>
+                <strong>${Utils.esc(paso.detalle)}</strong>
                 <span class="pendientes-banner-fecha">${this.formatFechaLabel(foco.fecha)}</span>
                 ${items ? `<ul>${items}</ul>` : ''}
             </div>
@@ -539,6 +539,15 @@ const Utils = {
         if (!raw) return 0;
 
         const isNegative = raw.startsWith('-');
+        // "10,5" / "1.500,50" / "10.5": 1 o 2 decimales. "5.000" (3 dígitos) son miles.
+        const limpio = raw.replace(/[^\d.,]/g, '');
+        let decimal = null;
+        if (/^[\d.]*\d,\d{1,2}$/.test(limpio)) decimal = parseFloat(limpio.replace(/\./g, '').replace(',', '.'));
+        else if (/^\d+\.\d{1,2}$/.test(limpio)) decimal = parseFloat(limpio);
+        if (decimal !== null && Number.isFinite(decimal)) {
+            const redondeado = Math.round(decimal);
+            return isNegative ? -redondeado : redondeado;
+        }
         const digits = raw.replace(/\D/g, '');
         if (!digits) return 0;
 
@@ -1072,6 +1081,19 @@ const Utils = {
         this.hideLoader(container);
     },
 
+    // Todo texto que viene de la hoja (nombres, teléfonos, notas) se escapa antes de ir a innerHTML.
+    esc(valor) {
+        return String(valor === undefined || valor === null ? '' : valor).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    },
+
+    sinUndefined(obj) {
+        const limpio = {};
+        Object.keys(obj).forEach(k => { if (obj[k] !== undefined) limpio[k] = obj[k]; });
+        return limpio;
+    },
+
     upsertInList(list, item, idField = 'id') {
         const idx = list.findIndex(x => String(x[idField]) === String(item[idField]));
         if (idx >= 0) {
@@ -1121,6 +1143,107 @@ const Utils = {
     }
 };
 
+// Varias personas usan la app a la vez (a veces con el mismo usuario).
+// El servidor cuenta cada escritura (`ver`). Si ese número salta sin que lo haya
+// causado esta pestaña, otra persona cambió datos: se descarta la memoria local
+// y se vuelve a leer lo que se está mirando.
+const Sync = {
+    ver: null,
+    escribiendo: 0,
+    INTERVALO: 40000,
+    REINTENTO: 4000,
+    _timer: null,
+    _chequeando: false,
+    _pendiente: false,
+    _aplicando: false,
+
+    observar(ver, esEscritura) {
+        const nueva = Number(ver);
+        if (!Number.isFinite(nueva)) return;
+        if (this.ver === null) {
+            this.ver = nueva;
+            return;
+        }
+        if (nueva === this.ver) return;
+        // Una escritura propia suma exactamente 1. Cualquier otro salto es de otra persona.
+        const soloMia = esEscritura === true && nueva === this.ver + 1;
+        if (nueva > this.ver) this.ver = nueva;
+        if (!soloMia) this._pedirRefresco();
+    },
+
+    iniciar() {
+        if (this._timer) return;
+        this._timer = setInterval(() => this.chequear(), this.INTERVALO);
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) this.chequear();
+        });
+        window.addEventListener('focus', () => this.chequear());
+    },
+
+    async chequear() {
+        if (document.hidden || this._chequeando) return;
+        this._chequeando = true;
+        try {
+            // La respuesta pasa por observar(); no hace falta mirar el resultado.
+            await API._executeRequest('app/version', 'GET', null, 1);
+        } catch (error) {
+            // Sin conexión: se reintenta en el próximo ciclo.
+        } finally {
+            this._chequeando = false;
+        }
+    },
+
+    _ocupado() {
+        if (this.escribiendo > 0) return true;
+        if (document.querySelector('#modal-overlay.active, #custom-alert-overlay.active, #custom-confirm-overlay.active')) return true;
+        const el = document.activeElement;
+        return !!(el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) && el.closest('.main-content, main, .page'));
+    },
+
+    _pedirRefresco() {
+        this._pendiente = true;
+        this._intentarRefresco();
+    },
+
+    async _intentarRefresco() {
+        if (!this._pendiente || this._aplicando) return;
+        if (this._ocupado()) {
+            // Alguien está tipeando o hay un diálogo abierto: no se le pisa lo que hace.
+            clearTimeout(this._espera);
+            this._espera = setTimeout(() => this._intentarRefresco(), this.REINTENTO);
+            return;
+        }
+        this._pendiente = false;
+        this._aplicando = true;
+        try {
+            await this.refrescar();
+            Utils.avisar('Se actualizaron datos cargados por otra persona');
+        } catch (error) {
+            console.warn('No se pudo actualizar con los cambios de otra persona:', error);
+            this._pendiente = true;
+            clearTimeout(this._espera);
+            this._espera = setTimeout(() => this._intentarRefresco(), this.REINTENTO * 4);
+        } finally {
+            this._aplicando = false;
+        }
+    },
+
+    async refrescar() {
+        CacheManager.clear();
+        AppState.fechaCargada = null;
+        if (typeof CobranzasHoy !== 'undefined') {
+            CobranzasHoy._lastTotales = [];
+            CobranzasHoy._fechaTotales = null;
+        }
+        DataLoader.invalidateFlujo(AppState.currentDate);
+        // Una sola lectura trae catálogo, día y cobranzas.
+        await API.getBootstrap(AppState.currentDate, true);
+        CacheManager.hydrateAppStateFromCache();
+        try { await DiaOperativo.refresh(); } catch (error) { /* se recalcula al navegar */ }
+        await Navigation.loadPageData(AppState.currentPage);
+    }
+};
+
 // API Client
 const API = {
     _pending: {},
@@ -1138,9 +1261,12 @@ const API = {
             return this._pending[dedupKey];
         }
 
+        const escribe = method !== 'GET';
+        if (escribe) Sync.escribiendo++;
         const promise = this._executeRequest(endpoint, method, data, retryCount)
             .finally(() => {
                 delete this._pending[dedupKey];
+                if (escribe) Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
             });
 
         this._pending[dedupKey] = promise;
@@ -1159,7 +1285,7 @@ const API = {
             const callbackName = 'apiCallback_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
             const timeoutMs = data?.__timeout || 30000;
 
-            let url = `${API_CONFIG.baseUrl}?endpoint=${encodeURIComponent(endpoint)}&method=${encodeURIComponent(method)}&apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&callback=${callbackName}`;
+            let url = `${API_CONFIG.baseUrl}?endpoint=${encodeURIComponent(endpoint)}&method=${encodeURIComponent(method)}&apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&token=${encodeURIComponent(Auth.getToken())}&callback=${callbackName}${method !== 'GET' ? `&rid=${callbackName}` : ''}`;
 
             if (data) {
                 Object.keys(data).forEach(key => {
@@ -1188,18 +1314,54 @@ const API = {
 
             const guardarTarde = (response) => {
                 const ok = response && (response.success === true || response.success === 'true');
-                const payload = ok ? (response.data || response) : null;
-                if (!payload || endpoint !== 'flujo/dia' || !data || !data.fecha) return;
-                const fechaResp = data.fecha;
-                CacheManager.set(`flujo:${fechaResp}`, payload);
-                if (payload.pedidos) CacheManager.set(`pedidos:${fechaResp}`, payload.pedidos);
-                if (payload.recepcion) CacheManager.set(`recepcion:${fechaResp}`, payload.recepcion);
-                if (payload.precios) CacheManager.set(`precios:${fechaResp}`, payload.precios);
-                if (AppState.currentPage === 'pedidos' && AppState.currentDate === fechaResp) {
-                    AppState.pedidos = payload.pedidos || [];
-                    Pedidos.aplicarEnviadosLocales();
-                    Pedidos.render();
-                    Utils.hideLoader(document.getElementById('pedidos-tbody'));
+                if (response && response.ver !== undefined) Sync.observar(response.ver, method !== 'GET');
+                if (!ok) return;
+                const payload = response.data || response;
+
+                if (endpoint === 'flujo/dia' && data && data.fecha) {
+                    const fechaResp = data.fecha;
+                    CacheManager.set(`flujo:${fechaResp}`, payload);
+                    if (payload.pedidos) CacheManager.set(`pedidos:${fechaResp}`, payload.pedidos);
+                    if (payload.recepcion) CacheManager.set(`recepcion:${fechaResp}`, payload.recepcion);
+                    if (payload.precios) CacheManager.set(`precios:${fechaResp}`, payload.precios);
+                    if (AppState.currentPage === 'pedidos' && AppState.currentDate === fechaResp) {
+                        AppState.pedidos = payload.pedidos || [];
+                        Pedidos.aplicarEnviadosLocales();
+                        Pedidos.render();
+                        Utils.hideLoader(document.getElementById('pedidos-tbody'));
+                    }
+                    return;
+                }
+
+                // El redirect de Google a veces hace fallar el cliente aunque el script ya escribió.
+                // Solo se aplican los campos que se mandaron: si no, se pisarían con vacío.
+                const activoDe = (v) => {
+                    if (v === undefined) return undefined;
+                    if (v === false || v === 'false' || v === 0 || v === '0') return false;
+                    if (v === true || v === 'true' || v === 1 || v === '1') return true;
+                    return v;
+                };
+                if (endpoint === 'clientes/update' && data && data.id) {
+                    Utils.upsertInList(AppState.clientes, Utils.sinUndefined({
+                        id: data.id,
+                        nombre: data.nombre,
+                        telefono: data.telefono === undefined ? undefined : (data.telefono || ''),
+                        activo: activoDe(data.activo)
+                    }));
+                    CacheManager.set('clientes', AppState.clientes);
+                    if (AppState.currentPage === 'clientes') Clientes.render();
+                    return;
+                }
+                if (endpoint === 'proveedores/update' && data && data.id) {
+                    Utils.upsertInList(AppState.proveedores, Utils.sinUndefined({
+                        id: data.id,
+                        nombre: data.nombre,
+                        rubro: data.rubro,
+                        telefono: data.telefono === undefined ? undefined : (data.telefono || ''),
+                        activo: activoDe(data.activo)
+                    }));
+                    CacheManager.set('proveedores', AppState.proveedores);
+                    if (AppState.currentPage === 'proveedores') ProveedoresGestion.render();
                 }
             };
 
@@ -1234,6 +1396,13 @@ const API = {
                     finish(reject, new Error('No se recibió respuesta del servidor'));
                     return;
                 }
+                if (response.sesion === false) {
+                    // La sesión venció o no es válida: se vuelve a la pantalla de ingreso.
+                    Auth.logout();
+                    finish(reject, new Error(response.error || 'Tu sesión venció. Volvé a iniciar sesión.'));
+                    return;
+                }
+                if (response.ver !== undefined) Sync.observar(response.ver, method !== 'GET');
                 if (response.success === true || response.success === 'true') {
                     finish(resolve, response.data || response);
                 } else {
@@ -1244,16 +1413,10 @@ const API = {
             scriptTag = document.createElement('script');
             scriptTag.src = url;
             scriptTag.async = true;
+            // El redirect de Google dispara onerror aunque el callback después llegue bien.
+            // No cancelamos el pedido: esperamos el callback o el timeout real.
             scriptTag.onerror = () => {
-                console.error('❌ JSONP onerror - endpoint:', endpoint, '- URL:', url.substring(0, 120) + '...');
-                const hint = endpoint === 'cierre'
-                    ? ' El cierre puede tardar. Revisá la URL en auth.js y volvé a publicar Code.gs.'
-                    : ' Verificá que el Apps Script esté publicado (Deploy → Manage Deployments) y que la URL en auth.js sea correcta.';
-                // El redirect de Google suele disparar onerror antes de que llegue el callback.
-                setTimeout(() => {
-                    if (settledRequest) return;
-                    fail(new Error('No se pudo conectar con el servidor.' + hint), true);
-                }, 4000);
+                console.warn('JSONP onerror (se sigue esperando):', endpoint);
             };
 
             timeoutId = setTimeout(() => {
@@ -1271,6 +1434,24 @@ const API = {
         return msg.includes('No se pudo conectar')
             || msg.includes('tardó más de')
             || msg.includes('No se recibió respuesta');
+    },
+
+    // Tras un corte de red no se sabe si el servidor llegó a guardar: se lee de nuevo y se compara.
+    async verificarGuardado(tipo, id, esperado) {
+        try {
+            const lista = await this._listaFresca(tipo, tipo);
+            const hallado = lista.find(item => String(item.id) === String(id));
+            if (!hallado) return false;
+            const esActivo = v => !(v === false || v === 'false' || v === 0 || v === '0');
+            return Object.keys(esperado).every(campo => {
+                if (campo === 'id') return true;
+                if (campo === 'activo') return esActivo(hallado.activo) === esActivo(esperado.activo);
+                return String(hallado[campo] === undefined || hallado[campo] === null ? '' : hallado[campo]).trim()
+                    === String(esperado[campo] === undefined || esperado[campo] === null ? '' : esperado[campo]).trim();
+            });
+        } catch (error) {
+            return false;
+        }
     },
 
     async _listaFresca(cacheKey, endpoint, params) {
@@ -1340,8 +1521,10 @@ const API = {
     
     async updateCliente(id, data) {
         data.id = id;
+        data.__timeout = 60000;
         const result = await this.request('clientes/update', 'POST', data);
         CacheManager.invalidate('clientes');
+        CacheManager.invalidatePattern('bootstrap:');
         return result;
     },
     
@@ -1389,8 +1572,10 @@ const API = {
     
     async updateProveedor(id, data) {
         data.id = id;
+        data.__timeout = 60000;
         const result = await this.request('proveedores/update', 'POST', data);
         CacheManager.invalidate('proveedores');
+        CacheManager.invalidatePattern('bootstrap:');
         return result;
     },
     
@@ -1742,6 +1927,9 @@ const API = {
     async savePreciosCliente(data) {
         const result = await this.request('precios-cliente', 'POST', data);
         DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
+        // Los totales a cobrar salen de estos precios: lo guardado antes quedó viejo.
+        CacheManager.invalidatePattern('cobranzas');
+        if (typeof CobranzasHoy !== 'undefined') CobranzasHoy._fechaTotales = null;
         this._invalidateFlujo();
         return result;
     },
@@ -2322,8 +2510,8 @@ const Clientes = {
             
             rowsHtml += `
                 <tr${inactiveStyle}>
-                    <td>${cliente.nombre || ''}</td>
-                    <td>${cliente.telefono || ''}</td>
+                    <td>${Utils.esc(cliente.nombre || '')}</td>
+                    <td>${Utils.esc(cliente.telefono || '')}</td>
                     <td><span class="status-badge ${esActivo ? 'status-activo' : 'status-inactivo'}">${esActivo ? 'Activo' : 'Inactivo'}</span></td>
                     <td>
                         <button class="btn btn-secondary" onclick="Clientes.edit('${cliente.id}')">Editar</button>
@@ -2358,7 +2546,7 @@ const Clientes = {
             
             if (!nombre) {
                 Utils.showError('El nombre es obligatorio');
-                return;
+                return true;
             }
             
             try {
@@ -2378,7 +2566,8 @@ const Clientes = {
                     Utils.upsertInList(AppState.clientes, nuevo);
                     CacheManager.set('clientes', AppState.clientes);
                     Clientes.render();
-                    Utils.showSuccess('Cliente agregado correctamente');
+                    if (result.existente) Utils.showInfo('Ya existía un cliente con ese nombre: no se creó otro.');
+                    else Utils.showSuccess('Cliente agregado correctamente');
                 } else {
                     throw new Error(result?.error || 'No se pudo crear el cliente');
                 }
@@ -2399,16 +2588,16 @@ const Clientes = {
         const content = `
             <div class="form-group">
                 <label>Nombre</label>
-                <input type="text" id="modal-cliente-nombre" class="form-control" value="${cliente.nombre || ''}" required>
+                <input type="text" id="modal-cliente-nombre" class="form-control" value="${Utils.esc(cliente.nombre || '')}" required>
             </div>
             <div class="form-group">
                 <label>Teléfono (WhatsApp)</label>
-                <input type="text" id="modal-cliente-telefono" class="form-control" value="${cliente.telefono || ''}">
+                <input type="text" id="modal-cliente-telefono" class="form-control" value="${Utils.esc(cliente.telefono || '')}">
                 <small>Necesario para enviar precios por WhatsApp</small>
             </div>
             <div class="form-group">
                 <label>
-                    <input type="checkbox" id="modal-cliente-activo" ${cliente.activo ? 'checked' : ''}>
+                    <input type="checkbox" id="modal-cliente-activo" ${cliente.activo === true || cliente.activo === 'true' || cliente.activo === 1 ? 'checked' : ''}>
                     Activo
                 </label>
             </div>
@@ -2421,67 +2610,71 @@ const Clientes = {
             
             if (!nombre) {
                 Utils.showError('El nombre es obligatorio');
-                return;
+                return true;
             }
-            
-            try {
+
+            const anterior = { ...cliente };
+            const datos = { id, nombre, telefono, activo };
+            Utils.upsertInList(AppState.clientes, datos);
+            CacheManager.set('clientes', AppState.clientes);
+            Clientes.render();
+            Utils.avisar('Cliente actualizado');
+
+            Utils.enSegundoPlano(async () => {
                 await API.updateCliente(id, {
-                    nombre: nombre,
-                    telefono: telefono,
-                    activo: activo
-                });
-                Utils.upsertInList(AppState.clientes, {
-                    id,
                     nombre,
                     telefono,
                     activo
                 });
                 CacheManager.set('clientes', AppState.clientes);
+            }, async (error) => {
+                if (API._esCorteDeConexion(error) && await API.verificarGuardado('clientes', id, datos)) {
+                    AppState.clientes = CacheManager.peek('clientes') || AppState.clientes;
+                    Clientes.render();
+                    return;
+                }
+                Utils.upsertInList(AppState.clientes, anterior);
+                CacheManager.set('clientes', AppState.clientes);
                 Clientes.render();
-                Utils.showSuccess('Cliente actualizado correctamente');
-            } catch (error) {
-                console.error('Error updating cliente:', error);
-                Utils.showError('Error al actualizar cliente: ' + error.message);
-            }
+                Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo guardar el cliente. Revisá la conexión y volvé a intentar.' : 'No se pudo guardar el cliente: ' + error.message);
+            });
         });
     },
     
     async toggleActivo(id, activoActual) {
-        const cliente = AppState.clientes.find(c => c.id === id);
+        const cliente = AppState.clientes.find(c => String(c.id) === String(id));
         if (!cliente) {
             Utils.showError('Cliente no encontrado');
             return;
         }
-        
-        // Debug logs
-        console.log('🔵 toggleActivo - ID:', id);
-        console.log('🔵 toggleActivo - activoActual tipo:', typeof activoActual, 'valor:', activoActual);
-        console.log('🔵 toggleActivo - cliente.activo tipo:', typeof cliente.activo, 'valor:', cliente.activo);
-        
-        // Convertir activoActual a booleano explícitamente
-        const activoBoolean = activoActual === true || activoActual === 'true';
+
+        const activoBoolean = activoActual === true || activoActual === 'true' || activoActual === 1;
         const nuevoEstado = !activoBoolean;
-        
-        console.log('🔵 toggleActivo - nuevo estado:', nuevoEstado);
-        
         const accion = activoBoolean ? 'desactivar' : 'activar';
         const confirmar = await Utils.showConfirm(`¿Está seguro de ${accion} este cliente?`);
         if (!confirmar) return;
-        
-        try {
-            await API.updateCliente(id, {
-                nombre: cliente.nombre,
-                telefono: cliente.telefono || '',
-                activo: nuevoEstado
-            });
-            Utils.upsertInList(AppState.clientes, { id, activo: nuevoEstado });
+
+        const anterior = { ...cliente };
+        Utils.upsertInList(AppState.clientes, { id: cliente.id, activo: nuevoEstado });
+        CacheManager.set('clientes', AppState.clientes);
+        Clientes.render();
+        Utils.avisar(`Cliente ${activoBoolean ? 'desactivado' : 'activado'}`);
+
+        Utils.enSegundoPlano(async () => {
+            // Solo el estado: así no se pisa un nombre que otra persona acaba de editar.
+            await API.updateCliente(cliente.id, { activo: nuevoEstado });
+            CacheManager.set('clientes', AppState.clientes);
+        }, async (error) => {
+            if (API._esCorteDeConexion(error) && await API.verificarGuardado('clientes', cliente.id, { activo: nuevoEstado })) {
+                AppState.clientes = CacheManager.peek('clientes') || AppState.clientes;
+                Clientes.render();
+                return;
+            }
+            Utils.upsertInList(AppState.clientes, anterior);
             CacheManager.set('clientes', AppState.clientes);
             Clientes.render();
-            Utils.showSuccess(`Cliente ${activoBoolean ? 'desactivado' : 'activado'} correctamente`);
-        } catch (error) {
-            console.error('❌ Error toggling cliente activo:', error);
-            Utils.showError('Error al cambiar estado del cliente: ' + error.message);
-        }
+            Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo cambiar el estado del cliente. Revisá la conexión y volvé a intentar.' : 'No se pudo cambiar el estado del cliente: ' + error.message);
+        });
     },
     
     async delete(id) {
@@ -2491,7 +2684,7 @@ const Clientes = {
             return;
         }
         
-        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente a "${cliente.nombre}"?\n\nEsta acción NO se puede deshacer y se eliminarán:\n- Todos los pedidos de este cliente\n- Todas las cobranzas asociadas\n- Todo el historial\n\n¿Desea continuar?`;
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente a "${cliente.nombre}"?\n\nEsta acción NO se puede deshacer.\n\nSolo se puede eliminar si nunca tuvo pedidos ni cobranzas. Si ya trabajó con él, usá Desactivar para conservar el historial.\n\n¿Desea continuar?`;
         
         const confirmar = await Utils.showConfirm(confirmMsg);
         if (!confirmar) return;
@@ -2561,9 +2754,9 @@ const Productos = {
             
             rowsHtml += `
                 <tr>
-                    <td>${producto.nombre || ''}</td>
+                    <td>${Utils.esc(producto.nombre || '')}</td>
                     <td><span class="status-badge ${tipoBadgeClass}">${producto.tipo || ''}</span></td>
-                    <td>${producto.unidad || ''}</td>
+                    <td>${Utils.esc(producto.unidad || '')}</td>
                     <td>${proveedor ? proveedor.nombre : 'Sin proveedor'}</td>
                     <td>
                         <button class="btn btn-secondary" onclick="Productos.edit('${producto.id}')">Editar</button>
@@ -2611,7 +2804,7 @@ const Productos = {
                 <label>Proveedor predeterminado</label>
                 <select id="modal-producto-proveedor" class="form-control">
                     <option value="">Sin proveedor</option>
-                    ${proveedores.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('')}
+                    ${proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
                 <small>Si no tienes proveedores, puedes agregarlo después</small>
             </div>
@@ -2625,7 +2818,7 @@ const Productos = {
             
             if (!nombre || !tipo || !unidad) {
                 Utils.showError('Complete todos los campos obligatorios');
-                return;
+                return true;
             }
             
             try {
@@ -2650,7 +2843,8 @@ const Productos = {
                     Utils.upsertInList(AppState.productos, nuevo);
                     CacheManager.set('productos', AppState.productos);
                     Productos.render();
-                    Utils.showSuccess('Producto agregado correctamente');
+                    if (result.existente) Utils.showInfo('Ya existía un producto con ese nombre: no se creó otro.');
+                    else Utils.showSuccess('Producto agregado correctamente');
                 } else {
                     throw new Error(result?.error || 'No se pudo crear el producto');
                 }
@@ -2667,7 +2861,7 @@ const Productos = {
                 if (!select) return;
                 const elegido = select.value;
                 select.innerHTML = '<option value="">Sin proveedor</option>' +
-                    AppState.proveedores.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('');
+                    AppState.proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('');
                 if (elegido) select.value = elegido;
             }).catch(() => {});
         }
@@ -2685,7 +2879,7 @@ const Productos = {
         const content = `
             <div class="form-group">
                 <label>Nombre del producto</label>
-                <input type="text" id="modal-producto-nombre" class="form-control" value="${producto.nombre || ''}" required>
+                <input type="text" id="modal-producto-nombre" class="form-control" value="${Utils.esc(producto.nombre || '')}" required>
             </div>
             <div class="form-group">
                 <label>Tipo</label>
@@ -2708,7 +2902,7 @@ const Productos = {
                 <label>Proveedor predeterminado</label>
                 <select id="modal-producto-proveedor" class="form-control">
                     <option value="">Sin proveedor</option>
-                    ${proveedores.map(p => `<option value="${p.id}" ${p.id === producto.proveedor_default ? 'selected' : ''}>${p.nombre}</option>`).join('')}
+                    ${proveedores.map(p => `<option value="${p.id}" ${p.id === producto.proveedor_default ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
             </div>
         `;
@@ -2721,7 +2915,7 @@ const Productos = {
             
             if (!nombre || !tipo || !unidad) {
                 Utils.showError('Complete todos los campos obligatorios');
-                return;
+                return true;
             }
             
             try {
@@ -2762,7 +2956,7 @@ const Productos = {
             return;
         }
 
-        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente "${producto.nombre}"?\n\nEsta acción NO se puede deshacer.\n\n¿Desea continuar?`;
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente "${producto.nombre}"?\n\nEsta acción NO se puede deshacer.\n\nSolo se puede eliminar si nunca se usó en pedidos, recepciones ni precios.\n\n¿Desea continuar?`;
 
         const confirmar = await Utils.showConfirm(confirmMsg);
         if (!confirmar) return;
@@ -2860,8 +3054,8 @@ const ProveedoresGestion = {
             
             rowsHtml += `
                 <tr${inactiveStyle}>
-                    <td>${proveedor.nombre || ''}</td>
-                    <td>${proveedor.rubro || ''}</td>
+                    <td>${Utils.esc(proveedor.nombre || '')}</td>
+                    <td>${Utils.esc(proveedor.rubro || '')}</td>
                     <td>${(proveedor.telefono && !String(proveedor.telefono).startsWith('#')) ? proveedor.telefono : '-'}</td>
                     <td><span class="status-badge ${esActivo ? 'status-activo' : 'status-inactivo'}">${esActivo ? 'Activo' : 'Inactivo'}</span></td>
                     <td>
@@ -2906,7 +3100,7 @@ const ProveedoresGestion = {
             
             if (!nombre || !rubro) {
                 Utils.showError('Complete todos los campos obligatorios');
-                return;
+                return true;
             }
             
             try {
@@ -2947,7 +3141,7 @@ const ProveedoresGestion = {
         const content = `
             <div class="form-group">
                 <label>Nombre del proveedor</label>
-                <input type="text" id="modal-proveedor-nombre" class="form-control" value="${proveedor.nombre || ''}" required>
+                <input type="text" id="modal-proveedor-nombre" class="form-control" value="${Utils.esc(proveedor.nombre || '')}" required>
             </div>
             <div class="form-group">
                 <label>Rubro</label>
@@ -2960,7 +3154,7 @@ const ProveedoresGestion = {
             </div>
             <div class="form-group">
                 <label>Teléfono (WhatsApp)</label>
-                <input type="tel" id="modal-proveedor-telefono" class="form-control" value="${proveedor.telefono || ''}" placeholder="Ej: 11 2345-6789">
+                <input type="tel" id="modal-proveedor-telefono" class="form-control" value="${Utils.esc(proveedor.telefono || '')}" placeholder="Ej: 11 2345-6789">
                 <small>Necesario para enviar pedidos por WhatsApp</small>
             </div>
             <div class="form-group">
@@ -2979,19 +3173,18 @@ const ProveedoresGestion = {
             
             if (!nombre || !rubro) {
                 Utils.showError('Complete todos los campos obligatorios');
-                return;
+                return true;
             }
-            
-            try {
+
+            const anterior = { ...proveedor };
+            const datos = { id, nombre, rubro, telefono, activo };
+            Utils.upsertInList(AppState.proveedores, datos);
+            CacheManager.set('proveedores', AppState.proveedores);
+            ProveedoresGestion.render();
+            Utils.avisar('Proveedor actualizado');
+
+            Utils.enSegundoPlano(async () => {
                 await API.updateProveedor(id, {
-                    id: id,
-                    nombre: nombre,
-                    rubro: rubro,
-                    telefono: telefono,
-                    activo: activo
-                });
-                
-                Utils.upsertInList(AppState.proveedores, {
                     id,
                     nombre,
                     rubro,
@@ -2999,12 +3192,17 @@ const ProveedoresGestion = {
                     activo
                 });
                 CacheManager.set('proveedores', AppState.proveedores);
+            }, async (error) => {
+                if (API._esCorteDeConexion(error) && await API.verificarGuardado('proveedores', id, datos)) {
+                    AppState.proveedores = CacheManager.peek('proveedores') || AppState.proveedores;
+                    ProveedoresGestion.render();
+                    return;
+                }
+                Utils.upsertInList(AppState.proveedores, anterior);
+                CacheManager.set('proveedores', AppState.proveedores);
                 ProveedoresGestion.render();
-                Utils.showSuccess('Proveedor actualizado correctamente');
-            } catch (error) {
-                console.error('Error updating proveedor:', error);
-                Utils.showError('Error al actualizar proveedor: ' + error.message);
-            }
+                Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo guardar el proveedor. Revisá la conexión y volvé a intentar.' : 'No se pudo guardar el proveedor: ' + error.message);
+            });
         });
     },
     
@@ -3015,28 +3213,32 @@ const ProveedoresGestion = {
             return;
         }
 
-        const activoBoolean = activoActual === true || activoActual === 'true';
+        const activoBoolean = activoActual === true || activoActual === 'true' || activoActual === 1;
         const nuevoEstado = !activoBoolean;
         const accion = activoBoolean ? 'desactivar' : 'activar';
         const confirmar = await Utils.showConfirm(`¿Está seguro de ${accion} este proveedor?`);
         if (!confirmar) return;
-        
-        try {
-            await API.updateProveedor(proveedor.id, {
-                id: proveedor.id,
-                nombre: proveedor.nombre,
-                rubro: proveedor.rubro,
-                telefono: proveedor.telefono || '',
-                activo: nuevoEstado
-            });
-            Utils.upsertInList(AppState.proveedores, { id, activo: nuevoEstado });
+
+        const anterior = { ...proveedor };
+        Utils.upsertInList(AppState.proveedores, { id: proveedor.id, activo: nuevoEstado });
+        CacheManager.set('proveedores', AppState.proveedores);
+        this.render();
+        Utils.avisar(`Proveedor ${activoBoolean ? 'desactivado' : 'activado'}`);
+
+        Utils.enSegundoPlano(async () => {
+            await API.updateProveedor(proveedor.id, { activo: nuevoEstado });
+            CacheManager.set('proveedores', AppState.proveedores);
+        }, async (error) => {
+            if (API._esCorteDeConexion(error) && await API.verificarGuardado('proveedores', proveedor.id, { activo: nuevoEstado })) {
+                AppState.proveedores = CacheManager.peek('proveedores') || AppState.proveedores;
+                this.render();
+                return;
+            }
+            Utils.upsertInList(AppState.proveedores, anterior);
             CacheManager.set('proveedores', AppState.proveedores);
             this.render();
-            Utils.showSuccess(`Proveedor ${activoBoolean ? 'desactivado' : 'activado'} correctamente`);
-        } catch (error) {
-            console.error('❌ Error toggling proveedor activo:', error);
-            Utils.showError('Error al cambiar estado del proveedor: ' + error.message);
-        }
+            Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo cambiar el estado del proveedor. Revisá la conexión y volvé a intentar.' : 'No se pudo cambiar el estado del proveedor: ' + error.message);
+        });
     },
     
     async delete(id) {
@@ -3046,7 +3248,7 @@ const ProveedoresGestion = {
             return;
         }
         
-        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente a "${proveedor.nombre}"?\n\nEsta acción NO se puede deshacer y se eliminarán:\n- Todos los registros relacionados con este proveedor\n- Todo el historial\n\n¿Desea continuar?`;
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente a "${proveedor.nombre}"?\n\nEsta acción NO se puede deshacer.\n\nSolo se puede eliminar si nunca tuvo pedidos, recepciones ni pagos. Si ya trabajó con él, usá Desactivar para conservar el historial.\n\n¿Desea continuar?`;
         
         const confirmar = await Utils.showConfirm(confirmMsg);
         if (!confirmar) return;
@@ -3295,7 +3497,7 @@ const Camiones = {
                     <button type="button" data-accion="quitar-cliente" data-camion="${camion.id}" data-cliente="${id}" aria-label="Sacar cliente">×</button>
                 </span>
             `).join('');
-            const opciones = libres.map(c => `<option value="${c.id}">${this._esc(c.nota ? `${c.nombre} · ${c.nota}` : c.nombre)}</option>`).join('');
+            const opciones = libres.map(c => `<option value="${c.id}">${this._esc(c.nota ? `${Utils.esc(c.nombre)} · ${Utils.esc(c.nota)}` : c.nombre)}</option>`).join('');
             return `
                 <article class="camion-card">
                     <div class="camion-card-top">
@@ -3922,7 +4124,7 @@ const Pedidos = {
             rowsHtml += `
                 <tr>
                     <td data-label="Cliente">${Utils.nombreCatalogo(pedido, 'cliente')}</td>
-                    <td data-label="Producto">${pedido.producto_nombre || ''}</td>
+                    <td data-label="Producto">${Utils.esc(pedido.producto_nombre || '')}</td>
                     <td data-label="Tipo">${pedido.tipo || ''}</td>
                     <td data-label="Cantidad" class="money">${pedido.cantidad || 0}</td>
                     <td data-label="Proveedor seleccionado">${celdaProveedor}</td>
@@ -4046,7 +4248,9 @@ const Pedidos = {
             await Promise.all(promises);
         }
         
-        const clientes = AppState.clientes;
+        // Un cliente desactivado no recibe pedidos nuevos (si lo desactivaron, no se lo ofrece).
+        const esActivo = c => !(c.activo === false || c.activo === 'false' || c.activo === 0 || c.activo === '0');
+        const clientes = AppState.clientes.filter(esActivo);
         const productos = AppState.productos;
         const proveedores = this.getProveedoresActivos(AppState.proveedores);
         
@@ -4055,21 +4259,21 @@ const Pedidos = {
                 <label>Cliente</label>
                 <select id="modal-cliente" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(clienteIdPrevio) ? 'selected' : ''}>${c.nombre}</option>`).join('')}
+                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(clienteIdPrevio) ? 'selected' : ''}>${Utils.esc(c.nombre)}</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
                 <label>Producto</label>
                 <select id="modal-producto" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${productos.map(p => `<option value="${p.id}">${p.nombre} (${p.tipo})</option>`).join('')}
+                    ${productos.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)} (${p.tipo})</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
                 <label>Proveedor</label>
                 <select id="modal-proveedor" class="form-control">
                     <option value="">Sin proveedor</option>
-                    ${proveedores.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('')}
+                    ${proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
                 <small class="modal-hint">Al elegir el producto se marca su proveedor habitual. Podés cambiarlo para este pedido.</small>
             </div>
@@ -4094,9 +4298,9 @@ const Pedidos = {
                 
                 console.log('🔵 Datos del pedido:', { clienteId, productoId, proveedorId, cantidad });
                 
-                if (!clienteId || !productoId || !cantidad) {
-                    Utils.showError('Complete todos los campos');
-                    throw new Error('Campos incompletos');
+                if (!clienteId || !productoId || !(cantidad >= 1)) {
+                    Utils.showError(!clienteId || !productoId ? 'Complete todos los campos' : 'La cantidad tiene que ser 1 o más');
+                    return true;
                 }
                 
                 const producto = productos.find(p => p.id == productoId);
@@ -4157,11 +4361,12 @@ const Pedidos = {
                     });
                     CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
                     if (AppState.currentPage === 'pedidos') this.render();
-                }, () => {
+                }, (error) => {
                     Utils.removeFromList(AppState.pedidos, tempId);
                     CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
                     if (AppState.currentPage === 'pedidos') Pedidos.render();
-                    Utils.showError('No se pudo guardar el pedido. Se quitó de la lista.');
+                    Utils.showError('No se pudo guardar el pedido. Se quitó de la lista.'
+                        + (API._esCorteDeConexion(error) ? ' Revisá la conexión.' : ' ' + (error && error.message || '')));
                 });
             } catch (error) {
                 console.error('❌ Error en creación de pedido:', error);
@@ -4190,7 +4395,8 @@ const Pedidos = {
         
         if (!AppState.clientes?.length) AppState.clientes = await API.getClientes();
         if (!AppState.productos?.length) AppState.productos = await API.getProductos();
-        const clientes = AppState.clientes;
+        // Se ofrecen los clientes activos y, si el pedido ya era de uno desactivado, también ese.
+        const clientes = AppState.clientes.filter(c => !(c.activo === false || c.activo === 'false' || c.activo === 0 || c.activo === '0') || String(c.id) === String(pedido.cliente_id));
         const productos = AppState.productos;
         await this.ensureDatosProveedor();
         const proveedores = this.getProveedoresActivos(AppState.proveedores);
@@ -4202,14 +4408,14 @@ const Pedidos = {
                 <label>Cliente</label>
                 <select id="modal-cliente" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(pedido.cliente_id) ? 'selected' : ''}>${c.nombre}</option>`).join('')}
+                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(pedido.cliente_id) ? 'selected' : ''}>${Utils.esc(c.nombre)}</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
                 <label>Producto</label>
                 <select id="modal-producto" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${productos.map(p => `<option value="${p.id}" ${String(p.id) === String(pedido.producto_id) ? 'selected' : ''}>${p.nombre} (${p.tipo})</option>`).join('')}
+                    ${productos.map(p => `<option value="${p.id}" ${String(p.id) === String(pedido.producto_id) ? 'selected' : ''}>${Utils.esc(p.nombre)} (${p.tipo})</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
@@ -4220,7 +4426,7 @@ const Pedidos = {
                 <label>Proveedor</label>
                 <select id="modal-proveedor" class="form-control">
                     <option value="">Sin proveedor</option>
-                    ${proveedores.map(p => `<option value="${p.id}" ${String(p.id) === String(proveedorActual) ? 'selected' : ''}>${p.nombre}</option>`).join('')}
+                    ${proveedores.map(p => `<option value="${p.id}" ${String(p.id) === String(proveedorActual) ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
                 <small class="modal-hint">El mismo producto puede pedirse a distintos proveedores. Este cambio vale solo para este pedido.</small>
             </div>
@@ -4232,9 +4438,9 @@ const Pedidos = {
             const cantidad = parseInt(document.getElementById('modal-cantidad').value);
             const proveedorId = document.getElementById('modal-proveedor').value;
             
-            if (!clienteId || !productoId || !cantidad) {
-                Utils.showError('Complete todos los campos');
-                return;
+            if (!clienteId || !productoId || !(cantidad >= 1)) {
+                Utils.showError(!clienteId || !productoId ? 'Complete todos los campos' : 'La cantidad tiene que ser 1 o más');
+                return true;
             }
             
             const producto = productos.find(p => String(p.id) === String(productoId));
@@ -4323,7 +4529,7 @@ const Pedidos = {
                 const nombre = proveedor?.nombre || 'Sin proveedor asignado';
                 const items = grupos[proveedorId].map(pedido => {
                     const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
-                    return `<li>${pedido.cliente_nombre || 'Cliente'} — ${pedido.producto_nombre || producto?.nombre || 'Producto'} × ${pedido.cantidad}</li>`;
+                    return `<li>${Utils.esc(pedido.cliente_nombre || 'Cliente')} — ${pedido.producto_nombre || producto?.nombre || 'Producto'} × ${pedido.cantidad}</li>`;
                 }).join('');
                 const sinTelefono = !proveedor || !proveedor.telefono;
                 return `
@@ -4566,7 +4772,7 @@ const Pedidos = {
                 </thead>
                 <tbody>
                     <tr>
-                        <td>${pedido.cliente_nombre || '-'}</td>
+                        <td>${Utils.esc(pedido.cliente_nombre || '-')}</td>
                         <td>${productoNombre}</td>
                         <td>${pedido.cantidad || 0}</td>
                     </tr>
@@ -4633,7 +4839,7 @@ const Pedidos = {
                 <label>Proveedor</label>
                 <select id="modal-pedido-proveedor" class="form-control">
                     ${proveedoresActivos.map(p =>
-                        `<option value="${p.id}">${p.nombre}${p.telefono ? ` (${p.telefono})` : ''}</option>`
+                        `<option value="${p.id}">${Utils.esc(p.nombre)}${p.telefono ? ` (${Utils.esc(p.telefono)})` : ''}</option>`
                     ).join('')}
                 </select>
                 <small id="modal-pedido-proveedor-hint" class="modal-hint"></small>
@@ -5173,11 +5379,11 @@ const Recepcion = {
 
             rowsHtml += `
                 <tr${rowClass}>
-                    <td>${item.producto_nombre || ''}</td>
+                    <td>${Utils.esc(item.producto_nombre || '')}</td>
                     <td>${item.pedido_total || 0}</td>
                     <td><input type="number" class="recepcion-llego" data-id="${item.id}" data-producto-id="${item.producto_id}" value="${item.llego || 0}" min="0"${disabled}></td>
                     <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${item.producto_id}" data-price-input="true" value="${Utils.formatPrice(item.precio_real || 0)}" placeholder="Costo del proveedor"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
-                    <td>${item.proveedor_nombre || ''}</td>
+                    <td>${Utils.esc(item.proveedor_nombre || '')}</td>
                     <td class="recepcion-acciones">${accionCell}</td>
                 </tr>
             `;
@@ -5232,23 +5438,27 @@ const Recepcion = {
             return;
         }
 
+        // Solo se confirma lo que tiene cantidad y precio cargados. Un producto en 0 no se da por
+        // "no llegó" en bloque: eso se confirma de a uno, a propósito.
         const listos = [];
         const incompletos = [];
+        const sinCargar = [];
         pendientes.forEach(item => {
             const { llego, precio } = this.getValoresProducto(item.producto_id);
-            if (llego > 0 && precio <= 0) incompletos.push(item.producto_nombre || 'producto');
+            const nombre = item.producto_nombre || 'producto';
+            if (!(llego > 0)) sinCargar.push(nombre);
+            else if (precio <= 0) incompletos.push(nombre);
             else listos.push({ item, llego, precio });
         });
 
         if (listos.length === 0) {
-            Utils.showError('Completá el precio real de los productos que llegaron antes de confirmar.');
+            Utils.showError('Cargá lo que llegó y el precio real de cada producto. Si algo no llegó, confirmalo con su propio botón Confirmar.');
             return;
         }
 
-        const aviso = incompletos.length
-            ? `\n\nQuedan sin confirmar (falta precio): ${incompletos.join(', ')}`
-            : '';
-        const ok = await Utils.showConfirm(`¿Confirmar ${listos.length} producto(s) con datos completos?${aviso}`);
+        const aviso = (incompletos.length ? `\n\nQuedan sin confirmar (falta precio): ${incompletos.join(', ')}` : '')
+            + (sinCargar.length ? `\n\nSin cargar, no se confirman (si no llegaron, confirmalos uno por uno): ${sinCargar.join(', ')}` : '');
+        const ok = await Utils.showConfirm(`¿Confirmar ${listos.length} producto(s) con lo que llegó?${aviso}`);
         if (!ok) return;
 
         const anteriores = listos.map(entrada => ({ ...entrada.item }));
@@ -6050,6 +6260,8 @@ const Precios = {
             comision_por_unidad: this.comisionPorUnidad,
             items: preciosItems
         });
+        // load() devuelve lo que ya tiene si cree que el día está cargado: hay que forzar la lectura.
+        AppState.fechaCargada = null;
         await this.load();
         this.sincronizarCobranza();
 
@@ -6097,6 +6309,12 @@ const Precios = {
             return;
         }
 
+        const sinPrecio = items.filter(item => Number(item.cantidad) > 0 && !(item.precio_cliente > 0)).length;
+        if (sinPrecio > 0) {
+            const seguir = await Utils.showConfirm(`Hay ${sinPrecio} producto(s) sin precio al cliente. No vas a poder cerrar el día hasta cargarlos. ¿Guardar igual?`);
+            if (!seguir) return;
+        }
+
         this.sincronizarCobranza();
         CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
         Utils.avisar('Precios guardados');
@@ -6108,8 +6326,8 @@ const Precios = {
                 items: items
             });
             CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
-        }, async () => {
-            Utils.showError('No se pudieron guardar los precios.');
+        }, async (error) => {
+            Utils.showError(API._esCorteDeConexion(error) ? 'No se pudieron guardar los precios. Revisá la conexión.' : 'No se pudieron guardar los precios: ' + (error && error.message || ''));
             await this.load();
             this.sincronizarCobranza();
         });
@@ -6747,9 +6965,14 @@ const Cierre = {
     _cerrando: false,
 
     _cobranzasCache(fecha) {
-        return CacheManager.get(`cobranzas:${fecha}:all`)
-            || CacheManager.get('cobranzas:all:all')
-            || [];
+        // La lista del día no trae las deudas de días anteriores: se unen ambas, sin repetir.
+        const porId = new Map();
+        [CacheManager.get('cobranzas:all:all'), CacheManager.get(`cobranzas:${fecha}:all`)].forEach(lista => {
+            (Array.isArray(lista) ? lista : []).forEach((c, i) => {
+                porId.set(String(c.id || `${c.cliente_id}|${c.fecha}|${i}`), c);
+            });
+        });
+        return Array.from(porId.values());
     },
 
     _itemResumen(label, estadoHtml, hint) {
@@ -6875,7 +7098,9 @@ const Cierre = {
             estadoCobranzasHoy = `<span class="cierre-pendiente">${cobradosHoy} cobrados, ${parcialHoy} parciales, ${totalClientesHoy - cobradosHoy - parcialHoy} sin cobrar (de ${totalClientesHoy})</span>`;
         }
 
-        const cobranzasPendientes = (cobranzas || []).filter(c => Utils.isCobranzaPendiente(c));
+        // "Pendientes" son las deudas de días anteriores: lo de hoy ya se ve en "Cobranzas del día".
+        const cobranzasPendientes = (cobranzas || []).filter(c =>
+            Utils.isCobranzaPendiente(c) && Utils.fechaIso(c.fecha) !== AppState.currentDate);
         const estadoCobranzasPendientes = cobranzasPendientes.length > 0
             ? `<span class="cierre-pendiente">Pendientes (${cobranzasPendientes.length})</span>`
             : '<span class="cierre-ok">Sin pendientes</span>';
@@ -6898,7 +7123,7 @@ const Cierre = {
                 : ''),
             this._itemResumen('Cobranzas pendientes', estadoCobranzasPendientes, cobranzasPendientes.length
                 ? 'Paso anterior: clientes con saldo de días anteriores todavía sin cobrar.'
-                : 'Paso anterior: no hay deudas viejas de clientes.'),
+                : 'Paso anterior: no hay deudas de días anteriores. Lo que quedó debiendo hoy pasa a pendientes al cerrar.'),
             this._itemResumen('Proveedores', estadoProveedores, proveedoresPendientes.length
                 ? `Paso anterior: ${proveedoresPendientes.length} proveedor${proveedoresPendientes.length === 1 ? '' : 'es'} con saldo a pagar.`
                 : 'Paso anterior: ningún proveedor tiene saldo pendiente.'),
@@ -7014,8 +7239,14 @@ const Cierre = {
             }
             
             // Validar que todo esté completo
-            await API.cerrarDia(fecha);
+            const resultadoCierre = await API.cerrarDia(fecha);
             Utils.showSuccess('Día cerrado correctamente');
+            const faltantesStock = (resultadoCierre && resultadoCierre.faltantes_stock) || [];
+            if (faltantesStock.length) {
+                await Utils.showWarning('Se vendió más de lo que había cargado en stock: '
+                    + faltantesStock.map(f => `${f.producto_nombre || 'Producto'} (faltaban ${f.faltante})`).join(', ')
+                    + '. El stock quedó en 0: revisalo en Stock.');
+            }
             
             CacheManager.invalidateAllExcept(['clientes', 'productos', 'proveedores']);
             DataLoader.invalidate();
@@ -7785,7 +8016,7 @@ const Cobranzas = {
                 ? '<button class="btn btn-whatsapp btn-sm" type="button" disabled title="Falta teléfono">WhatsApp</button>'
                 : `<button class="btn btn-whatsapp btn-sm" type="button" onclick="Cobranzas.enviarWhatsApp('${cobranza.id}')">WhatsApp</button>`;
             tr.innerHTML = `
-                <td data-label="Cliente">${cliente.nombre || ''}</td>
+                <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}</td>
                 <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
                 <td data-label="Cómo pagó" class="medios-texto">${MediosPago.texto(cobranza.medios)}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</td>
                 <td data-label="Fecha">${Utils.formatDate(cobranza.fecha)}</td>
@@ -7913,7 +8144,7 @@ const Cobranzas = {
                 <label>Cliente</label>
                 <select id="modal-cobranza-cliente" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${cobranzas.map(c => `<option value="${c.id}">${c.cliente_nombre} - ${Utils.formatCurrency(Utils.getCobranzaSaldo(c))}</option>`).join('')}
+                    ${cobranzas.map(c => `<option value="${c.id}">${Utils.esc(c.cliente_nombre)} - ${Utils.formatCurrency(Utils.getCobranzaSaldo(c))}</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
@@ -8069,7 +8300,7 @@ const Cobranzas = {
         const content = `
             <div class="form-group">
                 <label>Cliente</label>
-                <input type="text" class="form-control" value="${cobranza.cliente_nombre || ''}" readonly>
+                <input type="text" class="form-control" value="${Utils.esc(cobranza.cliente_nombre || '')}" readonly>
             </div>
             <div class="form-group">
                 <label>Fecha</label>
@@ -8388,7 +8619,7 @@ const CobranzasHoy = {
         const filas = items.length
             ? items.map(item => `
                 <tr>
-                    <td>${item.producto_nombre || 'Producto'}</td>
+                    <td>${Utils.esc(item.producto_nombre || 'Producto')}</td>
                     <td>${item.cantidad ?? ''}</td>
                     <td>${Utils.formatCurrency(item.precio_cliente || 0)}</td>
                     <td>${Utils.formatCurrency(item.subtotal || 0)}</td>
@@ -8844,7 +9075,7 @@ const Pagos = {
                 ? `<div class="deposito-texto">${identificados.map(item => `${Depositos._esc(item.cuenta)} · vino de ${Depositos._esc(item.cliente)} ${Utils.formatCurrency(item.monto)}`).join('<br>')}</div>`
                 : '';
             tr.innerHTML = `
-                <td data-label="Proveedor">${proveedor.nombre || ''}${vino}</td>
+                <td data-label="Proveedor">${Utils.esc(proveedor.nombre || '')}${vino}</td>
                 <td data-label="Le debés" style="${saldo > 0 ? 'color:#dc3545;font-weight:700;' : ''}">${Utils.formatCurrency(saldo)}</td>
                 <td data-label="Cómo pagaste" class="medios-texto">${MediosPago.texto(proveedor.medios)}</td>
                 <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
@@ -9124,7 +9355,7 @@ const Pagos = {
         const content = `
             <div class="form-group">
                 <label>Proveedor</label>
-                <p class="modal-static-value">${proveedor.nombre || '-'}</p>
+                <p class="modal-static-value">${Utils.esc(proveedor.nombre || '-')}</p>
                 <small class="modal-hint">${sinTelefono
                     ? 'Este proveedor no tiene teléfono. Configuralo en Proveedores.'
                     : (proveedor.telefono || '')}</small>
@@ -9304,7 +9535,7 @@ const Stock = {
             const nombre = String(item.producto_nombre || '').replace(/'/g, "\\'");
             const tr = document.createElement('tr');
             tr.innerHTML = `
-                <td>${item.producto_nombre || ''}</td>
+                <td>${Utils.esc(item.producto_nombre || '')}</td>
                 <td>${this._tipo(item.tipo)}</td>
                 <td>${this._cantidad(item.stock_actual, item.unidad)}</td>
                 <td><span class="status-badge ${estado === 'BAJO' ? 'status-bajo' : 'status-activo'}">${estado}</span></td>
@@ -9328,7 +9559,7 @@ const Stock = {
                 <label>Producto</label>
                 <select id="modal-stock-producto" class="form-control">
                     <option value="">Seleccionar...</option>
-                    ${productos.map(p => `<option value="${p.id}">${p.nombre} · ${this._tipo(p.tipo)}</option>`).join('')}
+                    ${productos.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)} · ${this._tipo(p.tipo)}</option>`).join('')}
                 </select>
             </div>
             <div class="form-group">
@@ -9418,6 +9649,11 @@ const Stock = {
         
         try {
             const resultado = await API.verificarStockBajo();
+
+            if (resultado && resultado.success === false) {
+                Utils.showInfo(resultado.message || 'No se pudo verificar el stock.');
+                return;
+            }
             
             if (resultado.productos && resultado.productos.length > 0) {
                 Utils.showSuccess(`Se encontraron ${resultado.productos.length} producto(s) con stock bajo. Se ha enviado una notificación por email.`);
@@ -9658,11 +9894,11 @@ const Historial = {
             ]);
 
             const filasPedidos = (pedidos || []).map(p =>
-                `<tr><td>${p.cliente_nombre || ''}</td><td>${p.producto_nombre || ''}</td><td class="money">${p.cantidad || 0}</td></tr>`
+                `<tr><td>${Utils.esc(p.cliente_nombre || '')}</td><td>${Utils.esc(p.producto_nombre || '')}</td><td class="money">${p.cantidad || 0}</td></tr>`
             ).join('') || '<tr><td colspan="3">Sin pedidos</td></tr>';
 
             const filasRecepcion = (recepciones || []).map(r =>
-                `<tr><td>${r.producto_nombre || ''}</td><td class="money">${r.llego || 0}</td><td class="money">${Utils.formatCurrency(r.precio_real || 0)}</td><td>${r.confirmado ? 'Confirmado' : 'Pendiente'}</td></tr>`
+                `<tr><td>${Utils.esc(r.producto_nombre || '')}</td><td class="money">${r.llego || 0}</td><td class="money">${Utils.formatCurrency(r.precio_real || 0)}</td><td>${r.confirmado ? 'Confirmado' : 'Pendiente'}</td></tr>`
             ).join('') || '<tr><td colspan="4">Sin recepción</td></tr>';
 
             const filasPrecios = (precios || []).map(p => {
@@ -9670,11 +9906,11 @@ const Historial = {
                 const unit = Utils.parsePrice(p.precio_cliente) || 0;
                 const comision = Utils.parsePrice(p.comision_unitaria) || 0;
                 const total = Math.round(cantidad * unit) + Math.round(cantidad * comision);
-                return `<tr><td>${p.cliente_nombre || ''}</td><td>${p.producto_nombre || ''}</td><td class="money">${cantidad}</td><td class="money">${Utils.formatCurrency(unit)}</td><td class="money">${Utils.formatCurrency(total)}</td></tr>`;
+                return `<tr><td>${Utils.esc(p.cliente_nombre || '')}</td><td>${Utils.esc(p.producto_nombre || '')}</td><td class="money">${cantidad}</td><td class="money">${Utils.formatCurrency(unit)}</td><td class="money">${Utils.formatCurrency(total)}</td></tr>`;
             }).join('') || '<tr><td colspan="5">Sin precios</td></tr>';
 
             const filasCobranzas = (cobranzas || []).map(c =>
-                `<tr><td>${c.cliente_nombre || ''}</td><td class="money">${Utils.formatCurrency(c.total || 0)}</td><td class="money">${Utils.formatCurrency(c.pagado || 0)}</td><td class="money ${Utils.parsePrice(c.saldo) > 0 ? 'money-alert' : ''}">${Utils.formatCurrency(c.saldo || 0)}</td></tr>`
+                `<tr><td>${Utils.esc(c.cliente_nombre || '')}</td><td class="money">${Utils.formatCurrency(c.total || 0)}</td><td class="money">${Utils.formatCurrency(c.pagado || 0)}</td><td class="money ${Utils.parsePrice(c.saldo) > 0 ? 'money-alert' : ''}">${Utils.formatCurrency(c.saldo || 0)}</td></tr>`
             ).join('') || '<tr><td colspan="4">Sin cobranzas</td></tr>';
 
             panel.innerHTML = `
@@ -9746,7 +9982,7 @@ const Historial = {
                     const subtotal = item.cantidad * precioUnit;
                     seccionPedidos += `
                     <tr>
-                        <td style="padding:4px 8px 4px 20px;">${item.producto_nombre || ''}</td>
+                        <td style="padding:4px 8px 4px 20px;">${Utils.esc(item.producto_nombre || '')}</td>
                         <td style="padding:4px 8px;text-align:center;">${item.cantidad} ${item.tipo === 'bebida' ? 'u.' : 'kg'}</td>
                         <td style="padding:4px 8px;text-align:right;">${formatPeso(precioUnit)}</td>
                         <td style="padding:4px 8px;text-align:right;">${formatPeso(subtotal)}</td>
@@ -9757,7 +9993,7 @@ const Historial = {
             // Sección recepción
             let seccionRecepcion = recepciones.map(r => `
                 <tr>
-                    <td style="padding:4px 8px;">${r.producto_nombre || ''}</td>
+                    <td style="padding:4px 8px;">${Utils.esc(r.producto_nombre || '')}</td>
                     <td style="padding:4px 8px;text-align:center;">${r.llego || 0}</td>
                     <td style="padding:4px 8px;text-align:right;">${formatPeso(r.precio_real)}</td>
                     <td style="padding:4px 8px;text-align:right;">${formatPeso((r.llego || 0) * (r.precio_real || 0))}</td>
@@ -9766,7 +10002,7 @@ const Historial = {
             // Sección cobranzas
             let seccionCobranzas = cobranzas.map(c => `
                 <tr>
-                    <td style="padding:4px 8px;">${c.cliente_nombre || ''}</td>
+                    <td style="padding:4px 8px;">${Utils.esc(c.cliente_nombre || '')}</td>
                     <td style="padding:4px 8px;text-align:right;">${formatPeso(c.total)}</td>
                     <td style="padding:4px 8px;text-align:right;">${formatPeso(c.pagado)}</td>
                     <td style="padding:4px 8px;text-align:right;color:${Utils.parsePrice(c.saldo) > 0 ? '#dc3545' : '#28a745'};">${formatPeso(c.saldo)}</td>
@@ -9858,8 +10094,10 @@ const Historial = {
     },
 
     async delete(id, fecha) {
-        const fechaFormateada = fecha
-            ? new Date(fecha + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })
+        // La hoja guarda la fecha como fecha-hora ("2026-10-13T03:00:00.000Z"): se toma solo el día.
+        const diaIso = Utils.fechaIso(fecha);
+        const fechaFormateada = diaIso
+            ? new Date(diaIso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })
             : fecha;
 
         const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR el historial del día ${fechaFormateada}?\n\nEsta acción NO se puede deshacer. Se eliminará el registro del cierre.\n\n¿Desea continuar?`;
@@ -9926,7 +10164,7 @@ const Caja = {
         tbody.innerHTML = delDia.map(m => `
             <tr>
                 <td data-label="Tipo">${m.tipo === 'egreso' ? 'Egreso' : 'Ingreso'}</td>
-                <td data-label="Detalle">${m.nota || ''}</td>
+                <td data-label="Detalle">${Utils.esc(m.nota || '')}</td>
                 <td data-label="Monto" class="money ${m.tipo === 'egreso' ? 'money-alert' : ''}">${Utils.formatCurrency(m.monto || 0)}</td>
                 <td data-label="Referencia">${m.referencia || ''}</td>
             </tr>
@@ -9972,6 +10210,10 @@ const Reparto = {
         this.enganchar();
         this._editando = false;
         const token = (this._carga = (this._carga || 0) + 1);
+        // La lista de cobranzas que trae el arranque de la app solo incluye las que tienen saldo.
+        // Acá hace falta la completa: si falta la de un cliente que ya pagó todo hoy, se lo tomaría
+        // como que debe el total del día. Por eso se descarta esa versión parcial.
+        CacheManager.invalidate('cobranzas:all:all');
         const local = this._datosLocales();
         if (local.listo) this._aplicar(local.cobranzas, local.proveedores, local.precios);
         else root.innerHTML = '<p class="camion-vacio">Buscando saldos…</p>';
@@ -9982,6 +10224,7 @@ const Reparto = {
         ]).then(([cobranzas, proveedores]) => {
             if (this._carga !== token || AppState.currentPage !== 'reparto' || this._editando) return;
             if (proveedores && proveedores.length) AppState.proveedores = proveedores;
+            this._cobranzasCompletas = cobranzas || [];
             this._aplicar(cobranzas || [], proveedores || [], this._preciosHoy());
         }).catch(error => console.error('Error cargando reparto:', error));
     },
@@ -9994,14 +10237,15 @@ const Reparto = {
     },
 
     _datosLocales() {
-        const cobranzas = CacheManager.peek('cobranzas:all:all') || AppState.cobranzas || [];
+        // Solo se muestra de inmediato lo que ya se leyó completo en esta sesión.
+        const cobranzas = this._cobranzasCompletas || [];
         const proveedores = CacheManager.peek('proveedores') || AppState.proveedores || [];
         const precios = this._preciosHoy();
         return {
             cobranzas: Array.isArray(cobranzas) ? cobranzas : [],
             proveedores: Array.isArray(proveedores) ? proveedores : [],
             precios: Array.isArray(precios) ? precios : [],
-            listo: (cobranzas && cobranzas.length) || (proveedores && proveedores.length)
+            listo: !!this._cobranzasCompletas && proveedores && proveedores.length > 0
         };
     },
 
@@ -10409,7 +10653,12 @@ const DataLoader = {
             CacheManager.set(`pedidos:${fecha}`, data.pedidos);
         }
         if (data.recepcion) {
-            AppState.recepcion = data.recepcion;
+            // En la pantalla de Recepción la lista incluye también los productos pedidos que todavía no
+            // tienen fila guardada. Lo que llega del servidor solo trae los guardados: si se pisara,
+            // esos productos desaparecerían de la memoria y "Confirmar todos" no los vería.
+            // (Pasa al armar la lista de precios en segundo plano tras confirmar un producto.)
+            const enRecepcion = AppState.currentPage === 'recepcion' || AppState.currentPage === 'recepcion-pendientes';
+            if (!enRecepcion) AppState.recepcion = data.recepcion;
             CacheManager.set(`recepcion:${fecha}`, data.recepcion);
         }
         if (data.precios) {
@@ -10433,8 +10682,10 @@ const DataLoader = {
 
 // Inicialización
 document.addEventListener('DOMContentLoaded', async () => {
+    if (window.__sinSesion) return; // sin sesión válida: ya se está yendo al ingreso
     Navigation.init();
     DiaOperativo.init();
+    Sync.iniciar();
 
     const cachedDias = CacheManager.get('flujo:dias-pendientes');
     if (Array.isArray(cachedDias) && cachedDias.length) {
