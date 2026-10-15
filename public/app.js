@@ -9673,7 +9673,7 @@ const Stock = {
             const content = `
                 <div class="form-group">
                     <label>Email(s) para notificaciones</label>
-                    <input type="text" id="modal-email-notif" class="form-control" value="${config.email_notificaciones || ''}" placeholder="email1@correo.com, email2@correo.com" required>
+                    <input type="text" id="modal-email-notif" class="form-control" value="${Utils.esc(config.email_notificaciones || '')}" placeholder="email1@correo.com, email2@correo.com" required>
                     <small>Se enviarán alertas de stock bajo a estos correos. Separa múltiples emails con comas.</small>
                 </div>
                 <div class="form-group">

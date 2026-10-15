@@ -2195,21 +2195,37 @@ function guardarCamiones(data) {
   var values = readUsedValues_(sheet);
   var headers = values.length ? values[0] : [];
   var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var ancho = Math.max(headers.length, 5);
 
-  for (var i = values.length - 1; i >= 1; i--) {
-    if (normalizeFecha(values[i][fechaIdx]) === fechaNorm) sheet.deleteRow(i + 1);
-  }
+  // Se arma la hoja completa en memoria y se escribe de una sola vez:
+  // borrar y agregar fila por fila tardaba varios segundos por camión.
+  var completar = function(fila) {
+    var copia = fila.slice(0, ancho);
+    while (copia.length < ancho) copia.push('');
+    return copia;
+  };
+  var filasAnteriores = values.length - 1;
+  var filas = values.slice(1).filter(function(fila) {
+    return normalizeFecha(fila[fechaIdx]) !== fechaNorm;
+  }).map(completar);
 
   (data.camiones || []).forEach(function(camion, index) {
     var clientes = Array.isArray(camion.clientes) ? camion.clientes : [];
-    sheet.appendRow([
+    filas.push(completar([
       camion.id || generateId(),
       fechaNorm,
       camion.nombre || ('Camión ' + (index + 1)),
       index + 1,
       JSON.stringify(clientes)
-    ]);
+    ]));
   });
+
+  if (filas.length > 0) {
+    sheet.getRange(2, 1, filas.length, ancho).setValues(filas);
+  }
+  if (filasAnteriores > filas.length) {
+    sheet.getRange(2 + filas.length, 1, filasAnteriores - filas.length, Math.max(sheet.getLastColumn(), ancho)).clearContent();
+  }
 
   invalidateSheetCache(CONFIG.SHEETS.CAMIONES);
   return { success: true, fecha: fechaNorm };
