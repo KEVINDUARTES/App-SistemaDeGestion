@@ -3886,6 +3886,14 @@ const Camiones = {
     },
 
     async _enviarPdf(lista, telefono) {
+        const texto = lista.length === 1
+            ? `Te mando la carga de ${lista[0].nombre}.`
+            : 'Te mando la carga de los camiones.';
+        // En la computadora va directo a WhatsApp, como los demás botones: el menú "Compartir"
+        // de la Mac no ofrece WhatsApp. Se abre antes de armar el PDF porque, si se espera,
+        // el navegador bloquea la ventana nueva.
+        const enCelular = WhatsAppService.isMobile();
+        if (!enCelular) WhatsAppService.openChat(telefono, texto);
         let doc;
         try {
             doc = await this._pdfHoja(lista);
@@ -3902,12 +3910,11 @@ const Camiones = {
             : 'carga-camiones.pdf';
         const blob = doc.output('blob');
         const archivo = new File([blob], nombre, { type: 'application/pdf' });
-        const texto = lista.length === 1
-            ? `Te mando la carga de ${lista[0].nombre}.`
-            : 'Te mando la carga de los camiones.';
-        const compartido = await this._compartirPdf(archivo, texto);
-        if (compartido === 'ok' || compartido === 'cancelado') return;
-        WhatsAppService.openChat(telefono, texto);
+        if (enCelular) {
+            const compartido = await this._compartirPdf(archivo, texto);
+            if (compartido === 'ok' || compartido === 'cancelado') return;
+            WhatsAppService.openChat(telefono, texto);
+        }
         doc.save(nombre);
         Utils.avisar('WhatsApp abierto. En esta computadora el PDF se descarga al lado: arrastralo al chat para enviarlo.');
     },
@@ -6706,7 +6713,7 @@ const Precios = {
             const blob = doc.output('blob');
             const archivo = new File([blob], nombre, { type: 'application/pdf' });
 
-            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+            if (WhatsAppService.isMobile() && navigator.canShare && navigator.canShare({ files: [archivo] })) {
                 await navigator.share({
                     files: [archivo],
                     title: 'Lista de precios',
@@ -6939,7 +6946,7 @@ const Precios = {
             const archivo = new File([blob], nombre, { type: 'application/pdf' });
             const texto = 'Te envío la lista de precios en el PDF.';
 
-            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+            if (WhatsAppService.isMobile() && navigator.canShare && navigator.canShare({ files: [archivo] })) {
                 await navigator.share({
                     files: [archivo],
                     title: 'Lista de precios',
@@ -7838,7 +7845,7 @@ const SaldoCliente = {
         const archivo = new File([blob], archivoNombre, { type: 'application/pdf' });
         const texto = `Hola ${nombre}, te paso el saldo por carga y el total. Va en el PDF.`;
         try {
-            if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+            if (WhatsAppService.isMobile() && navigator.canShare && navigator.canShare({ files: [archivo] })) {
                 await navigator.share({ files: [archivo], title: 'Saldo', text: texto });
                 Utils.avisar('PDF listo. Elegí WhatsApp para enviarlo.');
                 return;
