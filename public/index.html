@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261003login">
+    <link rel="stylesheet" href="styles.css?v=20261021planilla2">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -194,6 +194,29 @@
             <div class="reparto-acceso">
                 <button type="button" class="btn btn-primary" id="btn-ir-reparto">Repartir efectivo</button>
                 <p>Anotá el efectivo que entró de un cliente y descontalo a los proveedores.</p>
+            </div>
+            <!-- Saldos por cliente y por proveedor (solo para algunos usuarios: ver Dashboard.USUARIOS_CON_SALDOS) -->
+            <div id="dashboard-saldos" class="saldos-inicio" hidden>
+                <div class="saldos-inicio-acciones">
+                    <button type="button" class="btn btn-primary btn-sm" id="btn-saldos-excel">Descargar Excel de saldos</button>
+                    <span>Saldo de cada cliente y proveedor, y hasta qué fecha.</span>
+                </div>
+                <section class="saldos-inicio-card">
+                    <header>
+                        <h3>Clientes que te deben</h3>
+                        <strong class="saldos-inicio-total" id="saldos-clientes-total">$0</strong>
+                    </header>
+                    <ul id="saldos-clientes-lista" class="saldos-inicio-lista"></ul>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="Navigation.navigateTo('cobranzas')">Ver cobranzas pendientes</button>
+                </section>
+                <section class="saldos-inicio-card">
+                    <header>
+                        <h3>Proveedores a pagar</h3>
+                        <strong class="saldos-inicio-total" id="saldos-proveedores-total">$0</strong>
+                    </header>
+                    <ul id="saldos-proveedores-lista" class="saldos-inicio-lista"></ul>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="Navigation.navigateTo('pagos-pendientes')">Ver pagos pendientes</button>
+                </section>
             </div>
             <!-- Gráfico de métricas -->
             <div class="metrics-section">
@@ -431,6 +454,23 @@
                 </div>
             </div>
             
+            <div class="precios-vistas" role="tablist">
+                <button type="button" class="btn btn-sm" id="btn-precios-vista-cliente" role="tab" onclick="Precios.cambiarVista('cliente')">Por cliente</button>
+                <button type="button" class="btn btn-sm" id="btn-precios-vista-planilla" role="tab" onclick="Precios.cambiarVista('planilla')">Planilla del día</button>
+            </div>
+
+            <!-- Planilla del día: productos en filas, cada cliente en su columna, total, precio, puesto y precio total -->
+            <div id="precios-planilla" class="precios-planilla" hidden>
+                <div class="precios-planilla-acciones">
+                    <p class="modal-hint">Todos los clientes del día con el total de cada producto y su precio, para armar la diferencia.</p>
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-precios-planilla-excel">Descargar Excel</button>
+                </div>
+                <div class="table-container precios-planilla-scroll">
+                    <table class="data-table precios-planilla-tabla" id="precios-planilla-tabla"></table>
+                </div>
+            </div>
+
+            <div id="precios-vista-cliente">
             <!-- Resumen del cliente (se muestra cuando hay filtro activo) -->
             <div id="precios-resumen-cliente" style="display: none;">
                 <h3>Resumen del Cliente</h3>
@@ -465,7 +505,7 @@
                             <th>Cliente</th>
                             <th>Producto</th>
                             <th>Cant.</th>
-                            <th title="Lo que te cobró el proveedor por cada unidad">Precio real <span class="th-hint">c/u</span></th>
+                            <th title="Sale de la recepción. Podés cambiarlo en una línea: solo cambia la ganancia, no lo que le debés al proveedor.">Precio real <span class="th-hint">c/u · editable</span></th>
                             <th title="Lo que le cobrás al cliente por cada unidad">Precio cliente <span class="th-hint">c/u</span></th>
                             <th>Ganancia</th>
                             <th>Total</th>
@@ -478,6 +518,7 @@
                         <!-- Se llena dinámicamente cuando hay filtro por cliente -->
                     </tfoot>
                 </table>
+            </div>
             </div>
             <div class="page-actions precios-acciones">
                 <button class="btn btn-secondary" id="btn-generar-lista-precios" type="button" title="Arma la lista con lo que ya confirmaste que llegó">Armar lista</button>
@@ -798,10 +839,10 @@
         <a href="#" data-page="cierre" class="nav-link"><span>7</span>Cierre</a>
     </nav>
     <script src="auth.js?v=20261013hoja"></script>
-    <script src="services/whatsapp.js?v=20260927sinboton"></script>
-    <script src="services/pedidoProveedorService.js?v=20261002prov"></script>
+    <script src="services/whatsapp.js?v=20261021total"></script>
+    <script src="services/pedidoProveedorService.js?v=20261021total"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261019wsppdf"></script>
+    <script src="app.js?v=20261021sinprov"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

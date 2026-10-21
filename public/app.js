@@ -2302,6 +2302,8 @@ const Navigation = {
 // Dashboard
 const Dashboard = {
     chart: null,
+    // Usuarios que ven en el inicio el detalle de saldos por cliente y por proveedor.
+    USUARIOS_CON_SALDOS: ['cargasluciano@gmail.com'],
     
     async load() {
         const chartContainer = document.querySelector('.chart-container');
@@ -2369,6 +2371,185 @@ const Dashboard = {
         // Stock bajo
         const stockBajo = Stock._filas(stock).filter(item => item.stock_actual <= item.minimo);
         document.getElementById('dashboard-stock-count').textContent = stockBajo.length || 0;
+
+        this.renderSaldos(cobranzasPendientes, proveedores);
+    },
+
+    _veSaldos() {
+        const email = String(Auth.getUserEmail() || '').toLowerCase();
+        return this.USUARIOS_CON_SALDOS.includes(email);
+    },
+
+    // Lo que debe cada cliente (sumando todos sus días) y lo que se le debe a cada proveedor.
+    renderSaldos(cobranzasPendientes, proveedores) {
+        const panel = document.getElementById('dashboard-saldos');
+        if (!panel) return;
+        if (!this._veSaldos()) {
+            panel.hidden = true;
+            return;
+        }
+        panel.hidden = false;
+
+        const porCliente = new Map();
+        cobranzasPendientes.forEach(c => {
+            const id = String(c.cliente_id || '');
+            const saldo = Utils.getCobranzaSaldo(c);
+            if (!id || saldo <= 0) return;
+            const previo = porCliente.get(id) || { id, nombre: Cobranzas._clienteDe(c).nombre || 'Cliente', saldo: 0 };
+            previo.saldo += saldo;
+            porCliente.set(id, previo);
+        });
+        const clientes = [...porCliente.values()].sort((a, b) => b.saldo - a.saldo);
+        const deudas = (proveedores || [])
+            .map(p => ({ id: String(p.id), nombre: p.nombre || 'Proveedor', saldo: Utils.parsePrice(p.saldo) || 0 }))
+            .filter(p => p.saldo > 0)
+            .sort((a, b) => b.saldo - a.saldo);
+
+        const pintar = (listaId, totalId, filas, tipo, vacio) => {
+            const total = filas.reduce((suma, f) => suma + f.saldo, 0);
+            document.getElementById(totalId).textContent = Utils.formatCurrency(total);
+            document.getElementById(listaId).innerHTML = filas.length
+                ? filas.map(f => `<li><button type="button" onclick="Dashboard.irASaldo('${tipo}', '${Utils.esc(f.id)}')">
+                        <span class="saldo-nombre">${Utils.esc(f.nombre)}</span>
+                        <span class="saldo-monto">${Utils.formatCurrency(f.saldo)}</span>
+                    </button></li>`).join('')
+                : `<li class="saldos-inicio-vacio">${vacio}</li>`;
+        };
+        pintar('saldos-clientes-lista', 'saldos-clientes-total', clientes, 'cliente', 'Ningún cliente te debe.');
+        pintar('saldos-proveedores-lista', 'saldos-proveedores-total', deudas, 'proveedor', 'No le debés a ningún proveedor.');
+    },
+
+    async _cargarXlsx() {
+        if (window.XLSX) return window.XLSX;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo cargar el generador de Excel'));
+            document.head.appendChild(script);
+        });
+        if (!window.XLSX) throw new Error('No se pudo cargar el generador de Excel');
+        return window.XLSX;
+    },
+
+    // Excel con dos hojas: qué debe cada cliente (desde y hasta qué día) y qué se le debe
+    // a cada proveedor (hasta qué mercadería y cuándo se le pagó por última vez).
+    // Se pide todo al servidor en el momento: el archivo tiene que estar al día.
+    async descargarExcelSaldos() {
+        try {
+            const [XLSX, cobranzas, proveedores, recepcion, pagos] = await Promise.all([
+                this._cargarXlsx(),
+                API.request('cobranzas', 'GET'),
+                API.request('proveedores', 'GET'),
+                API.request('recepcion', 'GET'),
+                API.request('pagos-proveedores', 'GET')
+            ]);
+            const aFecha = iso => {
+                const f = Utils.fechaIso(iso);
+                return f ? new Date(f + 'T12:00:00') : '';
+            };
+            const ahora = new Date();
+            const corte = `Saldos al ${ahora.toLocaleDateString('es-AR')} ${ahora.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false })}`;
+
+            const porCliente = new Map();
+            (cobranzas || []).filter(c => Utils.isCobranzaPendiente(c)).forEach(c => {
+                const saldo = Utils.getCobranzaSaldo(c);
+                if (saldo <= 0) return;
+                const id = String(c.cliente_id || '');
+                const fecha = Utils.fechaIso(c.fecha);
+                const fila = porCliente.get(id) || { nombre: Cobranzas._clienteDe(c).nombre || 'Cliente', saldo: 0, dias: 0, desde: '', hasta: '' };
+                fila.saldo += saldo;
+                fila.dias += 1;
+                if (fecha && (!fila.desde || fecha < fila.desde)) fila.desde = fecha;
+                if (fecha && fecha > fila.hasta) fila.hasta = fecha;
+                porCliente.set(id, fila);
+            });
+            const clientes = [...porCliente.values()].sort((a, b) => b.saldo - a.saldo);
+
+            const ultimaMercaderia = {};
+            (recepcion || []).forEach(r => {
+                const confirmado = r.confirmado === true || r.confirmado === 'true';
+                const fecha = Utils.fechaIso(r.fecha);
+                const id = String(r.proveedor_id || '');
+                if (!confirmado || !fecha || !id || !(Number(r.llego) > 0)) return;
+                if (!ultimaMercaderia[id] || fecha > ultimaMercaderia[id]) ultimaMercaderia[id] = fecha;
+            });
+            const ultimoPago = {};
+            (pagos || []).forEach(p => {
+                const fecha = Utils.fechaIso(p.fecha);
+                const id = String(p.proveedor_id || '');
+                if (!fecha || !id) return;
+                if (!ultimoPago[id] || fecha > ultimoPago[id]) ultimoPago[id] = fecha;
+            });
+            const deudas = (proveedores || [])
+                .map(p => ({ id: String(p.id), nombre: p.nombre || 'Proveedor', saldo: Utils.parsePrice(p.saldo) || 0 }))
+                .filter(p => p.saldo > 0)
+                .sort((a, b) => b.saldo - a.saldo);
+
+            const total = filas => filas.reduce((suma, f) => suma + f.saldo, 0);
+            const hojaClientes = XLSX.utils.aoa_to_sheet([
+                [corte],
+                [],
+                ['Cliente', 'Saldo que debe', 'Días adeudados', 'Debe desde', 'Hasta (último día adeudado)'],
+                ...clientes.map(f => [f.nombre, f.saldo, f.dias, aFecha(f.desde), aFecha(f.hasta)]),
+                [],
+                ['TOTAL', total(clientes)]
+            ], { cellDates: true, dateNF: 'dd/mm/yyyy' });
+            const hojaProveedores = XLSX.utils.aoa_to_sheet([
+                [corte],
+                [],
+                ['Proveedor', 'Saldo a pagar', 'Mercadería hasta', 'Último pago'],
+                ...deudas.map(f => [f.nombre, f.saldo, aFecha(ultimaMercaderia[f.id]), aFecha(ultimoPago[f.id])]),
+                [],
+                ['TOTAL', total(deudas)]
+            ], { cellDates: true, dateNF: 'dd/mm/yyyy' });
+
+            const formatoPesos = (hoja, columna) => {
+                const rango = XLSX.utils.decode_range(hoja['!ref']);
+                for (let fila = 3; fila <= rango.e.r; fila++) {
+                    const celda = hoja[XLSX.utils.encode_cell({ r: fila, c: columna })];
+                    if (celda && typeof celda.v === 'number') celda.z = '"$" #,##0';
+                }
+            };
+            formatoPesos(hojaClientes, 1);
+            formatoPesos(hojaProveedores, 1);
+            hojaClientes['!cols'] = [{ wch: 30 }, { wch: 16 }, { wch: 15 }, { wch: 13 }, { wch: 26 }];
+            hojaProveedores['!cols'] = [{ wch: 30 }, { wch: 16 }, { wch: 17 }, { wch: 13 }];
+
+            const libro = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(libro, hojaClientes, 'Clientes');
+            XLSX.utils.book_append_sheet(libro, hojaProveedores, 'Proveedores');
+            XLSX.writeFile(libro, `saldos-${ahora.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' })}.xlsx`);
+            Utils.showSuccess('Se descargó el Excel con los saldos.');
+        } catch (error) {
+            console.error('Error armando el Excel de saldos:', error);
+            Utils.showError('No se pudo armar el Excel: ' + error.message);
+        }
+    },
+
+    // Lleva a la pantalla de pendientes y marca la fila de ese cliente o proveedor.
+    irASaldo(tipo, id) {
+        this._resaltar = { tipo, id: String(id), hasta: Date.now() + 30000 };
+        Navigation.navigateTo(tipo === 'cliente' ? 'cobranzas' : 'pagos-pendientes');
+    },
+
+    // Las tablas se dibujan dos veces (lo guardado y después lo del servidor): la marca
+    // se vuelve a poner mientras dura, y solo la primera vez se desplaza hasta la fila.
+    resaltarFila(tipo) {
+        const r = this._resaltar;
+        if (!r || r.tipo !== tipo || Date.now() > r.hasta) return;
+        const atributo = tipo === 'cliente' ? 'data-cliente-id' : 'data-proveedor-id';
+        const filas = [...document.querySelectorAll(`tr[${atributo}]`)].filter(tr => tr.getAttribute(atributo) === r.id);
+        if (!filas.length) return;
+        filas.forEach(tr => tr.classList.add('fila-resaltada'));
+        if (r.marcada) return;
+        r.marcada = true;
+        r.hasta = Date.now() + 4000;
+        filas[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => {
+            if (this._resaltar === r) this._resaltar = null;
+            document.querySelectorAll('tr.fila-resaltada').forEach(tr => tr.classList.remove('fila-resaltada'));
+        }, 4000);
     },
     
     renderChart(labels, data) {
@@ -4124,7 +4305,9 @@ const Pedidos = {
             const { proveedor, nombreProveedor } = this.resolverProveedorPedido(pedido);
             const badgeEnvio = enviado
                 ? '<span class="status-badge status-activo">Enviado</span>'
-                : '<span class="status-badge status-pendiente">Pendiente</span>';
+                : (this._sinProveedorAProposito(pedido)
+                    ? '<span class="status-badge status-inactivo">No se pide</span>'
+                    : '<span class="status-badge status-pendiente">Pendiente</span>');
             const celdaProveedor = proveedor
                 ? nombreProveedor
                 : '<span class="pedido-proveedor-vacio">Sin proveedor</span>';
@@ -4165,9 +4348,9 @@ const Pedidos = {
 
         const grupos = {};
         pedidos.forEach(pedido => {
-            const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
-            const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(producto?.proveedor_default || ''));
-            const nombre = proveedor?.nombre || 'Sin proveedor';
+            if (this._sinProveedorAProposito(pedido)) return;
+            const { nombreProveedor } = this.resolverProveedorPedido(pedido);
+            const nombre = nombreProveedor || 'Sin proveedor';
             if (!grupos[nombre]) grupos[nombre] = { enviados: 0, total: 0 };
             grupos[nombre].total += 1;
             if (PedidoProveedorService.isEnviado(pedido)) grupos[nombre].enviados += 1;
@@ -4175,7 +4358,7 @@ const Pedidos = {
 
         const enviados = Object.entries(grupos).filter(([, g]) => g.enviados > 0);
         const pendientes = Object.entries(grupos).filter(([, g]) => g.enviados < g.total);
-        const nPendientes = pedidos.filter(p => !PedidoProveedorService.isEnviado(p)).length;
+        const nPendientes = pedidos.filter(p => !PedidoProveedorService.isEnviado(p) && !this._sinProveedorAProposito(p)).length;
 
         const partesEnviados = enviados.map(([nombre, g]) =>
             `${nombre} (${g.enviados} pedido${g.enviados === 1 ? '' : 's'})`
@@ -4279,7 +4462,7 @@ const Pedidos = {
             <div class="form-group">
                 <label>Proveedor</label>
                 <select id="modal-proveedor" class="form-control">
-                    <option value="">Sin proveedor</option>
+                    <option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}">Sin proveedor</option>
                     ${proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
                 <small class="modal-hint">Al elegir el producto se marca su proveedor habitual. Podés cambiarlo para este pedido.</small>
@@ -4389,7 +4572,7 @@ const Pedidos = {
             if (!proveedorSelect) return;
             proveedorSelect.value = [...proveedorSelect.options].some(opcion => opcion.value === String(habitual))
                 ? String(habitual)
-                : '';
+                : PedidoProveedorService.SIN_PROVEEDOR_ID;
         });
     },
     
@@ -4432,7 +4615,7 @@ const Pedidos = {
             <div class="form-group">
                 <label>Proveedor</label>
                 <select id="modal-proveedor" class="form-control">
-                    <option value="">Sin proveedor</option>
+                    <option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}" ${proveedorActual === PedidoProveedorService.SIN_PROVEEDOR_ID || !proveedorActual ? 'selected' : ''}>Sin proveedor</option>
                     ${proveedores.map(p => `<option value="${p.id}" ${String(p.id) === String(proveedorActual) ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
                 <small class="modal-hint">El mismo producto puede pedirse a distintos proveedores. Este cambio vale solo para este pedido.</small>
@@ -4517,7 +4700,7 @@ const Pedidos = {
     async enviarPendientes() {
         try {
             await this.ensureDatosProveedor();
-            const pendientes = (AppState.pedidos || []).filter(p => !PedidoProveedorService.isEnviado(p));
+            const pendientes = (AppState.pedidos || []).filter(p => !PedidoProveedorService.isEnviado(p) && !this._sinProveedorAProposito(p));
             if (pendientes.length === 0) {
                 Utils.showInfo('No hay pedidos pendientes de enviar a proveedores.');
                 return;
@@ -4534,10 +4717,10 @@ const Pedidos = {
             const bloques = Object.keys(grupos).map(proveedorId => {
                 const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
                 const nombre = proveedor?.nombre || 'Sin proveedor asignado';
-                const items = grupos[proveedorId].map(pedido => {
-                    const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
-                    return `<li>${Utils.esc(pedido.cliente_nombre || 'Cliente')} — ${pedido.producto_nombre || producto?.nombre || 'Producto'} × ${pedido.cantidad}</li>`;
-                }).join('');
+                const items = this._totalesPorProducto(grupos[proveedorId]).map(linea => `
+                    <li><strong>${Utils.esc(linea.producto)} × ${linea.total}${linea.unidad ? ' ' + Utils.esc(linea.unidad) : ''}</strong>
+                        <small class="modal-hint">${linea.detalle.map(d => `${Utils.esc(d.cliente)} ${d.cantidad}`).join(' · ')}</small></li>
+                `).join('');
                 const sinTelefono = !proveedor || !proveedor.telefono;
                 return `
                     <div class="proveedor-pendiente">
@@ -4570,11 +4753,7 @@ const Pedidos = {
             return;
         }
 
-        const items = (pedidosGrupo || []).map(pedido => ({
-            producto: pedido.producto_nombre || 'Producto',
-            cantidad: pedido.cantidad
-        }));
-        const mensaje = PedidoProveedorService.construirMensaje(proveedor.nombre, items);
+        const mensaje = PedidoProveedorService.construirMensaje(proveedor.nombre, this._itemsMensaje(pedidosGrupo));
         const modo = await WhatsAppService.sendOrOpen(proveedor.telefono, mensaje, API, AppState.whatsappAutoEnvio);
         const ids = pedidosGrupo.map(p => p.id);
         this.recordarEnviados(ids);
@@ -4590,6 +4769,64 @@ const Pedidos = {
         DataLoader.invalidateFlujo(AppState.currentDate);
         await this.load();
         document.getElementById('modal-overlay')?.classList.remove('active');
+    },
+
+    _productoDe(pedido) {
+        return (AppState.productos || []).find(p => String(p.id) === String(pedido?.producto_id)) || null;
+    },
+
+    _itemsMensaje(pedidos) {
+        return (pedidos || []).map(pedido => {
+            const producto = this._productoDe(pedido);
+            return {
+                producto: pedido.producto_nombre || producto?.nombre || 'Producto',
+                cantidad: pedido.cantidad,
+                unidad: producto?.unidad || ''
+            };
+        });
+    },
+
+    // Un renglón por producto con el total del día y de quién es cada parte.
+    _totalesPorProducto(pedidos) {
+        const porProducto = {};
+        (pedidos || []).forEach(pedido => {
+            const producto = this._productoDe(pedido);
+            const key = String(pedido.producto_id);
+            if (!porProducto[key]) {
+                porProducto[key] = {
+                    producto: pedido.producto_nombre || producto?.nombre || 'Producto',
+                    unidad: producto?.unidad || '',
+                    total: 0,
+                    detalle: []
+                };
+            }
+            const cantidad = parseFloat(pedido.cantidad) || 0;
+            porProducto[key].total = Math.round((porProducto[key].total + cantidad) * 100) / 100;
+            porProducto[key].detalle.push({ cliente: Utils.nombreCatalogo(pedido, 'cliente') || 'Cliente', cantidad });
+        });
+        return Object.values(porProducto).sort((a, b) => a.producto.localeCompare(b.producto, 'es'));
+    },
+
+    // Los pedidos del día del mismo producto y del mismo proveedor que este: se le piden juntos.
+    // Para un envío nuevo, solo los que faltan mandar; para reenviar, los ya mandados.
+    _grupoMismoProducto(pedido) {
+        const enviado = PedidoProveedorService.isEnviado(pedido);
+        const proveedorDe = p => String(p.proveedor_id || this._productoDe(p)?.proveedor_default || '');
+        const proveedor = proveedorDe(pedido);
+        const grupo = (AppState.pedidos || []).filter(p =>
+            String(p.producto_id) === String(pedido.producto_id) &&
+            PedidoProveedorService.isEnviado(p) === enviado &&
+            proveedorDe(p) === proveedor
+        );
+        return grupo.some(p => String(p.id) === String(pedido.id)) ? grupo : [pedido, ...grupo];
+    },
+
+    // Solo se guarda el proveedor en los pedidos que tenían otro: cada cambio es una ida al servidor.
+    async _asignarProveedorAlGrupo(grupo, proveedorId) {
+        for (const p of grupo) {
+            const actual = String(p.proveedor_id || this._productoDe(p)?.proveedor_default || '');
+            if (actual !== String(proveedorId)) await this.guardarProveedorDelPedido(p, proveedorId);
+        }
     },
 
     getProveedoresActivos(proveedores) {
@@ -4631,6 +4868,7 @@ const Pedidos = {
         } else {
             botones.push(`<button type="button" class="btn btn-secondary" onclick="Pedidos.reSeleccionarProveedor('${pedido.id}')">Reenviar WhatsApp</button>`);
         }
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="Pedidos.cambiarProveedor('${pedido.id}')">Cambiar proveedor</button>`);
         botones.push(`<button type="button" class="btn btn-secondary" onclick="Pedidos.edit('${pedido.id}')">Editar pedido</button>`);
         botones.push(`<button type="button" class="btn btn-danger" onclick="Pedidos.delete('${pedido.id}')">Eliminar pedido</button>`);
 
@@ -4718,6 +4956,50 @@ const Pedidos = {
         }
     },
 
+    // Cambia el proveedor de un pedido sin mandar nada. "Sin proveedor" queda guardado a propósito:
+    // ese pedido no se le pide a nadie y no cuenta como pendiente de enviar.
+    async cambiarProveedor(pedidoId) {
+        try {
+            await this.ensureDatosProveedor();
+            const pedido = this.encontrarPedido(pedidoId);
+            if (!pedido) {
+                Utils.showError('Pedido no encontrado');
+                return;
+            }
+            const SIN = PedidoProveedorService.SIN_PROVEEDOR_ID;
+            const producto = this._productoDe(pedido);
+            const actual = String(pedido.proveedor_id || producto?.proveedor_default || SIN);
+            const proveedores = this.getProveedoresActivos(AppState.proveedores);
+            const opciones = [`<option value="${SIN}" ${actual === SIN ? 'selected' : ''}>Sin proveedor</option>`]
+                .concat(proveedores.map(p => `<option value="${p.id}" ${String(p.id) === actual ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`));
+            const content = `
+                <p><strong>${Utils.esc(Utils.nombreCatalogo(pedido, 'cliente'))}</strong> — ${Utils.esc(pedido.producto_nombre || producto?.nombre || 'Producto')} × ${pedido.cantidad || 0}</p>
+                <div class="form-group">
+                    <label for="modal-cambiar-proveedor">Proveedor</label>
+                    <select id="modal-cambiar-proveedor" class="form-control">${opciones.join('')}</select>
+                    <small class="modal-hint">Elegí "Sin proveedor" si este pedido no se le pide a nadie. Vale solo para este pedido.</small>
+                </div>
+            `;
+            Utils.showModal('Cambiar proveedor', content, async () => {
+                const elegido = document.getElementById('modal-cambiar-proveedor').value;
+                if (elegido === actual) return;
+                await this.guardarProveedorDelPedido(pedido, elegido);
+                this.render();
+                const nombre = elegido === SIN
+                    ? 'sin proveedor'
+                    : (proveedores.find(p => String(p.id) === elegido)?.nombre || 'el proveedor elegido');
+                Utils.showSuccess(`El pedido quedó con ${nombre}.`);
+            }, 'Guardar');
+        } catch (error) {
+            console.error('Error en Pedidos.cambiarProveedor():', error);
+            this.handleProveedorError(error);
+        }
+    },
+
+    _sinProveedorAProposito(pedido) {
+        return String(pedido?.proveedor_id || '') === PedidoProveedorService.SIN_PROVEEDOR_ID;
+    },
+
     async reSeleccionarProveedor(pedidoId) {
         try {
             await this.ensureDatosProveedor();
@@ -4768,7 +5050,11 @@ const Pedidos = {
 
         if (saveBtn) saveBtn.disabled = sinTelefono;
 
+        const grupo = this._grupoMismoProducto(pedido);
+        const [linea] = this._totalesPorProducto(grupo);
+        const unidad = linea.unidad ? ' ' + Utils.esc(linea.unidad) : '';
         previewItems.innerHTML = `
+            <p class="modal-hint">Se le pide el total del día de ${Utils.esc(productoNombre)}${grupo.length > 1 ? ` (${grupo.length} pedidos)` : ''}.</p>
             <table class="modal-pedido-detalle-table">
                 <thead>
                     <tr>
@@ -4778,19 +5064,22 @@ const Pedidos = {
                     </tr>
                 </thead>
                 <tbody>
+                    ${linea.detalle.map(d => `
                     <tr>
-                        <td>${Utils.esc(pedido.cliente_nombre || '-')}</td>
-                        <td>${productoNombre}</td>
-                        <td>${pedido.cantidad || 0}</td>
+                        <td>${Utils.esc(d.cliente)}</td>
+                        <td>${Utils.esc(productoNombre)}</td>
+                        <td>${d.cantidad}</td>
+                    </tr>`).join('')}
+                    <tr>
+                        <td><strong>Total del día</strong></td>
+                        <td></td>
+                        <td><strong>${linea.total}${unidad}</strong></td>
                     </tr>
                 </tbody>
             </table>
         `;
 
-        previewMensaje.value = PedidoProveedorService.construirMensaje(proveedor.nombre, [{
-            producto: productoNombre,
-            cantidad: pedido.cantidad
-        }]);
+        previewMensaje.value = PedidoProveedorService.construirMensaje(proveedor.nombre, this._itemsMensaje(grupo));
     },
 
     bindModalProveedorEvents(proveedorDefault, pedido) {
@@ -4900,17 +5189,17 @@ const Pedidos = {
                 );
             }
 
-            await this.guardarProveedorDelPedido(pedido, proveedorId);
-
+            const grupo = this._grupoMismoProducto(pedido);
             const modoEnvio = await WhatsAppService.sendOrOpen(
                 proveedor.telefono,
                 mensaje,
                 API,
                 AppState.whatsappAutoEnvio
             );
+            await this._asignarProveedorAlGrupo(grupo, proveedorId);
 
-            this.recordarEnviados([pedido.id]);
-            this.registrarEnvio(proveedor.nombre, 1, modoEnvio);
+            this.recordarEnviados(grupo.map(p => p.id));
+            this.registrarEnvio(proveedor.nombre, grupo.length, modoEnvio);
             DataLoader.invalidateFlujo(AppState.currentDate);
             await this.load();
 
@@ -4940,7 +5229,7 @@ const Pedidos = {
                 );
             }
 
-            await this.guardarProveedorDelPedido(pedido, proveedorId);
+            const grupo = this._grupoMismoProducto(pedido);
 
             const context = {
                 pedidos: AppState.pedidos,
@@ -4958,9 +5247,11 @@ const Pedidos = {
                 AppState.whatsappAutoEnvio
             );
 
-            this.recordarEnviados([pedido.id]);
-            this.registrarEnvio(proveedor.nombre, 1, modoEnvio);
-            await PedidoProveedorService.persistirMarcado([pedido.id], context);
+            await this._asignarProveedorAlGrupo(grupo, proveedorId);
+            const ids = grupo.map(p => p.id);
+            this.recordarEnviados(ids);
+            this.registrarEnvio(proveedor.nombre, ids.length, modoEnvio);
+            await PedidoProveedorService.persistirMarcado(ids, context);
             DataLoader.invalidateFlujo(AppState.currentDate);
             await this.load();
         } catch (error) {
@@ -5754,6 +6045,140 @@ const Precios = {
     selectedClienteId: null,
     comisionPorUnidad: 350,
     recepciones: [], // Para obtener precio_real
+
+    // "cliente": la tabla de siempre para cargar precios. "planilla": todo el día de un vistazo.
+    vista: (() => { try { return localStorage.getItem('precios-vista') || 'cliente'; } catch (e) { return 'cliente'; } })(),
+
+    cambiarVista(vista) {
+        this.vista = vista === 'planilla' ? 'planilla' : 'cliente';
+        try { localStorage.setItem('precios-vista', this.vista); } catch (e) { /* sin almacenamiento */ }
+        this.renderPlanilla();
+    },
+
+    // Productos en filas y clientes en columnas: cuánto lleva cada uno, el total, el precio
+    // (lo que cobró el proveedor), el puesto y el precio total. Como la planilla que usaban en Excel.
+    _datosPlanilla() {
+        const precios = AppState.precios || [];
+        const clientesMap = new Map();
+        const productosMap = new Map();
+        precios.forEach(p => {
+            const cantidad = parseFloat(p.cantidad) || 0;
+            if (cantidad <= 0) return;
+            const cid = String(p.cliente_id);
+            if (!clientesMap.has(cid)) clientesMap.set(cid, { id: cid, nombre: Utils.nombreCatalogo(p, 'cliente') || 'Cliente' });
+            const pid = String(p.producto_id);
+            if (!productosMap.has(pid)) {
+                const recepcion = (this.recepciones || []).find(r => String(r.producto_id) === pid);
+                const producto = (AppState.productos || []).find(x => String(x.id) === pid);
+                const provId = String(recepcion?.proveedor_id || producto?.proveedor_default || '');
+                const proveedor = (AppState.proveedores || []).find(x => String(x.id) === provId);
+                productosMap.set(pid, {
+                    producto: Utils.nombreCatalogo(p, 'producto') || 'Producto',
+                    precio: Utils.parsePrice(recepcion?.precio_real) || 0,
+                    puesto: proveedor?.nombre || recepcion?.proveedor_nombre || '',
+                    cants: {},
+                    total: 0
+                });
+            }
+            const fila = productosMap.get(pid);
+            fila.cants[cid] = Math.round(((fila.cants[cid] || 0) + cantidad) * 100) / 100;
+            fila.total = Math.round((fila.total + cantidad) * 100) / 100;
+        });
+        const clientes = [...clientesMap.values()].sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+        const productos = [...productosMap.values()]
+            .map(f => ({ ...f, precioTotal: Math.round(f.total * f.precio) }))
+            .sort((a, b) => a.producto.localeCompare(b.producto, 'es'));
+        return { clientes, productos, total: productos.reduce((s, f) => s + f.precioTotal, 0) };
+    },
+
+    renderPlanilla() {
+        const planilla = document.getElementById('precios-planilla');
+        const vistaCliente = document.getElementById('precios-vista-cliente');
+        if (!planilla) return;
+        const enPlanilla = this.vista === 'planilla';
+        planilla.hidden = !enPlanilla;
+        if (vistaCliente) vistaCliente.hidden = enPlanilla;
+        document.getElementById('btn-precios-vista-cliente')?.classList.toggle('activo', !enPlanilla);
+        document.getElementById('btn-precios-vista-planilla')?.classList.toggle('activo', enPlanilla);
+        if (!enPlanilla) return;
+
+        const tabla = document.getElementById('precios-planilla-tabla');
+        const { clientes, productos, total } = this._datosPlanilla();
+        if (!productos.length) {
+            tabla.innerHTML = '<tbody><tr><td style="padding:30px;color:#666;">Todavía no hay productos confirmados en la recepción de este día.</td></tr></tbody>';
+            return;
+        }
+        const cant = n => (n ? String(n).replace('.', ',') : '');
+        const fecha = AppState.currentDate ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR') : '';
+        tabla.innerHTML = `
+            <thead>
+                <tr>
+                    <th class="pl-producto">${Utils.esc(fecha)} · Producto</th>
+                    ${clientes.map(c => `<th>${Utils.esc(c.nombre)}</th>`).join('')}
+                    <th class="pl-total">Total cant.</th>
+                    <th>Precio</th>
+                    <th>Puesto</th>
+                    <th>Precio total</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${productos.map(f => `
+                <tr>
+                    <td class="pl-producto">${Utils.esc(f.producto)}</td>
+                    ${clientes.map(c => `<td>${cant(f.cants[c.id])}</td>`).join('')}
+                    <td class="pl-total">${cant(f.total)}</td>
+                    <td class="pl-dinero">${f.precio ? Utils.formatCurrency(f.precio) : '—'}</td>
+                    <td class="pl-puesto">${Utils.esc(f.puesto || '—')}</td>
+                    <td class="pl-dinero">${f.precio ? Utils.formatCurrency(f.precioTotal) : '—'}</td>
+                </tr>`).join('')}
+            </tbody>
+            <tfoot>
+                <tr>
+                    <td class="pl-producto">Total</td>
+                    ${clientes.map(() => '<td></td>').join('')}
+                    <td class="pl-total"></td>
+                    <td></td>
+                    <td></td>
+                    <td class="pl-dinero">${Utils.formatCurrency(total)}</td>
+                </tr>
+            </tfoot>
+        `;
+    },
+
+    async descargarPlanillaExcel() {
+        try {
+            const XLSX = await Dashboard._cargarXlsx();
+            const { clientes, productos, total } = this._datosPlanilla();
+            if (!productos.length) {
+                Utils.showInfo('Todavía no hay productos confirmados en la recepción de este día.');
+                return;
+            }
+            const fecha = AppState.currentDate ? new Date(AppState.currentDate + 'T12:00:00') : '';
+            const filas = [
+                [fecha, ...clientes.map(c => c.nombre), 'TOTAL', 'PRECIO', 'PUESTO', 'PRECIO TOTAL'],
+                ['PRODUCTO', ...clientes.map(() => 'CANT'), 'CANT', '', '', ''],
+                ...productos.map(f => [f.producto, ...clientes.map(c => f.cants[c.id] || ''), f.total, f.precio || '', f.puesto, f.precio ? f.precioTotal : '']),
+                [],
+                ['TOTAL', ...clientes.map(() => ''), '', '', '', total]
+            ];
+            const hoja = XLSX.utils.aoa_to_sheet(filas, { cellDates: true, dateNF: 'dd/mm/yyyy' });
+            const colPrecio = clientes.length + 2;
+            const rango = XLSX.utils.decode_range(hoja['!ref']);
+            for (let r = 2; r <= rango.e.r; r++) {
+                [colPrecio, colPrecio + 2].forEach(c => {
+                    const celda = hoja[XLSX.utils.encode_cell({ r, c })];
+                    if (celda && typeof celda.v === 'number') celda.z = '"$" #,##0';
+                });
+            }
+            hoja['!cols'] = [{ wch: 26 }, ...clientes.map(() => ({ wch: 10 })), { wch: 10 }, { wch: 12 }, { wch: 18 }, { wch: 14 }];
+            const libro = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(libro, hoja, 'Planilla');
+            XLSX.writeFile(libro, `planilla-${AppState.currentDate || 'dia'}.xlsx`);
+        } catch (error) {
+            console.error('Error armando la planilla:', error);
+            Utils.showError('No se pudo armar el Excel: ' + error.message);
+        }
+    },
     
     async load() {
         const tbody = document.getElementById('precios-tbody');
@@ -5900,8 +6325,15 @@ const Precios = {
         
         // Ocultar loader local
         Utils.hideTableLoader(tbody);
+        this.renderPlanilla();
         
         // GUARDAR VALORES ACTUALES DE LOS INPUTS ANTES DE RENDERIZAR
+        // Precio real: lo que esté escrito en el campo (vacío = volver al de la recepción).
+        const realesInputs = {};
+        document.querySelectorAll('.precio-real').forEach(input => {
+            const id = input.getAttribute('data-id');
+            if (id) realesInputs[id] = Utils.parsePrice((input.value || '').trim()) || 0;
+        });
         const preciosInputs = {};
         document.querySelectorAll('.precio-cliente').forEach(input => {
             const id = input.getAttribute('data-id');
@@ -5951,10 +6383,17 @@ const Precios = {
             // Obtener precio_real de la recepción
             const recepcion = this.recepciones.find(r => String(r.producto_id) === String(precio.producto_id));
             const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
-            const precioReal = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            // Se completa solo con el costo de la recepción; si lo cambian a mano, vale el de la línea.
+            const precioRealLinea = realesInputs[precio.id] !== undefined
+                ? realesInputs[precio.id]
+                : Utils.parsePrice(precio.precio_real || 0);
+            const precioRealEditado = precioRealLinea > 0 && precioRealLinea !== precioRealRecepcion;
+            precio.precio_real = precioRealEditado ? precioRealLinea : 0;
+            const precioReal = precioRealEditado ? precioRealLinea : precioRealRecepcion;
             
             const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
-            const pareceAutomatico = precioReal > 0 && extra > 0 && precioUnitario === precioReal + extra;
+            const pareceAutomatico = precioRealRecepcion > 0 && extra > 0 && precioUnitario === precioRealRecepcion + extra;
             const precioManual = pareceAutomatico ? 0 : precioUnitario;
             if (pareceAutomatico) {
                 precio.precio_cliente = 0;
@@ -5977,7 +6416,7 @@ const Precios = {
                     <td>${Utils.nombreCatalogo(precio, 'cliente')}</td>
                     <td>${Utils.nombreCatalogo(precio, 'producto')}</td>
                     <td>${cantidad}</td>
-                    <td>${precioReal > 0 ? Utils.formatCurrency(precioReal) : '-'}</td>
+                    <td><input type="text" class="precio-real${precioRealEditado ? ' precio-real-editado' : ''}" data-id="${precio.id}" data-auto="${precioRealRecepcion}" data-price-input="true" value="${precioReal > 0 ? Utils.formatPrice(precioReal) : ''}" style="width: 100px;" placeholder="${precioRealRecepcion > 0 ? Utils.formatPrice(precioRealRecepcion) : 'Costo c/u'}" title="${precioRealEditado ? `Cambiado a mano (el de la recepción es ${Utils.formatCurrency(precioRealRecepcion)}). Borralo para volver al de la recepción.` : 'Sale de la recepción. Podés cambiarlo: solo cambia la ganancia de esta línea, no lo que le debés al proveedor.'}"></td>
                     <td><input type="text" class="precio-cliente" data-id="${precio.id}" data-price-input="true" value="${precioManual > 0 ? Utils.formatPrice(precioManual) : ''}" onchange="Precios.onPrecioChange()" style="width: 100px;" placeholder="Precio al cliente" title="Lo que le cobrás al cliente por unidad. La comisión se suma aparte."></td>
                     <td style="color: ${gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${precioManual > 0 ? `${gananciaTotal > 0 ? '+' : ''}${Utils.formatCurrency(gananciaTotal)}` : '—'}</td>
                     <td>${precioManual > 0 ? Utils.formatCurrency(total) : '—'}</td>
@@ -6090,10 +6529,16 @@ const Precios = {
             totalCantidad += cantidad;
             const recepcion = (this.recepciones || []).find(r => String(r.producto_id) === String(precio.producto_id));
             const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
-            const precioReal = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            const inputReal = tr.querySelector('.precio-real');
+            const precioRealLinea = inputReal ? (Utils.parsePrice(inputReal.value) || 0) : 0;
+            const precioRealEditado = precioRealLinea > 0 && precioRealLinea !== precioRealRecepcion;
+            precio.precio_real = precioRealEditado ? precioRealLinea : 0;
+            if (inputReal) inputReal.classList.toggle('precio-real-editado', precioRealEditado);
+            const precioReal = precioRealEditado ? precioRealLinea : precioRealRecepcion;
             const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
             const precioUnitario = Utils.parsePrice(input.value) || 0;
-            const pareceAutomatico = precioReal > 0 && extra > 0 && precioUnitario === precioReal + extra;
+            const pareceAutomatico = precioRealRecepcion > 0 && extra > 0 && precioUnitario === precioRealRecepcion + extra;
             const precioManual = pareceAutomatico ? 0 : precioUnitario;
             const gananciaTotal = precioManual > 0 ? (precioManual - precioReal) * cantidad : 0;
             const total = cantidad * precioManual;
@@ -6306,7 +6751,9 @@ const Precios = {
                     producto_id: precioData.producto_id,
                     cantidad: precioData.cantidad || 0,
                     precio_cliente: precio,
-                    comision_unitaria: this.comisionPorUnidad
+                    comision_unitaria: this.comisionPorUnidad,
+                    // 0 = el de la recepción (se guarda vacío)
+                    precio_real: Utils.parsePrice(precioData.precio_real) || 0
                 });
             }
         });
@@ -8022,6 +8469,7 @@ const Cobranzas = {
             const btnWhatsApp = sinTelefono
                 ? '<button class="btn btn-whatsapp btn-sm" type="button" disabled title="Falta teléfono">WhatsApp</button>'
                 : `<button class="btn btn-whatsapp btn-sm" type="button" onclick="Cobranzas.enviarWhatsApp('${cobranza.id}')">WhatsApp</button>`;
+            tr.dataset.clienteId = String(cobranza.cliente_id || '');
             tr.innerHTML = `
                 <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}</td>
                 <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
@@ -8038,6 +8486,7 @@ const Cobranzas = {
             `;
             tbody.appendChild(tr);
         });
+        Dashboard.resaltarFila('cliente');
     },
 
     _clienteDe(cobranza) {
@@ -9081,6 +9530,7 @@ const Pagos = {
             const vino = identificados.length
                 ? `<div class="deposito-texto">${identificados.map(item => `${Depositos._esc(item.cuenta)} · vino de ${Depositos._esc(item.cliente)} ${Utils.formatCurrency(item.monto)}`).join('<br>')}</div>`
                 : '';
+            tr.dataset.proveedorId = String(proveedor.id || '');
             tr.innerHTML = `
                 <td data-label="Proveedor">${Utils.esc(proveedor.nombre || '')}${vino}</td>
                 <td data-label="Le debés" style="${saldo > 0 ? 'color:#dc3545;font-weight:700;' : ''}">${Utils.formatCurrency(saldo)}</td>
@@ -9096,6 +9546,7 @@ const Pagos = {
             tbody.appendChild(tr);
         });
         Depositos.pintarEnPagos();
+        Dashboard.resaltarFila('proveedor');
     },
 
     _aplicarRecepcionHoy(recepcion) {
@@ -10764,12 +11215,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     const preciosTbody = document.getElementById('precios-tbody');
     if (preciosTbody) {
+        const esCampoPrecio = el => el.classList && (el.classList.contains('precio-cliente') || el.classList.contains('precio-real'));
         preciosTbody.addEventListener('input', (e) => {
-            if (!e.target.classList || !e.target.classList.contains('precio-cliente')) return;
+            if (!esCampoPrecio(e.target)) return;
             Precios.refrescarCalculo();
         });
         preciosTbody.addEventListener('focusout', (e) => {
-            if (!e.target.classList || !e.target.classList.contains('precio-cliente')) return;
+            if (!esCampoPrecio(e.target)) return;
             Precios.onPrecioChange();
         });
     }
@@ -10789,6 +11241,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });
     addButtonListener('btn-ajustar-stock', () => Stock.ajustar(), 'Ajustando...');
     addButtonListener('btn-verificar-stock', () => Stock.verificarStockBajo(), 'Verificando...');
+    addButtonListener('btn-saldos-excel', () => Dashboard.descargarExcelSaldos(), 'Armando Excel...');
+    addButtonListener('btn-precios-planilla-excel', () => Precios.descargarPlanillaExcel(), 'Armando Excel...');
     addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
     addButtonListener('btn-ir-reparto', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-caja-repartir', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });

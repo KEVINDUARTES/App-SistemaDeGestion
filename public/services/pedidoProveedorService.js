@@ -195,21 +195,28 @@ const PedidoProveedorService = {
      * @param {Array} items
      * @returns {string}
      */
+    // Al proveedor le importa el total del día, no cuánto lleva cada cliente:
+    // "Richar 10 ajos, Ruben 10 ajos, Raul 10 ajos" se manda como "Ajo: 30".
     construirMensaje(nombreProveedor, items) {
-        const cantidadesPorProducto = {};
+        const porProducto = {};
 
         items.forEach(item => {
             const nombre = item.producto || 'Producto';
-            const cantidad = parseFloat(item.cantidad) || 0;
-            cantidadesPorProducto[nombre] = (cantidadesPorProducto[nombre] || 0) + cantidad;
+            if (!porProducto[nombre]) porProducto[nombre] = { cantidad: 0, unidad: item.unidad || '' };
+            porProducto[nombre].cantidad += parseFloat(item.cantidad) || 0;
         });
 
-        const lineasProductos = Object.entries(cantidadesPorProducto)
-            .map(([nombre, cantidad]) => `• ${nombre} x${cantidad}`)
+        const lineasProductos = Object.keys(porProducto)
+            .sort((a, b) => a.localeCompare(b, 'es'))
+            .map(nombre => {
+                const { cantidad, unidad } = porProducto[nombre];
+                const total = Math.round(cantidad * 100) / 100;
+                return `• ${nombre}: ${total}${unidad ? ' ' + unidad : ''}`;
+            })
             .join('\n');
 
         return (
-            `Hola ${nombreProveedor}, queremos realizar el siguiente pedido:\n\n` +
+            `Hola ${nombreProveedor}, hoy vamos a necesitar:\n\n` +
             `${lineasProductos}\n\n` +
             'Muchas gracias.'
         );

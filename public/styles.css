@@ -704,6 +704,185 @@ body {
     color: var(--color-gray-600);
 }
 
+.saldos-inicio {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+.saldos-inicio-acciones {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    color: var(--color-gray-600);
+}
+
+.saldos-inicio-card {
+    background: var(--color-white);
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+}
+
+.saldos-inicio-card header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.saldos-inicio-card h3 {
+    margin: 0;
+    font-size: 1rem;
+    color: var(--color-gray-800);
+}
+
+.saldos-inicio-total {
+    color: var(--color-danger);
+    font-size: 1.15rem;
+}
+
+.saldos-inicio-lista {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 260px;
+    overflow-y: auto;
+}
+
+.saldos-inicio-lista button {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 8px;
+    border: 0;
+    border-bottom: 1px solid var(--color-gray-100);
+    background: none;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    color: var(--color-gray-700);
+}
+
+.saldos-inicio-lista button:hover,
+.saldos-inicio-lista button:focus-visible {
+    background: var(--color-gray-50);
+}
+
+.saldos-inicio-lista .saldo-nombre {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.saldos-inicio-lista .saldo-monto {
+    font-weight: 700;
+    color: var(--color-danger);
+    white-space: nowrap;
+}
+
+.saldos-inicio-vacio {
+    color: var(--color-gray-500);
+    padding: 8px 0;
+}
+
+.precio-real-editado {
+    border-color: var(--color-warning) !important;
+    background: var(--color-warning-light) !important;
+}
+
+.precios-vistas {
+    display: inline-flex;
+    gap: 4px;
+    padding: 4px;
+    margin-bottom: 16px;
+    background: var(--color-gray-100);
+    border-radius: var(--radius-lg);
+}
+
+.precios-vistas .btn {
+    background: transparent;
+    color: var(--color-gray-600);
+    border: 0;
+}
+
+.precios-vistas .btn.activo {
+    background: var(--color-white);
+    color: var(--color-primary-dark);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.precios-planilla-acciones {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.precios-planilla-acciones .modal-hint {
+    margin: 0;
+}
+
+.precios-planilla-scroll {
+    overflow-x: auto;
+}
+
+.precios-planilla-tabla th,
+.precios-planilla-tabla td {
+    white-space: nowrap;
+    text-align: center;
+}
+
+.precios-planilla-tabla .pl-producto {
+    text-align: left;
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--color-white);
+}
+
+.precios-planilla-tabla thead .pl-producto {
+    background: inherit;
+}
+
+.precios-planilla-tabla .pl-total {
+    background: var(--color-info-light);
+    font-weight: 700;
+}
+
+.precios-planilla-tabla thead .pl-total {
+    background: rgba(255, 255, 255, 0.2);
+    color: inherit;
+}
+
+.precios-planilla-tabla .pl-dinero {
+    text-align: right;
+}
+
+.precios-planilla-tabla .pl-puesto {
+    text-align: left;
+}
+
+.precios-planilla-tabla tfoot td {
+    font-weight: 700;
+    background: var(--color-gray-50);
+}
+
+tr.fila-resaltada td {
+    background: var(--color-warning-light) !important;
+    transition: background 0.4s;
+}
+
 .reparto-card {
     background: var(--color-white);
     border: 1px solid var(--color-gray-200);

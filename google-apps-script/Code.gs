@@ -31,7 +31,12 @@ const CONFIG = {
   //  - Los datos que ya existían (la hoja de siempre) son de Nicol. Kevin arranca con una hoja nueva y vacía.
   USERS: {
     'kevindurtes792@gmail.com': { password: 'kevinpassword123', spreadsheetId: '' },
-    'nicolirina.rosascharny@gmail.com': { password: 'nicolpassword456', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' }
+    'nicolirina.rosascharny@gmail.com': { password: 'nicolpassword456', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' },
+    // Equipo de Luciano Cargas: trabajan sobre la misma hoja que Nicol (ven y cargan los mismos datos).
+    'lau.alvarez1601@gmail.com': { password: 'Crdkps-8553', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' },
+    'deniserosas153@gmail.com': { password: 'Fsjpdb-8346', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' },
+    'cargasluciano@gmail.com': { password: 'Nawfrn-8976', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' },
+    'sarmientolucasfacundo@gmail.com': { password: 'Nxqxfb-9797', spreadsheetId: '18G5wDNgnsSu4saWGQu4m-B0XF6oJ5oRrSPLl7zMVJVY' }
   }
 };
 
@@ -106,9 +111,14 @@ function setTenant_(email) {
 
 /** Corre algo (por ejemplo un aviso programado) una vez por cada usuario. */
 function paraCadaUsuario_(fn) {
+  // Varios usuarios pueden compartir la misma hoja: se corre una sola vez por hoja
+  // (si no, el aviso de stock bajo llegaría repetido).
+  var hojasHechas = {};
   Object.keys(CONFIG.USERS).forEach(function(email) {
     try {
-      setTenant_(email);
+      var hoja = setTenant_(email).spreadsheetId;
+      if (hojasHechas[hoja]) return;
+      hojasHechas[hoja] = true;
       fn(email);
     } catch (error) {
       Logger.log('❌ Falló para ' + email + ': ' + error.toString());
@@ -2579,6 +2589,8 @@ function getPreciosCliente(fecha = null) {
     if (precio.fecha) precio.fecha = normalizeFecha(precio.fecha);
     precio.precio_cliente = normalizeAmount(precio.precio_cliente);
     precio.comision_unitaria = normalizeAmount(precio.comision_unitaria);
+    // Precio real cambiado a mano en esa línea (solo para la ganancia). 0 = el de la recepción.
+    precio.precio_real = normalizeAmount(precio.precio_real);
 
     var cliente = findInIdMap(clientesMap, precio.cliente_id);
     precio.cliente_nombre = cliente ? cliente.nombre : '';
@@ -2598,6 +2610,7 @@ function getPreciosCliente(fecha = null) {
 function savePreciosCliente(data) {
   const sheet = getSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
   ensureColumn(sheet, 'comision_unitaria');
+  ensureColumn(sheet, 'precio_real');
   
   // Normalizar fecha una sola vez
   const fechaNormalizada = normalizeFecha(data.fecha);
@@ -2613,6 +2626,7 @@ function savePreciosCliente(data) {
   const cantidadIdx = headers.indexOf('cantidad') !== -1 ? headers.indexOf('cantidad') : 4;
   const precioIdx = headers.indexOf('precio_cliente') !== -1 ? headers.indexOf('precio_cliente') : 5;
   const comisionIdx = headers.indexOf('comision_unitaria');
+  const precioRealIdx = headers.indexOf('precio_real');
   const preciosIndex = {};
   
   for (let i = 1; i < values.length; i++) {
@@ -2632,10 +2646,15 @@ function savePreciosCliente(data) {
       ? normalizeAmount(item.comision_unitaria)
       : comisionDia;
 
+    // El precio real de la línea solo se toca si viene: armar la lista no lo manda y no lo borra.
+    var traePrecioReal = item.precio_real !== undefined && item.precio_real !== null;
+    var precioRealLinea = traePrecioReal && normalizeAmount(item.precio_real) > 0 ? normalizeAmount(item.precio_real) : '';
+
     if (rowIdx !== undefined) {
       values[rowIdx][precioIdx] = precioCliente;
       if (cantidadIdx !== -1 && item.cantidad !== undefined) values[rowIdx][cantidadIdx] = item.cantidad || 0;
       if (comisionIdx !== -1) values[rowIdx][comisionIdx] = comision;
+      if (precioRealIdx !== -1 && traePrecioReal) values[rowIdx][precioRealIdx] = precioRealLinea;
     } else {
       var newRow = [];
       for (var c = 0; c < headers.length; c++) newRow.push('');
@@ -2648,6 +2667,7 @@ function savePreciosCliente(data) {
       newRow[cantidadIdx] = item.cantidad || 0;
       newRow[precioIdx] = precioCliente;
       if (comisionIdx !== -1) newRow[comisionIdx] = comision;
+      if (precioRealIdx !== -1 && traePrecioReal) newRow[precioRealIdx] = precioRealLinea;
       rowsToAppend.push(newRow);
     }
   });
