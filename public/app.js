@@ -2223,6 +2223,7 @@ const Navigation = {
             historial: 'Historial de días',
             reparto: 'Repartir efectivo',
             caja: 'Caja',
+            cuentas: 'Cuentas corrientes',
             mantenimiento: 'Limpiar datos'
         };
         document.getElementById('page-title').textContent = titles[requested] || 'Dashboard';
@@ -2288,6 +2289,9 @@ const Navigation = {
                     break;
                 case 'caja':
                     await Caja.load();
+                    break;
+                case 'cuentas':
+                    await Cuentas.load();
                     break;
                 case 'reparto':
                     await Reparto.load();
@@ -2695,6 +2699,7 @@ const Clientes = {
                     <td>${Utils.esc(cliente.telefono || '')}</td>
                     <td><span class="status-badge ${esActivo ? 'status-activo' : 'status-inactivo'}">${esActivo ? 'Activo' : 'Inactivo'}</span></td>
                     <td>
+                        <button class="btn btn-secondary" onclick="CuentaCorriente.abrir('cliente', '${cliente.id}')">Cuenta</button>
                         <button class="btn btn-secondary" onclick="Clientes.edit('${cliente.id}')">Editar</button>
                         <button class="btn ${esActivo ? 'btn-secondary' : 'btn-primary'}" onclick="Clientes.toggleActivo('${cliente.id}', ${esActivo})">${esActivo ? 'Desactivar' : 'Activar'}</button>
                         <button class="btn btn-danger" onclick="Clientes.delete('${cliente.id}')">Eliminar</button>
@@ -3181,7 +3186,9 @@ const ProveedoresGestion = {
             const action = button.dataset.proveedorAction;
             const id = button.dataset.proveedorId;
 
-            if (action === 'edit') {
+            if (action === 'cuenta') {
+                CuentaCorriente.abrir('proveedor', id);
+            } else if (action === 'edit') {
                 this.edit(id);
             } else if (action === 'toggle') {
                 this.toggleActivo(id, button.dataset.activo === 'true');
@@ -3240,6 +3247,7 @@ const ProveedoresGestion = {
                     <td>${(proveedor.telefono && !String(proveedor.telefono).startsWith('#')) ? proveedor.telefono : '-'}</td>
                     <td><span class="status-badge ${esActivo ? 'status-activo' : 'status-inactivo'}">${esActivo ? 'Activo' : 'Inactivo'}</span></td>
                     <td>
+                        <button type="button" class="btn btn-secondary" data-proveedor-action="cuenta" data-proveedor-id="${proveedor.id}">Cuenta</button>
                         <button type="button" class="btn btn-secondary" data-proveedor-action="edit" data-proveedor-id="${proveedor.id}">Editar</button>
                         <button type="button" class="btn ${esActivo ? 'btn-secondary' : 'btn-primary'}" data-proveedor-action="toggle" data-proveedor-id="${proveedor.id}" data-activo="${esActivo}">${esActivo ? 'Desactivar' : 'Activar'}</button>
                         <button type="button" class="btn btn-danger" data-proveedor-action="delete" data-proveedor-id="${proveedor.id}">Eliminar</button>
@@ -4046,6 +4054,7 @@ const Camiones = {
                     height: alto,
                     useCORS: true
                 });
+                doc.__lienzos = (doc.__lienzos || []).concat(canvas);
                 const img = canvas.toDataURL('image/jpeg', 0.92);
                 const imgH = canvas.height * pageW / canvas.width;
                 if (i > 0) doc.addPage();
@@ -4067,14 +4076,13 @@ const Camiones = {
     },
 
     async _enviarPdf(lista, telefono) {
+        if (!WhatsAppService.normalizePhone(telefono)) {
+            Utils.showError('Ese teléfono no es válido para WhatsApp. Revisalo (ej.: 261 248 2292).');
+            return;
+        }
         const texto = lista.length === 1
             ? `Te mando la carga de ${lista[0].nombre}.`
             : 'Te mando la carga de los camiones.';
-        // En la computadora va directo a WhatsApp, como los demás botones: el menú "Compartir"
-        // de la Mac no ofrece WhatsApp. Se abre antes de armar el PDF porque, si se espera,
-        // el navegador bloquea la ventana nueva.
-        const enCelular = WhatsAppService.isMobile();
-        if (!enCelular) WhatsAppService.openChat(telefono, texto);
         let doc;
         try {
             doc = await this._pdfHoja(lista);
@@ -4089,15 +4097,8 @@ const Camiones = {
         const nombre = lista.length === 1
             ? `carga-${String(lista[0].nombre).replace(/[^\w\-]+/g, '-')}.pdf`
             : 'carga-camiones.pdf';
-        const blob = doc.output('blob');
-        const archivo = new File([blob], nombre, { type: 'application/pdf' });
-        if (enCelular) {
-            const compartido = await this._compartirPdf(archivo, texto);
-            if (compartido === 'ok' || compartido === 'cancelado') return;
-            WhatsAppService.openChat(telefono, texto);
-        }
-        doc.save(nombre);
-        Utils.avisar('WhatsApp abierto. En esta computadora el PDF se descarga al lado: arrastralo al chat para enviarlo.');
+        const destinatario = lista.length === 1 ? `quien carga ${lista[0].nombre}` : 'quien carga los camiones';
+        await EnvioPdf.enviar({ telefono, texto, doc, nombre, destinatario });
     },
 
     async _compartirPdf(archivo, texto) {
@@ -7132,6 +7133,7 @@ const Precios = {
                 height: alto
             });
             const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            doc.__lienzos = [canvas];
             const pageW = doc.internal.pageSize.getWidth();
             const pageH = doc.internal.pageSize.getHeight();
             const img = canvas.toDataURL('image/jpeg', 0.92);
@@ -7157,22 +7159,13 @@ const Precios = {
             PrecioClienteService.validarEnvio(cliente, datos);
             const doc = await this._construirPdfPrecios(datos);
             const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.pdf`;
-            const blob = doc.output('blob');
-            const archivo = new File([blob], nombre, { type: 'application/pdf' });
-
-            if (WhatsAppService.isMobile() && navigator.canShare && navigator.canShare({ files: [archivo] })) {
-                await navigator.share({
-                    files: [archivo],
-                    title: 'Lista de precios',
-                    text: `Lista de precios de ${datos.clienteNombre || 'cliente'}`
-                });
-                Utils.showSuccess(`PDF listo para enviar a ${cliente.nombre}. Elegí WhatsApp.`);
-                return;
-            }
-
-            doc.save(nombre);
-            WhatsAppService.openChat(cliente.telefono, 'Te envío la lista de precios en el PDF.');
-            Utils.showSuccess(`Se descargó el PDF. Adjuntalo en el chat de ${cliente.nombre}.`);
+            await EnvioPdf.enviar({
+                telefono: cliente.telefono,
+                texto: `Hola ${cliente.nombre}, te envío la lista de precios.`,
+                doc,
+                nombre,
+                destinatario: cliente.nombre
+            });
         } catch (error) {
             if (error && error.name === 'AbortError') return;
             this.handleWhatsAppError(error);
@@ -7389,28 +7382,287 @@ const Precios = {
             PrecioClienteService.validarEnvio(cliente, datos);
             const doc = await this._pdfDesdeHtml(html);
             const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.pdf`;
-            const blob = doc.output('blob');
-            const archivo = new File([blob], nombre, { type: 'application/pdf' });
-            const texto = 'Te envío la lista de precios en el PDF.';
-
-            if (WhatsAppService.isMobile() && navigator.canShare && navigator.canShare({ files: [archivo] })) {
-                await navigator.share({
-                    files: [archivo],
-                    title: 'Lista de precios',
-                    text: texto
-                });
-                Utils.showSuccess(`PDF listo para enviar a ${cliente.nombre}. Elegí WhatsApp.`);
-                return;
-            }
-
-            doc.save(nombre);
-            WhatsAppService.openChat(cliente.telefono, texto);
-            Utils.showSuccess(`Se descargó el PDF. Adjuntalo en el chat de ${cliente.nombre}.`);
+            await EnvioPdf.enviar({
+                telefono: cliente.telefono,
+                texto: `Hola ${cliente.nombre}, te envío la lista de precios.`,
+                doc,
+                nombre,
+                destinatario: cliente.nombre
+            });
         } catch (error) {
             if (error && error.name === 'AbortError') return;
             console.error('Error exporting PDF:', error);
             this.handleWhatsAppError(error);
         }
+    }
+};
+
+// Cuenta corriente de un cliente o un proveedor: cada carga y cada pago, con el saldo que va
+// quedando. La pueden ver todos los usuarios (los totales del inicio, solo algunos).
+//  - Proveedor: lo que llegó y se confirmó en la recepción (cantidad × precio real) y sus pagos.
+//  - Cliente: lo que se le cobró cada día (productos y comisión) y lo que fue pagando.
+//    Solo figuran los días que ya tienen cobranza (cerrados o con algún cobro), igual que en Cobranzas.
+const CuentaCorriente = {
+    _ultima: null,
+
+    _medio(texto) {
+        const partes = String(texto || '').split('·');
+        return partes.length > 1 ? partes[partes.length - 1].trim() : '';
+    },
+
+    _movimientosProveedor(id, recepcion, pagos) {
+        const movs = [];
+        (recepcion || []).forEach(r => {
+            const confirmado = r.confirmado === true || r.confirmado === 'true';
+            const cantidad = parseFloat(r.llego) || 0;
+            if (!confirmado || cantidad <= 0 || String(r.proveedor_id) !== id) return;
+            const precio = Utils.parsePrice(r.precio_real) || 0;
+            movs.push({ fecha: Utils.fechaIso(r.fecha), orden: 0, producto: r.producto_nombre || 'Producto', cantidad, precio, total: Math.round(cantidad * precio), pago: 0, medio: '' });
+        });
+        (pagos || []).forEach(p => {
+            if (String(p.proveedor_id) !== id) return;
+            const monto = Utils.parsePrice(p.monto) || 0;
+            if (!monto) return;
+            const metodo = String(p.metodo || 'efectivo');
+            movs.push({ fecha: Utils.fechaIso(p.fecha), orden: 1, producto: p.nota ? String(p.nota) : 'Pago', cantidad: '', precio: '', total: 0, pago: monto, medio: metodo.charAt(0).toUpperCase() + metodo.slice(1) });
+        });
+        return movs;
+    },
+
+    _movimientosCliente(id, cobranzas, precios, caja) {
+        const movs = [];
+        (cobranzas || []).filter(c => String(c.cliente_id) === id).forEach(c => {
+            const fecha = Utils.fechaIso(c.fecha);
+            const lineas = (precios || []).filter(p => String(p.cliente_id) === id && Utils.fechaIso(p.fecha) === fecha && (parseFloat(p.cantidad) || 0) > 0);
+            let suma = 0;
+            let comision = 0;
+            lineas.forEach(p => {
+                const cantidad = parseFloat(p.cantidad) || 0;
+                const precio = Utils.parsePrice(p.precio_cliente) || 0;
+                const total = Math.round(cantidad * precio);
+                comision += Math.round(cantidad * (Utils.parsePrice(p.comision_unitaria) || 0));
+                suma += total;
+                movs.push({ fecha, orden: 0, producto: p.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
+            });
+            if (comision) {
+                suma += comision;
+                movs.push({ fecha, orden: 0, producto: 'Comisión de reparto', cantidad: '', precio: '', total: comision, pago: 0, medio: '' });
+            }
+            const totalCobranza = Utils.parsePrice(c.total) || 0;
+            if (totalCobranza !== suma) {
+                movs.push({ fecha, orden: 0, producto: lineas.length ? 'Ajuste del día' : 'Carga del día', cantidad: '', precio: '', total: totalCobranza - suma, pago: 0, medio: '' });
+            }
+            // Pagos: los movimientos de caja de esta cobranza (con su fecha y medio).
+            let pagadoCaja = 0;
+            (caja || []).filter(m => String(m.referencia) === String(c.id)).forEach(m => {
+                const monto = (Utils.parsePrice(m.monto) || 0) * (String(m.tipo) === 'egreso' ? -1 : 1);
+                if (!monto) return;
+                pagadoCaja += monto;
+                movs.push({ fecha: Utils.fechaIso(m.fecha) || fecha, orden: 1, producto: monto < 0 ? 'Corrección de cobro' : 'Pago', cantidad: '', precio: '', total: 0, pago: monto, medio: this._medio(m.nota) });
+            });
+            const pagado = Utils.parsePrice(c.pagado) || 0;
+            if (pagado !== pagadoCaja) {
+                movs.push({ fecha, orden: 1, producto: 'Pago', cantidad: '', precio: '', total: 0, pago: pagado - pagadoCaja, medio: '' });
+            }
+        });
+        return movs;
+    },
+
+    _conSaldo(movs) {
+        let saldo = 0;
+        return movs
+            .sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '') || a.orden - b.orden)
+            .map(m => {
+                saldo += (m.total || 0) - (m.pago || 0);
+                return { ...m, saldo };
+            });
+    },
+
+    async abrir(tipo, id) {
+        id = String(id);
+        const esCliente = tipo === 'cliente';
+        const lista = esCliente ? AppState.clientes : AppState.proveedores;
+        const nombre = (lista || []).find(x => String(x.id) === id)?.nombre || (esCliente ? 'Cliente' : 'Proveedor');
+        Utils.showLoader();
+        try {
+            let movs;
+            if (esCliente) {
+                const [cobranzas, precios, caja] = await Promise.all([
+                    API.request('cobranzas', 'GET'),
+                    API.request('precios-cliente', 'GET'),
+                    API.request('caja', 'GET')
+                ]);
+                movs = this._movimientosCliente(id, cobranzas, precios, caja);
+            } else {
+                const [recepcion, pagos] = await Promise.all([
+                    API.request('recepcion', 'GET'),
+                    API.request('pagos-proveedores', 'GET')
+                ]);
+                movs = this._movimientosProveedor(id, recepcion, pagos);
+            }
+            const filas = this._conSaldo(movs);
+            this._ultima = { tipo, nombre, filas };
+            this._mostrar(esCliente, nombre, filas);
+        } catch (error) {
+            console.error('Error armando la cuenta corriente:', error);
+            Utils.showError('No se pudo armar la cuenta corriente: ' + error.message);
+        } finally {
+            Utils.hideLoader();
+        }
+    },
+
+    _mostrar(esCliente, nombre, filas) {
+        const saldo = filas.length ? filas[filas.length - 1].saldo : 0;
+        const plata = n => (n ? Utils.formatCurrency(n) : '');
+        const fecha = iso => (iso ? new Date(iso + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric' }) : '');
+        const cuerpo = filas.length
+            ? filas.map(f => `
+                <tr class="${f.pago ? 'cc-pago' : ''}">
+                    <td>${Utils.esc(fecha(f.fecha))}</td>
+                    <td class="cc-producto">${Utils.esc(f.producto)}</td>
+                    <td class="cc-num">${f.cantidad === '' ? '' : String(f.cantidad).replace('.', ',')}</td>
+                    <td class="cc-num">${plata(f.precio)}</td>
+                    <td class="cc-num">${plata(f.total)}</td>
+                    <td class="cc-num">${plata(f.pago)}</td>
+                    <td>${Utils.esc(f.medio || '')}</td>
+                    <td class="cc-num cc-saldo">${Utils.formatCurrency(f.saldo)}</td>
+                </tr>`).join('')
+            : `<tr><td colspan="8" style="text-align:center;padding:24px;color:#666;">Todavía no hay movimientos con ${Utils.esc(nombre)}.</td></tr>`;
+        const content = `
+            <div class="cuenta-corriente">
+                <div class="cc-resumen">
+                    <span>${esCliente ? 'Te debe' : 'Le debés'}</span>
+                    <strong class="${saldo > 0 ? 'cc-deuda' : ''}">${Utils.formatCurrency(saldo)}</strong>
+                    <button type="button" class="btn btn-secondary btn-sm" id="cc-excel">Descargar Excel</button>
+                </div>
+                <div class="table-container cc-scroll">
+                    <table class="data-table cc-tabla">
+                        <thead>
+                            <tr><th>Fecha</th><th>Producto</th><th>Cantidad</th><th>Precio</th><th>Total</th><th>Pago</th><th>Medio</th><th>Saldo</th></tr>
+                        </thead>
+                        <tbody>${cuerpo}</tbody>
+                    </table>
+                </div>
+                ${esCliente ? '<p class="modal-hint">Figuran los días ya cerrados o con algún cobro. Lo de hoy aparece cuando se cobra o se cierra el día.</p>' : ''}
+            </div>
+        `;
+        Utils.showModal(`Cuenta corriente · ${nombre}`, content, null);
+        document.getElementById('cc-excel')?.addEventListener('click', () => this.descargarExcel());
+        const scroll = document.querySelector('.cc-scroll');
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    },
+
+    async descargarExcel() {
+        const cuenta = this._ultima;
+        if (!cuenta) return;
+        try {
+            const XLSX = await Dashboard._cargarXlsx();
+            const filas = [
+                [`Cuenta corriente · ${cuenta.nombre}`],
+                [],
+                ['FECHA', 'PRODUCTO', 'CANTIDAD', 'PRECIO', 'TOTAL', 'PAGO', 'MEDIO', 'SALDO'],
+                ...cuenta.filas.map(f => [f.fecha ? new Date(f.fecha + 'T12:00:00') : '', f.producto, f.cantidad, f.precio || '', f.total || '', f.pago || '', f.medio || '', f.saldo]),
+                [],
+                ['SALDO', '', '', '', '', '', '', cuenta.filas.length ? cuenta.filas[cuenta.filas.length - 1].saldo : 0]
+            ];
+            const hoja = XLSX.utils.aoa_to_sheet(filas, { cellDates: true, dateNF: 'dddd, d "de" mmmm "de" yyyy' });
+            const rango = XLSX.utils.decode_range(hoja['!ref']);
+            for (let r = 3; r <= rango.e.r; r++) {
+                [3, 4, 5, 7].forEach(c => {
+                    const celda = hoja[XLSX.utils.encode_cell({ r, c })];
+                    if (celda && typeof celda.v === 'number') celda.z = '"$" #,##0';
+                });
+            }
+            hoja['!cols'] = [{ wch: 30 }, { wch: 24 }, { wch: 10 }, { wch: 13 }, { wch: 15 }, { wch: 15 }, { wch: 14 }, { wch: 16 }];
+            const libro = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(libro, hoja, 'Cuenta corriente');
+            XLSX.writeFile(libro, `cuenta-${String(cuenta.nombre).replace(/[^\w\-]+/g, '-')}.xlsx`);
+        } catch (error) {
+            Utils.showError('No se pudo armar el Excel: ' + error.message);
+        }
+    }
+};
+
+// Envío de un PDF por WhatsApp Web. Ninguna página puede adjuntar un archivo en el chat de
+// WhatsApp Web, así que el documento se copia como imagen: se abre el chat con la frase y en el
+// chat se pega con Cmd+V (Ctrl+V), debajo de la frase. En el celular se usa el menú Compartir.
+const EnvioPdf = {
+    async _imagen(doc) {
+        const lienzos = (doc && doc.__lienzos) || [];
+        if (!lienzos.length) return null;
+        const ancho = Math.max(...lienzos.map(c => c.width));
+        const altoTotal = lienzos.reduce((suma, c) => suma + c.height, 0);
+        const escala = Math.min(1, 14000 / altoTotal);
+        const lienzo = document.createElement('canvas');
+        lienzo.width = Math.round(ancho * escala);
+        lienzo.height = Math.round(altoTotal * escala);
+        const ctx = lienzo.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, lienzo.width, lienzo.height);
+        let y = 0;
+        lienzos.forEach(c => {
+            ctx.drawImage(c, 0, y, Math.round(c.width * escala), Math.round(c.height * escala));
+            y += Math.round(c.height * escala);
+        });
+        return new Promise(resolve => lienzo.toBlob(resolve, 'image/png'));
+    },
+
+    _puedeCopiarImagen() {
+        return !!(navigator.clipboard && navigator.clipboard.write && window.ClipboardItem);
+    },
+
+    // { telefono, texto, doc, nombre, destinatario }
+    async enviar({ telefono, texto, doc, nombre, destinatario }) {
+        const archivo = new File([doc.output('blob')], nombre, { type: 'application/pdf' });
+        if (WhatsAppService.isMobile()) {
+            try {
+                if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                    await navigator.share({ files: [archivo], title: nombre, text: texto });
+                    return;
+                }
+            } catch (error) {
+                if (error && error.name === 'AbortError') return;
+            }
+            doc.save(nombre);
+            WhatsAppService.openChat(telefono, texto);
+            Utils.avisar(`Se descargó el PDF. Adjuntalo en el chat de ${destinatario}.`);
+            return;
+        }
+
+        const imagen = this._puedeCopiarImagen() ? await this._imagen(doc) : null;
+        if (!imagen) {
+            doc.save(nombre);
+            WhatsAppService.openChat(telefono, texto);
+            Utils.avisar('Se abrió WhatsApp Web. El PDF se descargó: arrastralo al chat para enviarlo.');
+            return;
+        }
+
+        const vista = URL.createObjectURL(imagen);
+        const atajo = /Mac/i.test(navigator.platform || navigator.userAgent) ? 'Cmd+V' : 'Ctrl+V';
+        const content = `
+            <ol class="envio-pdf-pasos">
+                <li>Tocá <strong>Copiar y abrir WhatsApp</strong>: se abre WhatsApp Web con el chat de <strong>${Utils.esc(destinatario)}</strong> y esta frase.</li>
+                <li>En el chat apretá <strong>${atajo}</strong>: el documento aparece debajo de la frase, listo para enviar.</li>
+            </ol>
+            <p class="envio-pdf-frase">${Utils.esc(texto)}</p>
+            <img class="envio-pdf-vista" src="${vista}" alt="Vista previa del documento">
+            <p class="modal-hint">¿Lo necesitás como archivo PDF? <button type="button" class="btn btn-secondary btn-sm" id="envio-pdf-descargar">Descargar PDF</button></p>
+        `;
+        Utils.showModal(`Enviar a ${destinatario}`, content, async () => {
+            try {
+                await navigator.clipboard.write([new ClipboardItem({ 'image/png': imagen })]);
+                WhatsAppService.openChat(telefono, texto);
+                Utils.avisar(`Documento copiado. En el chat de WhatsApp Web apretá ${atajo} y después Enviar.`);
+            } catch (error) {
+                console.warn('No se pudo copiar el documento:', error);
+                doc.save(nombre);
+                WhatsAppService.openChat(telefono, texto);
+                Utils.avisar('No se pudo copiar el documento. Se descargó el PDF: arrastralo al chat de WhatsApp Web.');
+            } finally {
+                setTimeout(() => URL.revokeObjectURL(vista), 60000);
+            }
+        }, 'Copiar y abrir WhatsApp');
+        document.getElementById('envio-pdf-descargar')?.addEventListener('click', () => doc.save(nombre));
     }
 };
 
@@ -8288,25 +8540,13 @@ const SaldoCliente = {
         const nombre = cliente.nombre || 'Cliente';
         const doc = await this._pdf(cliente, cargas);
         const archivoNombre = `saldo-${nombre.replace(/[^\w\-]+/g, '-')}.pdf`;
-        const blob = doc.output('blob');
-        const archivo = new File([blob], archivoNombre, { type: 'application/pdf' });
-        const texto = `Hola ${nombre}, te paso el saldo por carga y el total. Va en el PDF.`;
-        try {
-            if (WhatsAppService.isMobile() && navigator.canShare && navigator.canShare({ files: [archivo] })) {
-                await navigator.share({ files: [archivo], title: 'Saldo', text: texto });
-                Utils.avisar('PDF listo. Elegí WhatsApp para enviarlo.');
-                return;
-            }
-        } catch (error) {
-            if (error && error.name === 'AbortError') return;
-        }
-        doc.save(archivoNombre);
-        if (cliente.telefono && String(cliente.telefono).trim()) {
-            WhatsAppService.openChat(cliente.telefono, texto);
-            Utils.avisar(`Se descargó el PDF. Adjuntalo en el chat de ${nombre}.`);
+        const texto = `Hola ${nombre}, te paso el saldo por carga y el total.`;
+        if (!WhatsAppService.normalizePhone(cliente.telefono)) {
+            doc.save(archivoNombre);
+            Utils.avisar(`Se descargó el PDF del saldo. ${nombre} no tiene un teléfono válido para WhatsApp.`);
             return;
         }
-        Utils.avisar('Se descargó el PDF del saldo.');
+        await EnvioPdf.enviar({ telefono: cliente.telefono, texto, doc, nombre: archivoNombre, destinatario: nombre });
     },
 
     _htmlPdf(cliente, cargas) {
@@ -8396,6 +8636,7 @@ const SaldoCliente = {
                 height: alto
             });
             const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            doc.__lienzos = [canvas];
             const pageW = doc.internal.pageSize.getWidth();
             const pageH = doc.internal.pageSize.getHeight();
             const img = canvas.toDataURL('image/jpeg', 0.92);
@@ -8480,6 +8721,7 @@ const Cobranzas = {
                     <div class="pagos-acciones">
                         <button class="btn btn-primary btn-sm" type="button" onclick="Cobranzas.cobrar('${cobranza.id}')">Cobrar</button>
                         <button class="btn btn-secondary btn-sm" type="button" onclick="SaldoCliente.abrir('${cliente.id}')">Enviar saldo</button>
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="CuentaCorriente.abrir('cliente', '${cliente.id}')">Cuenta</button>
                         ${btnWhatsApp}
                     </div>
                 </td>
@@ -9540,6 +9782,7 @@ const Pagos = {
                 <td data-label="Acciones">
                     <div class="pagos-acciones">
                         ${btnPagar}
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="CuentaCorriente.abrir('proveedor', '${proveedor.id}')">Cuenta</button>
                     </div>
                 </td>
             `;
@@ -10578,6 +10821,338 @@ const Historial = {
     }
 };
 
+// Cuenta corriente de cada cliente o proveedor: cada carga y cada pago con su fecha, y el saldo
+// que va quedando. La ven todos los usuarios (los totales del inicio son solo para algunos).
+const Cuentas = {
+    tipo: 'cliente',
+    elegido: { cliente: '', proveedor: '' },
+    _datos: null,
+
+    async load() {
+        this._pintarTipo();
+        const tbody = document.getElementById('cuentas-tbody');
+        Utils.showTableLoader(tbody);
+        try {
+            const [clientes, proveedores, cobranzas, precios, caja, recepcion, pagos] = await Promise.all([
+                API.request('clientes', 'GET'),
+                API.request('proveedores', 'GET'),
+                API.request('cobranzas', 'GET'),
+                API.request('precios-cliente', 'GET'),
+                API.request('caja', 'GET'),
+                API.request('recepcion', 'GET'),
+                API.request('pagos-proveedores', 'GET')
+            ]);
+            this._datos = { clientes, proveedores, cobranzas, precios, caja, recepcion, pagos };
+            this._pintarTipo();
+        } catch (error) {
+            console.error('Error loading cuentas:', error);
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">Google no respondió a tiempo. Esperá un minuto y volvé a entrar.</td></tr>';
+        }
+    },
+
+    cambiarTipo(tipo) {
+        this.tipo = tipo === 'proveedor' ? 'proveedor' : 'cliente';
+        this._pintarTipo();
+    },
+
+    elegir(id) {
+        this.elegido[this.tipo] = String(id || '');
+        this.render();
+    },
+
+    // Abre la cuenta de alguien desde otra pantalla.
+    abrir(tipo, id) {
+        this.tipo = tipo === 'proveedor' ? 'proveedor' : 'cliente';
+        this.elegido[this.tipo] = String(id || '');
+        Navigation.navigateTo('cuentas');
+    },
+
+    _pintarTipo() {
+        const esCliente = this.tipo === 'cliente';
+        document.getElementById('btn-cuentas-clientes')?.classList.toggle('activo', esCliente);
+        document.getElementById('btn-cuentas-proveedores')?.classList.toggle('activo', !esCliente);
+        const label = document.getElementById('cuentas-select-label');
+        if (label) label.textContent = esCliente ? 'Cliente' : 'Proveedor';
+        const select = document.getElementById('cuentas-select');
+        if (!select || !this._datos) return;
+        const lista = (esCliente ? this._datos.clientes : this._datos.proveedores) || [];
+        const ordenada = [...lista].sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        select.innerHTML = `<option value="">${esCliente ? 'Elegí un cliente' : 'Elegí un proveedor'}</option>` +
+            ordenada.map(x => `<option value="${Utils.esc(x.id)}">${Utils.esc(x.nombre || '')}</option>`).join('');
+        select.value = this.elegido[this.tipo] || '';
+        this.render();
+    },
+
+    _fechaLarga(iso) {
+        const f = Utils.fechaIso(iso);
+        if (!f) return '';
+        return new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    },
+
+    _medio(texto) {
+        const partes = String(texto || '').split('·');
+        return partes.length > 1 ? partes[partes.length - 1].trim() : '';
+    },
+
+    _num(v) {
+        return parseFloat(v) || 0;
+    },
+
+    // Una fila por producto (como la planilla que usaban): fecha, producto, cantidad, precio y total.
+    // Los pagos van en su propia fila con el medio. La comisión de reparto va en una fila por día.
+    _movimientosCliente(id) {
+        const { cobranzas, precios, caja } = this._datos;
+        const movimientos = [];
+        const lineasPorDia = {};
+        (precios || []).filter(p => String(p.cliente_id) === id && this._num(p.cantidad) > 0).forEach(p => {
+            const fecha = Utils.fechaIso(p.fecha);
+            if (fecha) (lineasPorDia[fecha] = lineasPorDia[fecha] || []).push(p);
+        });
+        const cargasDelDia = (fecha, totalCobranza) => {
+            let suma = 0;
+            let cantidadDia = 0;
+            const comisiones = {};
+            (lineasPorDia[fecha] || []).forEach(p => {
+                const cantidad = this._num(p.cantidad);
+                const precio = Utils.parsePrice(p.precio_cliente) || 0;
+                const total = Math.round(cantidad * precio);
+                suma += total;
+                cantidadDia += cantidad;
+                const comision = Utils.parsePrice(p.comision_unitaria) || 0;
+                if (comision > 0) {
+                    const c = comisiones[comision] || (comisiones[comision] = { cantidad: 0, total: 0 });
+                    c.cantidad += cantidad;
+                    c.total += Math.round(cantidad * comision);
+                }
+                movimientos.push({ fecha, orden: 0, producto: p.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
+            });
+            Object.keys(comisiones).forEach(valor => {
+                const c = comisiones[valor];
+                suma += c.total;
+                movimientos.push({ fecha, orden: 0, producto: 'Comisión de reparto', cantidad: Math.round(c.cantidad * 100) / 100, precio: Number(valor), total: c.total, pago: 0, medio: '' });
+            });
+            // Si la cobranza guardada no coincide con los precios (datos viejos), manda la cobranza.
+            if (totalCobranza !== null && Math.round(totalCobranza - suma) !== 0) {
+                movimientos.push({ fecha, orden: 0, producto: 'Ajuste de la carga', cantidad: '', precio: '', total: Math.round(totalCobranza - suma), pago: 0, medio: '' });
+            }
+        };
+        const fechasConCobranza = new Set();
+        (cobranzas || []).filter(c => String(c.cliente_id) === id).forEach(c => {
+            const fecha = Utils.fechaIso(c.fecha);
+            fechasConCobranza.add(fecha);
+            cargasDelDia(fecha, Utils.parsePrice(c.total) || 0);
+            let registrado = 0;
+            (caja || []).filter(m => String(m.referencia) === String(c.id)).forEach(m => {
+                const monto = Utils.parsePrice(m.monto) || 0;
+                if (!monto) return;
+                const egreso = String(m.tipo).toLowerCase() === 'egreso';
+                registrado += egreso ? -monto : monto;
+                movimientos.push({
+                    fecha: Utils.fechaIso(m.fecha) || fecha, orden: 1,
+                    producto: egreso ? 'Ajuste de cobro' : '', cantidad: '', precio: '', total: 0,
+                    pago: egreso ? -monto : monto, medio: this._medio(m.nota)
+                });
+            });
+            // Cobros viejos que no dejaron movimiento en la caja: se muestran en la fecha de la carga.
+            const resto = Math.round((Utils.parsePrice(c.pagado) || 0) - registrado);
+            if (resto !== 0) movimientos.push({ fecha, orden: 1, producto: '', cantidad: '', precio: '', total: 0, pago: resto, medio: '' });
+        });
+        Object.keys(lineasPorDia).forEach(fecha => {
+            if (!fechasConCobranza.has(fecha)) cargasDelDia(fecha, null);
+        });
+        return movimientos;
+    },
+
+    // Lo que entregó (confirmado en la recepción: llegó × precio real) y cada pago con su medio.
+    _movimientosProveedor(id) {
+        const { recepcion, pagos } = this._datos;
+        const movimientos = [];
+        (recepcion || []).forEach(r => {
+            const confirmado = r.confirmado === true || r.confirmado === 'true';
+            if (!confirmado || String(r.proveedor_id) !== id) return;
+            const cantidad = this._num(r.llego);
+            const precio = Utils.parsePrice(r.precio_real) || 0;
+            const total = Math.round(cantidad * precio);
+            if (total <= 0) return;
+            movimientos.push({ fecha: Utils.fechaIso(r.fecha), orden: 0, producto: r.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
+        });
+        (pagos || []).filter(p => String(p.proveedor_id) === id).forEach(p => {
+            const monto = Utils.parsePrice(p.monto) || 0;
+            if (!monto) return;
+            const medio = [p.metodo ? String(p.metodo).toUpperCase() : '', p.nota].filter(Boolean).join(' · ');
+            movimientos.push({ fecha: Utils.fechaIso(p.fecha), orden: 1, producto: '', cantidad: '', precio: '', total: 0, pago: monto, medio });
+        });
+        return movimientos;
+    },
+
+    _cuenta() {
+        const id = this.elegido[this.tipo];
+        if (!id || !this._datos) return null;
+        const lista = (this.tipo === 'cliente' ? this._datos.clientes : this._datos.proveedores) || [];
+        const quien = lista.find(x => String(x.id) === id);
+        const movimientos = (this.tipo === 'cliente' ? this._movimientosCliente(id) : this._movimientosProveedor(id))
+            .sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)) || a.orden - b.orden);
+        let saldo = 0;
+        movimientos.forEach(m => {
+            saldo = Math.round(saldo + m.total - m.pago);
+            m.saldo = saldo;
+        });
+        return {
+            nombre: quien?.nombre || '',
+            movimientos,
+            cargas: movimientos.reduce((s, m) => s + m.total, 0),
+            pagos: movimientos.reduce((s, m) => s + m.pago, 0),
+            saldo
+        };
+    },
+
+    render() {
+        const tbody = document.getElementById('cuentas-tbody');
+        const resumen = document.getElementById('cuentas-resumen');
+        if (!tbody) return;
+        Utils.hideTableLoader(tbody);
+        const tabla = tbody.closest('table');
+        tabla.querySelector('tfoot')?.remove();
+        const cuenta = this._cuenta();
+        if (!cuenta) {
+            if (resumen) resumen.hidden = true;
+            tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">${this._datos ? `Elegí un ${this.tipo} para ver su cuenta.` : 'Cargando...'}</td></tr>`;
+            return;
+        }
+        const esCliente = this.tipo === 'cliente';
+        if (resumen) {
+            resumen.hidden = false;
+            resumen.innerHTML = `
+                <div class="pagos-resumen-card"><span>Total cargas</span><strong>${Utils.formatCurrency(cuenta.cargas)}</strong></div>
+                <div class="pagos-resumen-card"><span>Total pagos</span><strong>${Utils.formatCurrency(cuenta.pagos)}</strong></div>
+                <div class="pagos-resumen-card ${cuenta.saldo > 0 ? 'is-deuda' : ''}"><span>${esCliente ? 'Saldo que debe' : 'Saldo a pagar'}</span><strong>${Utils.formatCurrency(cuenta.saldo)}</strong></div>
+            `;
+        }
+        if (!cuenta.movimientos.length) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">Todavía no tiene cargas ni pagos.</td></tr>';
+            return;
+        }
+        const cant = n => (n === '' || n === null || n === undefined ? '' : String(n).replace('.', ','));
+        const plata = n => (n === '' || !n ? '' : Utils.formatCurrency(n));
+        tbody.innerHTML = cuenta.movimientos.map(m => `
+            <tr>
+                <td data-label="Fecha" class="cuentas-fecha">${this._fechaLarga(m.fecha)}</td>
+                <td data-label="Producto">${Utils.esc(m.producto)}</td>
+                <td data-label="Cantidad" class="cuentas-dinero">${cant(m.cantidad)}</td>
+                <td data-label="Precio" class="cuentas-dinero">${plata(m.precio)}</td>
+                <td data-label="Total" class="cuentas-dinero">${plata(m.total)}</td>
+                <td data-label="Pago" class="cuentas-dinero cuentas-pago">${plata(m.pago)}</td>
+                <td data-label="Medio">${Utils.esc(m.medio)}</td>
+                <td data-label="Saldo" class="cuentas-dinero"><strong>${Utils.formatCurrency(m.saldo)}</strong></td>
+            </tr>
+        `).join('');
+        tabla.insertAdjacentHTML('beforeend', `
+            <tfoot>
+                <tr>
+                    <td colspan="4">Total</td>
+                    <td class="cuentas-dinero">${Utils.formatCurrency(cuenta.cargas)}</td>
+                    <td class="cuentas-dinero">${Utils.formatCurrency(cuenta.pagos)}</td>
+                    <td></td>
+                    <td class="cuentas-dinero">${Utils.formatCurrency(cuenta.saldo)}</td>
+                </tr>
+            </tfoot>
+        `);
+    },
+
+    // Mismo diseño que los demás PDF de la app (encabezado azul, recuadro con el nombre, filas alternadas).
+    _htmlPdf(cuenta) {
+        const esCliente = this.tipo === 'cliente';
+        const generado = new Date().toLocaleString('es-AR');
+        const etiquetaSaldo = esCliente ? 'Saldo que debe' : 'Saldo a pagar';
+        const cant = n => (n === '' || n === null || n === undefined ? '' : String(n).replace('.', ','));
+        const plata = n => (n === '' || !n ? '' : Utils.formatCurrency(n));
+        let fechaAnterior = '';
+        const cuerpo = cuenta.movimientos.map((m, i) => {
+            const fecha = this._fechaLarga(m.fecha);
+            const mostrarFecha = fecha !== fechaAnterior;
+            fechaAnterior = fecha;
+            const esPago = !!m.pago;
+            return `
+            <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                <td class="col-fecha">${mostrarFecha ? Utils.esc(fecha) : ''}</td>
+                <td class="${esPago ? 'pago' : ''}">${Utils.esc(m.producto || (esPago ? 'Pago' : ''))}</td>
+                <td class="col-num">${cant(m.cantidad)}</td>
+                <td class="col-num">${plata(m.precio)}</td>
+                <td class="col-money">${plata(m.total)}</td>
+                <td class="col-money pago">${plata(m.pago)}</td>
+                <td class="pago">${Utils.esc(m.medio)}</td>
+                <td class="col-money saldo">${Utils.formatCurrency(m.saldo)}</td>
+            </tr>`;
+        }).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Cuenta corriente</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; padding: 32px 36px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 14px 20px; border-radius: 8px; margin-bottom: 20px; }
+                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 10px 8px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+                thead th.col-money, thead th.col-num { text-align: right; }
+                tbody td { padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f8fafc; }
+                td.col-fecha { color: #475569; width: 150px; }
+                td.col-num { text-align: right; white-space: nowrap; }
+                td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                td.col-money.saldo { color: #1e293b; }
+                td.pago, td.col-money.pago { color: #15803d; }
+                .totals-wrap { margin-top: 18px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 300px; box-shadow: none; }
+                .totals-table td { padding: 8px 14px; font-size: 14px; font-weight: 700; border: none; }
+                .totals-table td:last-child { text-align: right; }
+                .totals-table tr.linea td { color: #475569; font-weight: 500; font-size: 13px; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; font-size: 16px; }
+                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
+                .footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Cuenta corriente</p></div>
+                <div class="doc-meta"><strong>${etiquetaSaldo}</strong>${Utils.formatCurrency(cuenta.saldo)}<br><span>Generado: ${Utils.esc(generado)}</span></div>
+            </div>
+            <div class="cliente-box"><div class="label">${esCliente ? 'Cliente' : 'Proveedor'}</div><div class="name">${Utils.esc(cuenta.nombre)}</div></div>
+            <table>
+                <thead><tr>
+                    <th>Fecha</th><th>Producto</th><th class="col-num">Cant.</th><th class="col-num">Precio</th>
+                    <th class="col-money">Total</th><th class="col-money">Pago</th><th>Medio</th><th class="col-money">Saldo</th>
+                </tr></thead>
+                <tbody>${cuerpo || '<tr><td colspan="8">Todavía no tiene cargas ni pagos.</td></tr>'}</tbody>
+            </table>
+            <div class="totals-wrap"><table class="totals-table">
+                <tr class="linea"><td>Total cargas</td><td>${Utils.formatCurrency(cuenta.cargas)}</td></tr>
+                <tr class="linea"><td>Total pagos</td><td>${Utils.formatCurrency(cuenta.pagos)}</td></tr>
+                <tr class="saldo"><td>${etiquetaSaldo}</td><td>${Utils.formatCurrency(cuenta.saldo)}</td></tr>
+            </table></div>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
+
+    async descargarPdf() {
+        const cuenta = this._cuenta();
+        if (!cuenta) {
+            Utils.showInfo(`Elegí un ${this.tipo} primero.`);
+            return;
+        }
+        try {
+            const doc = await Precios._pdfDesdeHtml(this._htmlPdf(cuenta));
+            doc.save(`cuenta-${String(cuenta.nombre).replace(/[^\w\-]+/g, '-')}.pdf`);
+        } catch (error) {
+            console.error('Error armando el PDF de la cuenta:', error);
+            Utils.showError('No se pudo armar el PDF: ' + error.message);
+        }
+    }
+};
+
 const Caja = {
     async load() {
         const tbody = document.getElementById('caja-tbody');
@@ -11243,6 +11818,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-verificar-stock', () => Stock.verificarStockBajo(), 'Verificando...');
     addButtonListener('btn-saldos-excel', () => Dashboard.descargarExcelSaldos(), 'Armando Excel...');
     addButtonListener('btn-precios-planilla-excel', () => Precios.descargarPlanillaExcel(), 'Armando Excel...');
+    addButtonListener('btn-cuentas-pdf', () => Cuentas.descargarPdf(), 'Armando PDF...');
     addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
     addButtonListener('btn-ir-reparto', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-caja-repartir', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });

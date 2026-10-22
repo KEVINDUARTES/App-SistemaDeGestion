@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261021planilla2">
+    <link rel="stylesheet" href="styles.css?v=20261022cuenta">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -164,6 +164,7 @@
                     <span class="nav-arrow">▼</span>
                 </a>
                 <ul class="nav-submenu">
+                    <li><a href="#" data-page="cuentas" class="nav-link">Cuentas corrientes</a></li>
                     <li><a href="#" data-page="historial" class="nav-link">Historial de Días</a></li>
                     <li><a href="#" data-page="reparto" class="nav-link">Repartir efectivo</a></li>
                     <li><a href="#" data-page="caja" class="nav-link">Caja</a></li>
@@ -744,6 +745,42 @@
             <div id="reparto-root"></div>
         </div>
 
+        <!-- Cuentas corrientes: resumen de cada cliente o proveedor (carga, pago y saldo) -->
+        <div id="cuentas" class="page">
+            <div class="page-header">
+                <h2>Cuentas corrientes</h2>
+            </div>
+            <div class="precios-vistas" role="tablist">
+                <button type="button" class="btn btn-sm" id="btn-cuentas-clientes" role="tab" onclick="Cuentas.cambiarTipo('cliente')">Clientes</button>
+                <button type="button" class="btn btn-sm" id="btn-cuentas-proveedores" role="tab" onclick="Cuentas.cambiarTipo('proveedor')">Proveedores</button>
+            </div>
+            <div class="cuentas-controles">
+                <div class="form-group">
+                    <label for="cuentas-select" id="cuentas-select-label">Cliente</label>
+                    <select id="cuentas-select" class="form-control" onchange="Cuentas.elegir(this.value)"></select>
+                </div>
+                <button type="button" class="btn btn-secondary" id="btn-cuentas-pdf">Descargar PDF</button>
+            </div>
+            <div id="cuentas-resumen" class="pagos-resumen" hidden></div>
+            <div class="table-container">
+                <table class="data-table cuentas-tabla">
+                    <thead>
+                        <tr>
+                            <th>Fecha</th>
+                            <th>Producto</th>
+                            <th class="cuentas-dinero">Cantidad</th>
+                            <th class="cuentas-dinero">Precio</th>
+                            <th class="cuentas-dinero">Total</th>
+                            <th class="cuentas-dinero">Pago</th>
+                            <th>Medio</th>
+                            <th class="cuentas-dinero">Saldo</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cuentas-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+
         <div id="caja" class="page">
             <div class="page-header">
                 <h2>Caja</h2>
@@ -839,10 +876,10 @@
         <a href="#" data-page="cierre" class="nav-link"><span>7</span>Cierre</a>
     </nav>
     <script src="auth.js?v=20261013hoja"></script>
-    <script src="services/whatsapp.js?v=20261021total"></script>
+    <script src="services/whatsapp.js?v=20261021web"></script>
     <script src="services/pedidoProveedorService.js?v=20261021total"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261021sinprov"></script>
+    <script src="app.js?v=20261022cuenta"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

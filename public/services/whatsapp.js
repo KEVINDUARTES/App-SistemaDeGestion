@@ -1,7 +1,7 @@
 /**
  * Servicio de integración con WhatsApp.
  * - Modo automático: WhatsApp Business Cloud API (backend).
- * - Modo manual: abre WhatsApp Web / app con mensaje precargado (wa.me).
+ * - Modo manual: abre WhatsApp Web (en el celular, la app) con el mensaje precargado.
  */
 class WhatsAppError extends Error {
     constructor(message, code = 'WHATSAPP_ERROR') {
@@ -64,7 +64,9 @@ const WhatsAppService = {
             return `whatsapp://send?phone=${phone}&text=${encodedMessage}`;
         }
 
-        return `https://wa.me/${phone}?text=${encodedMessage}`;
+        // En la computadora se usa siempre WhatsApp Web (es el que usan), no la aplicación:
+        // wa.me pasa por una página que ofrece abrir la app de escritorio.
+        return `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
     },
 
     openChat(telefono, mensaje) {

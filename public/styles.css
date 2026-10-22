@@ -711,6 +711,11 @@ body {
     margin-bottom: 20px;
 }
 
+/* Sin esto, display: grid le gana al atributo hidden y la sección se ve para todos. */
+.saldos-inicio[hidden] {
+    display: none;
+}
+
 .saldos-inicio-acciones {
     grid-column: 1 / -1;
     display: flex;
@@ -874,6 +879,120 @@ body {
 }
 
 .precios-planilla-tabla tfoot td {
+    font-weight: 700;
+    background: var(--color-gray-50);
+}
+
+.envio-pdf-pasos {
+    margin: 0 0 12px;
+    padding-left: 20px;
+    line-height: 1.5;
+}
+
+.envio-pdf-frase {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    background: var(--color-success-light);
+    border-radius: var(--radius-md);
+    color: var(--color-gray-800);
+}
+
+.envio-pdf-vista {
+    display: block;
+    max-width: 100%;
+    max-height: 45vh;
+    margin: 0 auto 10px;
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-md);
+    object-fit: contain;
+}
+
+.modal:has(.cuenta-corriente) {
+    width: min(1100px, calc(100vw - 24px));
+    max-width: 1100px;
+}
+
+.cc-resumen {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.cc-resumen strong {
+    font-size: 1.4rem;
+}
+
+.cc-resumen .cc-deuda {
+    color: var(--color-danger);
+}
+
+.cc-resumen .btn {
+    margin-left: auto;
+}
+
+.cc-scroll {
+    max-height: 55vh;
+    overflow: auto;
+}
+
+.cc-tabla th,
+.cc-tabla td {
+    white-space: nowrap;
+}
+
+.cc-tabla .cc-producto {
+    white-space: normal;
+    min-width: 140px;
+}
+
+.cc-tabla .cc-num {
+    text-align: right;
+}
+
+.cc-tabla .cc-saldo {
+    font-weight: 700;
+}
+
+.cc-tabla tr.cc-pago td {
+    background: var(--color-success-light);
+}
+
+.cuentas-controles {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.cuentas-controles .form-group {
+    flex: 1;
+    min-width: 220px;
+    max-width: 420px;
+    margin: 0;
+}
+
+.cuentas-tabla .cuentas-dinero {
+    text-align: right;
+    white-space: nowrap;
+}
+
+.cuentas-tabla .cuentas-fecha {
+    white-space: nowrap;
+}
+
+.cuentas-tabla .cuentas-pago {
+    color: var(--color-success);
+}
+
+.cuentas-tabla .cuentas-detalle small {
+    display: block;
+    color: var(--color-gray-500);
+}
+
+.cuentas-tabla tfoot td {
     font-weight: 700;
     background: var(--color-gray-50);
 }
