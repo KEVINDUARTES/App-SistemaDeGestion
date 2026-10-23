@@ -202,16 +202,14 @@ const PedidoProveedorService = {
 
         items.forEach(item => {
             const nombre = item.producto || 'Producto';
-            if (!porProducto[nombre]) porProducto[nombre] = { cantidad: 0, unidad: item.unidad || '' };
-            porProducto[nombre].cantidad += parseFloat(item.cantidad) || 0;
+            porProducto[nombre] = (porProducto[nombre] || 0) + (parseFloat(item.cantidad) || 0);
         });
 
         const lineasProductos = Object.keys(porProducto)
             .sort((a, b) => a.localeCompare(b, 'es'))
             .map(nombre => {
-                const { cantidad, unidad } = porProducto[nombre];
-                const total = Math.round(cantidad * 100) / 100;
-                return `• ${nombre}: ${total}${unidad ? ' ' + unidad : ''}`;
+                const total = Math.round(porProducto[nombre] * 100) / 100;
+                return `• ${nombre}: ${total}`;
             })
             .join('\n');
 

@@ -932,7 +932,8 @@ body {
     margin-left: auto;
 }
 
-.cc-scroll {
+/* .table-container (más abajo) pone overflow: visible; acá la tabla se desplaza adentro del cuadro. */
+.table-container.cc-scroll {
     max-height: 55vh;
     overflow: auto;
 }
@@ -957,44 +958,6 @@ body {
 
 .cc-tabla tr.cc-pago td {
     background: var(--color-success-light);
-}
-
-.cuentas-controles {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: 12px;
-    margin-bottom: 16px;
-}
-
-.cuentas-controles .form-group {
-    flex: 1;
-    min-width: 220px;
-    max-width: 420px;
-    margin: 0;
-}
-
-.cuentas-tabla .cuentas-dinero {
-    text-align: right;
-    white-space: nowrap;
-}
-
-.cuentas-tabla .cuentas-fecha {
-    white-space: nowrap;
-}
-
-.cuentas-tabla .cuentas-pago {
-    color: var(--color-success);
-}
-
-.cuentas-tabla .cuentas-detalle small {
-    display: block;
-    color: var(--color-gray-500);
-}
-
-.cuentas-tabla tfoot td {
-    font-weight: 700;
-    background: var(--color-gray-50);
 }
 
 tr.fila-resaltada td {

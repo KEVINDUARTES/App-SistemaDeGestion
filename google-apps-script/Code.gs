@@ -103,6 +103,8 @@ function resolverHojaDeUsuario_(email) {
 function setTenant_(email) {
   var id = resolverHojaDeUsuario_(email);
   _tenant = { email: email, spreadsheetId: id, clave: String(id).substring(0, 16) };
+  // Versión de los datos al empezar: lo que esta ejecución guarde en la caché queda marcado con ella.
+  _tenant.ver = getDataVersion_();
   _spreadsheetCache = null;
   _sheetValuesCache = {};
   invalidateCatalogMemo();
@@ -796,11 +798,23 @@ var SERVER_CACHE_TTL = {
   dias: 90
 };
 
+// Las lecturas no esperan turno: una lectura que leyó la hoja ANTES de una escritura podía guardar
+// su copia en la caché DESPUÉS de que la escritura la borrara, y durante 10 minutos todos veían
+// datos viejos (por ejemplo, teléfonos recién cargados que "desaparecían").
+// Por eso cada copia de datos ('sc:...') lleva la versión con la que empezó la ejecución que la
+// leyó, y solo se usa si sigue siendo la versión actual: cualquier escritura posterior la descarta.
+function esCopiaDeDatos_(key) {
+  return String(key).indexOf('sc:') === 0;
+}
+
 function serverCacheGet(key) {
   try {
     var raw = CacheService.getScriptCache().get(tenantClave_() + ':' + key);
     if (!raw) return null;
-    return JSON.parse(raw);
+    var valor = JSON.parse(raw);
+    if (!esCopiaDeDatos_(key)) return valor;
+    if (!valor || typeof valor !== 'object' || valor.v !== _tenant.ver) return null;
+    return valor.d;
   } catch (e) {
     return null;
   }
@@ -808,6 +822,7 @@ function serverCacheGet(key) {
 
 function serverCacheSet(key, value, ttlSeconds) {
   try {
+    if (esCopiaDeDatos_(key)) value = { v: _tenant.ver, d: value };
     var json = JSON.stringify(value);
     if (json.length > 95000) return;
     CacheService.getScriptCache().put(tenantClave_() + ':' + key, json, ttlSeconds || SERVER_CACHE_TTL.catalog);

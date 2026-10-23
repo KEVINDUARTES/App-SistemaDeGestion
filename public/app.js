@@ -1088,6 +1088,18 @@ const Utils = {
         }[c]));
     },
 
+    // Solo lo que el usuario cambió en el formulario. Si se mandara todo, una persona con la
+    // pantalla desactualizada pisaría con vacío lo que otra acaba de cargar (ej.: un teléfono).
+    cambiosDe(anterior, nuevo) {
+        const normal = v => (v === true || v === 'true' || v === 1 ? true
+            : (v === false || v === 'false' || v === 0 ? false : String(v === undefined || v === null ? '' : v).trim()));
+        const cambios = {};
+        Object.keys(nuevo).forEach(campo => {
+            if (normal(nuevo[campo]) !== normal(anterior ? anterior[campo] : undefined)) cambios[campo] = nuevo[campo];
+        });
+        return cambios;
+    },
+
     sinUndefined(obj) {
         const limpio = {};
         Object.keys(obj).forEach(k => { if (obj[k] !== undefined) limpio[k] = obj[k]; });
@@ -1368,9 +1380,12 @@ const API = {
             const fail = (error, allowRetry) => {
                 if (settledRequest) return;
                 settledRequest = true;
-                const esTimeout = String(error && error.message || '').includes('tardó más de');
-                cleanup(esTimeout);
-                if (esTimeout) {
+                const msg = String(error && error.message || '');
+                const esTimeout = msg.includes('tardó más de');
+                // Si la respuesta llega igual más tarde, se aprovecha (en un timeout o tras un onerror).
+                const esperarTarde = esTimeout || msg.includes('No se pudo conectar con Google');
+                cleanup(esperarTarde);
+                if (esperarTarde) {
                     window[callbackName] = (response) => {
                         delete window[callbackName];
                         if (scriptTag && scriptTag.parentNode) scriptTag.parentNode.removeChild(scriptTag);
@@ -1413,10 +1428,15 @@ const API = {
             scriptTag = document.createElement('script');
             scriptTag.src = url;
             scriptTag.async = true;
-            // El redirect de Google dispara onerror aunque el callback después llegue bien.
-            // No cancelamos el pedido: esperamos el callback o el timeout real.
+            // Si Google contesta con una página de error (no con la respuesta), el navegador avisa
+            // con onerror y ese script ya no se va a ejecutar. Antes se seguía esperando hasta el
+            // límite (120 s en el cierre) y el error real nunca se veía. Se da un margen corto por si
+            // el callback igual llega y después se corta como "no se pudo conectar".
             scriptTag.onerror = () => {
-                console.warn('JSONP onerror (se sigue esperando):', endpoint);
+                console.warn('JSONP onerror:', endpoint);
+                setTimeout(() => {
+                    fail(new Error('No se pudo conectar con Google. Revisá la conexión y volvé a intentar.'), true);
+                }, 8000);
             };
 
             timeoutId = setTimeout(() => {
@@ -2223,7 +2243,6 @@ const Navigation = {
             historial: 'Historial de días',
             reparto: 'Repartir efectivo',
             caja: 'Caja',
-            cuentas: 'Cuentas corrientes',
             mantenimiento: 'Limpiar datos'
         };
         document.getElementById('page-title').textContent = titles[requested] || 'Dashboard';
@@ -2289,9 +2308,6 @@ const Navigation = {
                     break;
                 case 'caja':
                     await Caja.load();
-                    break;
-                case 'cuentas':
-                    await Cuentas.load();
                     break;
                 case 'reparto':
                     await Reparto.load();
@@ -2436,24 +2452,26 @@ const Dashboard = {
         return window.XLSX;
     },
 
-    // Excel con dos hojas: qué debe cada cliente (desde y hasta qué día) y qué se le debe
-    // a cada proveedor (hasta qué mercadería y cuándo se le pagó por última vez).
+    // PDF de saldos: qué debe cada cliente (desde y hasta qué día) y qué se le debe a cada
+    // proveedor (hasta qué mercadería y cuándo se le pagó por última vez).
+    // seccion: 'ambos' (inicio), 'clientes' (Cobranzas pendientes) o 'proveedores' (Pagos pendientes).
     // Se pide todo al servidor en el momento: el archivo tiene que estar al día.
-    async descargarExcelSaldos() {
+    async descargarPdfSaldos(seccion = 'ambos') {
+        const conClientes = seccion !== 'proveedores';
+        const conProveedores = seccion !== 'clientes';
         try {
-            const [XLSX, cobranzas, proveedores, recepcion, pagos] = await Promise.all([
-                this._cargarXlsx(),
+            const [cobranzas, proveedores, recepcion, pagos] = await Promise.all([
                 API.request('cobranzas', 'GET'),
                 API.request('proveedores', 'GET'),
                 API.request('recepcion', 'GET'),
                 API.request('pagos-proveedores', 'GET')
             ]);
-            const aFecha = iso => {
+            const fechaCorta = iso => {
                 const f = Utils.fechaIso(iso);
-                return f ? new Date(f + 'T12:00:00') : '';
+                if (!f) return '—';
+                const [y, m, d] = f.split('-');
+                return `${d}/${m}/${y}`;
             };
-            const ahora = new Date();
-            const corte = `Saldos al ${ahora.toLocaleDateString('es-AR')} ${ahora.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false })}`;
 
             const porCliente = new Map();
             (cobranzas || []).filter(c => Utils.isCobranzaPendiente(c)).forEach(c => {
@@ -2491,43 +2509,74 @@ const Dashboard = {
                 .sort((a, b) => b.saldo - a.saldo);
 
             const total = filas => filas.reduce((suma, f) => suma + f.saldo, 0);
-            const hojaClientes = XLSX.utils.aoa_to_sheet([
-                [corte],
-                [],
-                ['Cliente', 'Saldo que debe', 'Días adeudados', 'Debe desde', 'Hasta (último día adeudado)'],
-                ...clientes.map(f => [f.nombre, f.saldo, f.dias, aFecha(f.desde), aFecha(f.hasta)]),
-                [],
-                ['TOTAL', total(clientes)]
-            ], { cellDates: true, dateNF: 'dd/mm/yyyy' });
-            const hojaProveedores = XLSX.utils.aoa_to_sheet([
-                [corte],
-                [],
-                ['Proveedor', 'Saldo a pagar', 'Mercadería hasta', 'Último pago'],
-                ...deudas.map(f => [f.nombre, f.saldo, aFecha(ultimaMercaderia[f.id]), aFecha(ultimoPago[f.id])]),
-                [],
-                ['TOTAL', total(deudas)]
-            ], { cellDates: true, dateNF: 'dd/mm/yyyy' });
+            const filasClientes = clientes.map((f, i) => `
+                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                    <td>${Utils.esc(f.nombre)}</td>
+                    <td class="col-money">${Utils.formatCurrency(f.saldo)}</td>
+                    <td class="col-num">${f.dias}</td>
+                    <td class="col-num">${fechaCorta(f.desde)}</td>
+                    <td class="col-num">${fechaCorta(f.hasta)}</td>
+                </tr>`).join('') || '<tr><td colspan="5" class="vacio">Ningún cliente te debe.</td></tr>';
+            const filasProveedores = deudas.map((f, i) => `
+                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                    <td>${Utils.esc(f.nombre)}</td>
+                    <td class="col-money">${Utils.formatCurrency(f.saldo)}</td>
+                    <td class="col-num">${fechaCorta(ultimaMercaderia[f.id])}</td>
+                    <td class="col-num">${fechaCorta(ultimoPago[f.id])}</td>
+                </tr>`).join('') || '<tr><td colspan="4" class="vacio">No le debés a ningún proveedor.</td></tr>';
 
-            const formatoPesos = (hoja, columna) => {
-                const rango = XLSX.utils.decode_range(hoja['!ref']);
-                for (let fila = 3; fila <= rango.e.r; fila++) {
-                    const celda = hoja[XLSX.utils.encode_cell({ r: fila, c: columna })];
-                    if (celda && typeof celda.v === 'number') celda.z = '"$" #,##0';
-                }
-            };
-            formatoPesos(hojaClientes, 1);
-            formatoPesos(hojaProveedores, 1);
-            hojaClientes['!cols'] = [{ wch: 30 }, { wch: 16 }, { wch: 15 }, { wch: 13 }, { wch: 26 }];
-            hojaProveedores['!cols'] = [{ wch: 30 }, { wch: 16 }, { wch: 17 }, { wch: 13 }];
-
-            const libro = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(libro, hojaClientes, 'Clientes');
-            XLSX.utils.book_append_sheet(libro, hojaProveedores, 'Proveedores');
-            XLSX.writeFile(libro, `saldos-${ahora.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' })}.xlsx`);
-            Utils.showSuccess('Se descargó el Excel con los saldos.');
+            const ahora = new Date();
+            const generado = ahora.toLocaleString('es-AR', { hour12: false });
+            const html = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Saldos</title>
+                <style>
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 13px; color: #1e293b; padding: 32px 40px; background: #fff; }
+                    .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 3px solid #1a73e8; }
+                    .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                    .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                    .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                    .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                    .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 12px 20px; border-radius: 8px; margin: 8px 0 14px; display: flex; justify-content: space-between; align-items: baseline; }
+                    .cliente-box .name { font-size: 18px; font-weight: 700; color: #1e293b; }
+                    .cliente-box .monto { font-size: 18px; font-weight: 700; color: #1a73e8; }
+                    table { width: 100%; border-collapse: collapse; margin-bottom: 26px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                    thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 11px 12px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+                    thead th.col-money, thead th.col-num { text-align: right; }
+                    tbody td { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; }
+                    .row-even { background: #fff; }
+                    .row-odd { background: #f8fafc; }
+                    td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                    td.col-num { text-align: right; white-space: nowrap; color: #475569; }
+                    td.vacio { text-align: center; color: #64748b; padding: 18px; }
+                    tfoot td { padding: 10px 12px; font-weight: 700; background: #f1f5f9; }
+                    tfoot td.col-money { text-align: right; color: #1e293b; }
+                    .footer { margin-top: 12px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+                </style></head><body>
+                <div class="doc-header">
+                    <div class="brand"><h1>Luciano Cargas</h1><p>${conClientes && conProveedores ? 'Saldos de clientes y proveedores' : (conClientes ? 'Cobranzas a clientes (pendientes)' : 'Pagos a proveedores (pendientes)')}</p></div>
+                    <div class="doc-meta"><strong>Saldos al</strong>${Utils.esc(generado)}</div>
+                </div>
+                ${conClientes ? `<div class="cliente-box"><span class="name">Clientes que te deben</span><span class="monto">${Utils.formatCurrency(total(clientes))}</span></div>
+                <table>
+                    <thead><tr><th>Cliente</th><th class="col-money">Saldo que debe</th><th class="col-num">Días</th><th class="col-num">Debe desde</th><th class="col-num">Hasta</th></tr></thead>
+                    <tbody>${filasClientes}</tbody>
+                    <tfoot><tr><td>Total</td><td class="col-money">${Utils.formatCurrency(total(clientes))}</td><td colspan="3"></td></tr></tfoot>
+                </table>` : ''}
+                ${conProveedores ? `<div class="cliente-box"><span class="name">Proveedores a pagar</span><span class="monto">${Utils.formatCurrency(total(deudas))}</span></div>
+                <table>
+                    <thead><tr><th>Proveedor</th><th class="col-money">Saldo a pagar</th><th class="col-num">Mercadería hasta</th><th class="col-num">Último pago</th></tr></thead>
+                    <tbody>${filasProveedores}</tbody>
+                    <tfoot><tr><td>Total</td><td class="col-money">${Utils.formatCurrency(total(deudas))}</td><td colspan="2"></td></tr></tfoot>
+                </table>` : ''}
+                <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+                </body></html>`;
+            const doc = await Precios._pdfDesdeHtml(html);
+            const prefijo = seccion === 'clientes' ? 'cobranzas-pendientes' : (seccion === 'proveedores' ? 'pagos-pendientes' : 'saldos');
+            doc.save(`${prefijo}-${ahora.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' })}.pdf`);
+            Utils.showSuccess('Se descargó el PDF con los saldos.');
         } catch (error) {
-            console.error('Error armando el Excel de saldos:', error);
-            Utils.showError('No se pudo armar el Excel: ' + error.message);
+            console.error('Error armando el PDF de saldos:', error);
+            Utils.showError('No se pudo armar el PDF: ' + error.message);
         }
     },
 
@@ -2800,18 +2849,16 @@ const Clientes = {
             }
 
             const anterior = { ...cliente };
-            const datos = { id, nombre, telefono, activo };
+            const cambios = Utils.cambiosDe(anterior, { nombre, telefono, activo });
+            if (!Object.keys(cambios).length) return;
+            const datos = { id, ...cambios };
             Utils.upsertInList(AppState.clientes, datos);
             CacheManager.set('clientes', AppState.clientes);
             Clientes.render();
             Utils.avisar('Cliente actualizado');
 
             Utils.enSegundoPlano(async () => {
-                await API.updateCliente(id, {
-                    nombre,
-                    telefono,
-                    activo
-                });
+                await API.updateCliente(id, { ...cambios });
                 CacheManager.set('clientes', AppState.clientes);
             }, async (error) => {
                 if (API._esCorteDeConexion(error) && await API.verificarGuardado('clientes', id, datos)) {
@@ -2928,7 +2975,7 @@ const Productos = {
         Utils.hideTableLoader(tbody);
         
         if (AppState.productos.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No hay productos registrados. Agregue productos para poder crear pedidos.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;">No hay productos registrados. Agregue productos para poder crear pedidos.</td></tr>';
             return;
         }
         
@@ -2942,7 +2989,6 @@ const Productos = {
                 <tr>
                     <td>${Utils.esc(producto.nombre || '')}</td>
                     <td><span class="status-badge ${tipoBadgeClass}">${producto.tipo || ''}</span></td>
-                    <td>${Utils.esc(producto.unidad || '')}</td>
                     <td>${proveedor ? proveedor.nombre : 'Sin proveedor'}</td>
                     <td>
                         <button class="btn btn-secondary" onclick="Productos.edit('${producto.id}')">Editar</button>
@@ -2973,17 +3019,7 @@ const Productos = {
                     <option value="">Seleccionar...</option>
                     <option value="verdura">Verdura</option>
                     <option value="bebida">Bebida</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Unidad de medida</label>
-                <select id="modal-producto-unidad" class="form-control" required>
-                    <option value="">Seleccionar...</option>
-                    <option value="kg">Kilogramo (kg)</option>
-                    <option value="unidad">Unidad</option>
-                    <option value="caja">Caja</option>
-                    <option value="docena">Docena</option>
-                    <option value="litro">Litro</option>
+                    <option value="mercadería">Mercadería</option>
                 </select>
             </div>
             <div class="form-group">
@@ -2999,10 +3035,9 @@ const Productos = {
         Utils.showModal('Agregar producto', content, async () => {
             const nombre = document.getElementById('modal-producto-nombre').value.trim();
             const tipo = document.getElementById('modal-producto-tipo').value;
-            const unidad = document.getElementById('modal-producto-unidad').value;
             const proveedorId = document.getElementById('modal-producto-proveedor').value;
             
-            if (!nombre || !tipo || !unidad) {
+            if (!nombre || !tipo) {
                 Utils.showError('Complete todos los campos obligatorios');
                 return true;
             }
@@ -3011,7 +3046,6 @@ const Productos = {
                 const result = await API.createProducto({
                     nombre: nombre,
                     tipo: tipo,
-                    unidad: unidad,
                     proveedor_default: proveedorId || ''
                 });
                 
@@ -3022,7 +3056,6 @@ const Productos = {
                         id: result.id,
                         nombre,
                         tipo,
-                        unidad,
                         proveedor_default: proveedorId || '',
                         ...result
                     };
@@ -3072,16 +3105,7 @@ const Productos = {
                 <select id="modal-producto-tipo" class="form-control" required>
                     <option value="verdura" ${producto.tipo === 'verdura' ? 'selected' : ''}>Verdura</option>
                     <option value="bebida" ${producto.tipo === 'bebida' ? 'selected' : ''}>Bebida</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Unidad de medida</label>
-                <select id="modal-producto-unidad" class="form-control" required>
-                    <option value="kg" ${producto.unidad === 'kg' ? 'selected' : ''}>Kilogramo (kg)</option>
-                    <option value="unidad" ${producto.unidad === 'unidad' ? 'selected' : ''}>Unidad</option>
-                    <option value="caja" ${producto.unidad === 'caja' ? 'selected' : ''}>Caja</option>
-                    <option value="docena" ${producto.unidad === 'docena' ? 'selected' : ''}>Docena</option>
-                    <option value="litro" ${producto.unidad === 'litro' ? 'selected' : ''}>Litro</option>
+                    <option value="mercadería" ${producto.tipo === 'mercadería' ? 'selected' : ''}>Mercadería</option>
                 </select>
             </div>
             <div class="form-group">
@@ -3096,10 +3120,9 @@ const Productos = {
         Utils.showModal('Editar producto', content, async () => {
             const nombre = document.getElementById('modal-producto-nombre').value.trim();
             const tipo = document.getElementById('modal-producto-tipo').value;
-            const unidad = document.getElementById('modal-producto-unidad').value;
             const proveedorId = document.getElementById('modal-producto-proveedor').value;
             
-            if (!nombre || !tipo || !unidad) {
+            if (!nombre || !tipo) {
                 Utils.showError('Complete todos los campos obligatorios');
                 return true;
             }
@@ -3108,7 +3131,6 @@ const Productos = {
                 await API.updateProducto(id, {
                     nombre: nombre,
                     tipo: tipo,
-                    unidad: unidad,
                     proveedor_default: proveedorId || ''
                 });
                 
@@ -3116,7 +3138,6 @@ const Productos = {
                     id,
                     nombre,
                     tipo,
-                    unidad,
                     proveedor_default: proveedorId || ''
                 });
                 CacheManager.set('productos', AppState.productos);
@@ -3366,20 +3387,16 @@ const ProveedoresGestion = {
             }
 
             const anterior = { ...proveedor };
-            const datos = { id, nombre, rubro, telefono, activo };
+            const cambios = Utils.cambiosDe(anterior, { nombre, rubro, telefono, activo });
+            if (!Object.keys(cambios).length) return;
+            const datos = { id, ...cambios };
             Utils.upsertInList(AppState.proveedores, datos);
             CacheManager.set('proveedores', AppState.proveedores);
             ProveedoresGestion.render();
             Utils.avisar('Proveedor actualizado');
 
             Utils.enSegundoPlano(async () => {
-                await API.updateProveedor(id, {
-                    id,
-                    nombre,
-                    rubro,
-                    telefono,
-                    activo
-                });
+                await API.updateProveedor(id, { ...cambios });
                 CacheManager.set('proveedores', AppState.proveedores);
             }, async (error) => {
                 if (API._esCorteDeConexion(error) && await API.verificarGuardado('proveedores', id, datos)) {
@@ -4719,7 +4736,7 @@ const Pedidos = {
                 const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
                 const nombre = proveedor?.nombre || 'Sin proveedor asignado';
                 const items = this._totalesPorProducto(grupos[proveedorId]).map(linea => `
-                    <li><strong>${Utils.esc(linea.producto)} × ${linea.total}${linea.unidad ? ' ' + Utils.esc(linea.unidad) : ''}</strong>
+                    <li><strong>${Utils.esc(linea.producto)} × ${linea.total}</strong>
                         <small class="modal-hint">${linea.detalle.map(d => `${Utils.esc(d.cliente)} ${d.cantidad}`).join(' · ')}</small></li>
                 `).join('');
                 const sinTelefono = !proveedor || !proveedor.telefono;
@@ -4781,8 +4798,7 @@ const Pedidos = {
             const producto = this._productoDe(pedido);
             return {
                 producto: pedido.producto_nombre || producto?.nombre || 'Producto',
-                cantidad: pedido.cantidad,
-                unidad: producto?.unidad || ''
+                cantidad: pedido.cantidad
             };
         });
     },
@@ -4796,7 +4812,6 @@ const Pedidos = {
             if (!porProducto[key]) {
                 porProducto[key] = {
                     producto: pedido.producto_nombre || producto?.nombre || 'Producto',
-                    unidad: producto?.unidad || '',
                     total: 0,
                     detalle: []
                 };
@@ -5053,7 +5068,6 @@ const Pedidos = {
 
         const grupo = this._grupoMismoProducto(pedido);
         const [linea] = this._totalesPorProducto(grupo);
-        const unidad = linea.unidad ? ' ' + Utils.esc(linea.unidad) : '';
         previewItems.innerHTML = `
             <p class="modal-hint">Se le pide el total del día de ${Utils.esc(productoNombre)}${grupo.length > 1 ? ` (${grupo.length} pedidos)` : ''}.</p>
             <table class="modal-pedido-detalle-table">
@@ -5074,7 +5088,7 @@ const Pedidos = {
                     <tr>
                         <td><strong>Total del día</strong></td>
                         <td></td>
-                        <td><strong>${linea.total}${unidad}</strong></td>
+                        <td><strong>${linea.total}</strong></td>
                     </tr>
                 </tbody>
             </table>
@@ -7501,7 +7515,7 @@ const CuentaCorriente = {
                 movs = this._movimientosProveedor(id, recepcion, pagos);
             }
             const filas = this._conSaldo(movs);
-            this._ultima = { tipo, nombre, filas };
+            this._ultima = { tipo, id, nombre, filas };
             this._mostrar(esCliente, nombre, filas);
         } catch (error) {
             console.error('Error armando la cuenta corriente:', error);
@@ -7518,14 +7532,14 @@ const CuentaCorriente = {
         const cuerpo = filas.length
             ? filas.map(f => `
                 <tr class="${f.pago ? 'cc-pago' : ''}">
-                    <td>${Utils.esc(fecha(f.fecha))}</td>
-                    <td class="cc-producto">${Utils.esc(f.producto)}</td>
-                    <td class="cc-num">${f.cantidad === '' ? '' : String(f.cantidad).replace('.', ',')}</td>
-                    <td class="cc-num">${plata(f.precio)}</td>
-                    <td class="cc-num">${plata(f.total)}</td>
-                    <td class="cc-num">${plata(f.pago)}</td>
-                    <td>${Utils.esc(f.medio || '')}</td>
-                    <td class="cc-num cc-saldo">${Utils.formatCurrency(f.saldo)}</td>
+                    <td data-label="Fecha">${Utils.esc(fecha(f.fecha))}</td>
+                    <td data-label="Producto" class="cc-producto">${Utils.esc(f.producto)}</td>
+                    <td data-label="Cantidad" class="cc-num">${f.cantidad === '' ? '' : String(f.cantidad).replace('.', ',')}</td>
+                    <td data-label="Precio" class="cc-num">${plata(f.precio)}</td>
+                    <td data-label="Total" class="cc-num">${plata(f.total)}</td>
+                    <td data-label="Pago" class="cc-num">${plata(f.pago)}</td>
+                    <td data-label="Medio">${Utils.esc(f.medio || '')}</td>
+                    <td data-label="Saldo" class="cc-num cc-saldo">${Utils.formatCurrency(f.saldo)}</td>
                 </tr>`).join('')
             : `<tr><td colspan="8" style="text-align:center;padding:24px;color:#666;">Todavía no hay movimientos con ${Utils.esc(nombre)}.</td></tr>`;
         const content = `
@@ -7533,7 +7547,7 @@ const CuentaCorriente = {
                 <div class="cc-resumen">
                     <span>${esCliente ? 'Te debe' : 'Le debés'}</span>
                     <strong class="${saldo > 0 ? 'cc-deuda' : ''}">${Utils.formatCurrency(saldo)}</strong>
-                    <button type="button" class="btn btn-secondary btn-sm" id="cc-excel">Descargar Excel</button>
+                    <button type="button" class="btn btn-whatsapp btn-sm" id="cc-whatsapp">Enviar WhatsApp</button>
                 </div>
                 <div class="table-container cc-scroll">
                     <table class="data-table cc-tabla">
@@ -7547,38 +7561,129 @@ const CuentaCorriente = {
             </div>
         `;
         Utils.showModal(`Cuenta corriente · ${nombre}`, content, null);
-        document.getElementById('cc-excel')?.addEventListener('click', () => this.descargarExcel());
+        document.getElementById('cc-whatsapp')?.addEventListener('click', () => this.enviarWhatsApp());
         const scroll = document.querySelector('.cc-scroll');
         if (scroll) scroll.scrollTop = scroll.scrollHeight;
     },
 
-    async descargarExcel() {
+    _fechaLarga(iso) {
+        const f = Utils.fechaIso(iso);
+        if (!f) return '';
+        return new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    },
+
+    // Mismo diseño que los demás PDF de la app (encabezado azul, recuadro con el nombre, filas alternadas).
+    _htmlPdf(cuenta, tipo) {
+        const esCliente = tipo === 'cliente';
+        const generado = new Date().toLocaleString('es-AR');
+        const etiquetaSaldo = esCliente ? 'Saldo que debe' : 'Saldo a pagar';
+        const cant = n => (n === '' || n === null || n === undefined ? '' : String(n).replace('.', ','));
+        const plata = n => (n === '' || !n ? '' : Utils.formatCurrency(n));
+        let fechaAnterior = '';
+        const cuerpo = cuenta.movimientos.map((m, i) => {
+            const fecha = this._fechaLarga(m.fecha);
+            const mostrarFecha = fecha !== fechaAnterior;
+            fechaAnterior = fecha;
+            const esPago = !!m.pago;
+            return `
+            <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                <td class="col-fecha">${mostrarFecha ? Utils.esc(fecha) : ''}</td>
+                <td class="${esPago ? 'pago' : ''}">${Utils.esc(m.producto || (esPago ? 'Pago' : ''))}</td>
+                <td class="col-num">${cant(m.cantidad)}</td>
+                <td class="col-num">${plata(m.precio)}</td>
+                <td class="col-money">${plata(m.total)}</td>
+                <td class="col-money pago">${plata(m.pago)}</td>
+                <td class="pago">${Utils.esc(m.medio)}</td>
+                <td class="col-money saldo">${Utils.formatCurrency(m.saldo)}</td>
+            </tr>`;
+        }).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Cuenta corriente</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; padding: 32px 36px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 14px 20px; border-radius: 8px; margin-bottom: 20px; }
+                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 10px 8px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+                thead th.col-money, thead th.col-num { text-align: right; }
+                tbody td { padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f8fafc; }
+                td.col-fecha { color: #475569; width: 150px; }
+                td.col-num { text-align: right; white-space: nowrap; }
+                td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                td.col-money.saldo { color: #1e293b; }
+                td.pago, td.col-money.pago { color: #15803d; }
+                .totals-wrap { margin-top: 18px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 300px; box-shadow: none; }
+                .totals-table td { padding: 8px 14px; font-size: 14px; font-weight: 700; border: none; }
+                .totals-table td:last-child { text-align: right; }
+                .totals-table tr.linea td { color: #475569; font-weight: 500; font-size: 13px; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; font-size: 16px; }
+                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
+                .footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Cuenta corriente</p></div>
+                <div class="doc-meta"><strong>${etiquetaSaldo}</strong>${Utils.formatCurrency(cuenta.saldo)}<br><span>Generado: ${Utils.esc(generado)}</span></div>
+            </div>
+            <div class="cliente-box"><div class="label">${esCliente ? 'Cliente' : 'Proveedor'}</div><div class="name">${Utils.esc(cuenta.nombre)}</div></div>
+            <table>
+                <thead><tr>
+                    <th>Fecha</th><th>Producto</th><th class="col-num">Cant.</th><th class="col-num">Precio</th>
+                    <th class="col-money">Total</th><th class="col-money">Pago</th><th>Medio</th><th class="col-money">Saldo</th>
+                </tr></thead>
+                <tbody>${cuerpo || '<tr><td colspan="8">Todavía no tiene cargas ni pagos.</td></tr>'}</tbody>
+            </table>
+            <div class="totals-wrap"><table class="totals-table">
+                <tr class="linea"><td>Total cargas</td><td>${Utils.formatCurrency(cuenta.cargas)}</td></tr>
+                <tr class="linea"><td>Total pagos</td><td>${Utils.formatCurrency(cuenta.pagos)}</td></tr>
+                <tr class="saldo"><td>${etiquetaSaldo}</td><td>${Utils.formatCurrency(cuenta.saldo)}</td></tr>
+            </table></div>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
+
+    // Como los demás envíos de PDF: en la computadora abre WhatsApp Web con la frase y deja el
+    // documento copiado para pegar; en el celular, el menú Compartir. Sin teléfono, se descarga.
+    async enviarWhatsApp() {
         const cuenta = this._ultima;
         if (!cuenta) return;
         try {
-            const XLSX = await Dashboard._cargarXlsx();
-            const filas = [
-                [`Cuenta corriente · ${cuenta.nombre}`],
-                [],
-                ['FECHA', 'PRODUCTO', 'CANTIDAD', 'PRECIO', 'TOTAL', 'PAGO', 'MEDIO', 'SALDO'],
-                ...cuenta.filas.map(f => [f.fecha ? new Date(f.fecha + 'T12:00:00') : '', f.producto, f.cantidad, f.precio || '', f.total || '', f.pago || '', f.medio || '', f.saldo]),
-                [],
-                ['SALDO', '', '', '', '', '', '', cuenta.filas.length ? cuenta.filas[cuenta.filas.length - 1].saldo : 0]
-            ];
-            const hoja = XLSX.utils.aoa_to_sheet(filas, { cellDates: true, dateNF: 'dddd, d "de" mmmm "de" yyyy' });
-            const rango = XLSX.utils.decode_range(hoja['!ref']);
-            for (let r = 3; r <= rango.e.r; r++) {
-                [3, 4, 5, 7].forEach(c => {
-                    const celda = hoja[XLSX.utils.encode_cell({ r, c })];
-                    if (celda && typeof celda.v === 'number') celda.z = '"$" #,##0';
-                });
+            const esCliente = cuenta.tipo === 'cliente';
+            const lista = esCliente ? AppState.clientes : AppState.proveedores;
+            const persona = (lista || []).find(x => String(x.id) === String(cuenta.id)) || {};
+            const movimientos = cuenta.filas;
+            const datos = {
+                nombre: cuenta.nombre,
+                movimientos,
+                cargas: movimientos.reduce((suma, f) => suma + (f.total || 0), 0),
+                pagos: movimientos.reduce((suma, f) => suma + (f.pago || 0), 0),
+                saldo: movimientos.length ? movimientos[movimientos.length - 1].saldo : 0
+            };
+            const doc = await Precios._pdfDesdeHtml(this._htmlPdf(datos, cuenta.tipo));
+            const nombreArchivo = `cuenta-${String(cuenta.nombre).replace(/[^\w\-]+/g, '-')}.pdf`;
+            if (!WhatsAppService.normalizePhone(persona.telefono)) {
+                doc.save(nombreArchivo);
+                Utils.avisar(`Se descargó el PDF. ${cuenta.nombre} no tiene un teléfono válido para WhatsApp: cargalo en ${esCliente ? 'Clientes' : 'Proveedores'}.`);
+                return;
             }
-            hoja['!cols'] = [{ wch: 30 }, { wch: 24 }, { wch: 10 }, { wch: 13 }, { wch: 15 }, { wch: 15 }, { wch: 14 }, { wch: 16 }];
-            const libro = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(libro, hoja, 'Cuenta corriente');
-            XLSX.writeFile(libro, `cuenta-${String(cuenta.nombre).replace(/[^\w\-]+/g, '-')}.xlsx`);
+            await EnvioPdf.enviar({
+                telefono: persona.telefono,
+                texto: `Hola ${cuenta.nombre}, te paso la cuenta corriente con el saldo al día.`,
+                doc,
+                nombre: nombreArchivo,
+                destinatario: cuenta.nombre
+            });
         } catch (error) {
-            Utils.showError('No se pudo armar el Excel: ' + error.message);
+            console.error('Error enviando la cuenta corriente:', error);
+            Utils.showError('No se pudo enviar la cuenta corriente: ' + error.message);
         }
     }
 };
@@ -7906,6 +8011,15 @@ const Cierre = {
         }
     },
     
+    async _quedoCerrado(fecha) {
+        try {
+            const cierres = await API._executeRequest('cierre', 'GET', null, 0);
+            return (cierres || []).some(c => Utils.fechaIso(c.fecha) === fecha && String(c.estado) === 'cerrado');
+        } catch (error) {
+            return false;
+        }
+    },
+
     async cerrar() {
         if (this._cerrando) return;
         const info = this && DiaOperativo.getDiaInfo(AppState.currentDate);
@@ -7959,6 +8073,10 @@ const Cierre = {
             await DiaOperativo.resolveWorkDate();
             Navigation.navigateTo('dashboard');
         } catch (error) {
+            // Si se cortó la conexión no se sabe si el servidor llegó a cerrar: se le pregunta.
+            if (API._esCorteDeConexion(error) && await this._quedoCerrado(AppState.currentDate)) {
+                error = new Error('ya está cerrado');
+            }
             if (String(error.message || '').includes('ya está cerrado')) {
                 Utils.showSuccess('Día cerrado correctamente');
                 CacheManager.invalidateAllExcept(['clientes', 'productos', 'proveedores']);
@@ -7981,6 +8099,11 @@ const Cierre = {
             // Si el error menciona recepciones, dar más contexto
             if (error.message.includes('recepciones')) {
                 errorMessage += '\n\nPor favor, asegúrate de haber confirmado todas las recepciones antes de cerrar el día.';
+            }
+
+            if (API._esCorteDeConexion(error)) {
+                errorMessage = 'No se pudo confirmar el cierre: Google no respondió. El día todavía no quedó cerrado. '
+                    + 'Volvé a tocar "Cerrar día": es seguro, no se duplica nada.';
             }
             
             Utils.showError(errorMessage);
@@ -8706,10 +8829,6 @@ const Cobranzas = {
             const tr = document.createElement('tr');
             const saldo = Utils.getCobranzaSaldo(cobranza);
             const cliente = this._clienteDe(cobranza);
-            const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
-            const btnWhatsApp = sinTelefono
-                ? '<button class="btn btn-whatsapp btn-sm" type="button" disabled title="Falta teléfono">WhatsApp</button>'
-                : `<button class="btn btn-whatsapp btn-sm" type="button" onclick="Cobranzas.enviarWhatsApp('${cobranza.id}')">WhatsApp</button>`;
             tr.dataset.clienteId = String(cobranza.cliente_id || '');
             tr.innerHTML = `
                 <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}</td>
@@ -8720,9 +8839,7 @@ const Cobranzas = {
                 <td data-label="Acciones">
                     <div class="pagos-acciones">
                         <button class="btn btn-primary btn-sm" type="button" onclick="Cobranzas.cobrar('${cobranza.id}')">Cobrar</button>
-                        <button class="btn btn-secondary btn-sm" type="button" onclick="SaldoCliente.abrir('${cliente.id}')">Enviar saldo</button>
                         <button class="btn btn-secondary btn-sm" type="button" onclick="CuentaCorriente.abrir('cliente', '${cliente.id}')">Cuenta</button>
-                        ${btnWhatsApp}
                     </div>
                 </td>
             `;
@@ -8913,26 +9030,6 @@ const Cobranzas = {
     programarAvisoWhatsApp(cliente, cobro, nombre) {
         if (!cliente) return;
         setTimeout(() => this.abrirModalWhatsApp(cliente, cobro, nombre), 350);
-    },
-
-    async enviarWhatsApp(cobranzaId) {
-        try {
-            await Pagos.ensureDatosWhatsApp();
-            const cobranza = (AppState.cobranzas || []).find(c => String(c.id) === String(cobranzaId));
-            if (!cobranza) {
-                Utils.showError('Cobranza no encontrada');
-                return;
-            }
-            const cliente = this._clienteDe(cobranza);
-            cliente.saldo = Utils.getCobranzaSaldo(cobranza);
-            const ultimo = this._ultimoCobro && String(this._ultimoCobro.cobranzaId) === String(cobranzaId)
-                ? this._ultimoCobro
-                : { fecha: cobranza.fecha };
-            this.abrirModalWhatsApp(cliente, ultimo, cliente.nombre);
-        } catch (error) {
-            console.error('Error preparando WhatsApp de cobro:', error);
-            Utils.showError('No se pudo preparar el WhatsApp: ' + (error.message || 'intentá de nuevo.'));
-        }
     },
 
     abrirModalWhatsApp(cliente, cobro = null, nombreCliente = '') {
@@ -10152,7 +10249,6 @@ const Stock = {
                     producto_id: producto.id,
                     producto_nombre: producto.nombre || item.producto_nombre || '',
                     tipo: producto.tipo || item.tipo || '',
-                    unidad: producto.unidad || item.unidad || '',
                     stock_actual: parseFloat(item.stock_actual) || 0,
                     minimo: item.minimo === undefined || item.minimo === '' ? 10 : (parseFloat(item.minimo) || 0)
                 };
@@ -10161,7 +10257,6 @@ const Stock = {
                 producto_id: item.producto_id,
                 producto_nombre: item.producto_nombre || '',
                 tipo: item.tipo || '',
-                unidad: item.unidad || '',
                 stock_actual: parseFloat(item.stock_actual) || 0,
                 minimo: parseFloat(item.minimo) || 10
             }));
@@ -10175,13 +10270,12 @@ const Stock = {
     _tipo(tipo) {
         if (tipo === 'bebida') return 'Bebida';
         if (tipo === 'verdura') return 'Verdura';
+        if (tipo === 'mercadería') return 'Mercadería';
         return tipo ? String(tipo) : '';
     },
 
-    _cantidad(valor, unidad) {
-        const numero = Math.round((parseFloat(valor) || 0) * 1000) / 1000;
-        const texto = Number.isInteger(numero) ? String(numero) : String(numero);
-        return unidad ? `${texto} ${unidad}` : texto;
+    _cantidad(valor) {
+        return String(Math.round((parseFloat(valor) || 0) * 1000) / 1000);
     },
 
     async _asegurarProductos() {
@@ -10238,7 +10332,7 @@ const Stock = {
             tr.innerHTML = `
                 <td>${Utils.esc(item.producto_nombre || '')}</td>
                 <td>${this._tipo(item.tipo)}</td>
-                <td>${this._cantidad(item.stock_actual, item.unidad)}</td>
+                <td>${this._cantidad(item.stock_actual)}</td>
                 <td><span class="status-badge ${estado === 'BAJO' ? 'status-bajo' : 'status-activo'}">${estado}</span></td>
                 <td>
                     <button class="btn btn-secondary" onclick="Stock.edit('${item.producto_id}', '${nombre}', ${item.stock_actual || 0})">Editar</button>
@@ -10684,7 +10778,7 @@ const Historial = {
                     seccionPedidos += `
                     <tr>
                         <td style="padding:4px 8px 4px 20px;">${Utils.esc(item.producto_nombre || '')}</td>
-                        <td style="padding:4px 8px;text-align:center;">${item.cantidad} ${item.tipo === 'bebida' ? 'u.' : 'kg'}</td>
+                        <td style="padding:4px 8px;text-align:center;">${item.cantidad}</td>
                         <td style="padding:4px 8px;text-align:right;">${formatPeso(precioUnit)}</td>
                         <td style="padding:4px 8px;text-align:right;">${formatPeso(subtotal)}</td>
                     </tr>`;
@@ -10817,338 +10911,6 @@ const Historial = {
             Utils.showError('Error al eliminar historial: ' + error.message);
         } finally {
             Utils.hideLoader();
-        }
-    }
-};
-
-// Cuenta corriente de cada cliente o proveedor: cada carga y cada pago con su fecha, y el saldo
-// que va quedando. La ven todos los usuarios (los totales del inicio son solo para algunos).
-const Cuentas = {
-    tipo: 'cliente',
-    elegido: { cliente: '', proveedor: '' },
-    _datos: null,
-
-    async load() {
-        this._pintarTipo();
-        const tbody = document.getElementById('cuentas-tbody');
-        Utils.showTableLoader(tbody);
-        try {
-            const [clientes, proveedores, cobranzas, precios, caja, recepcion, pagos] = await Promise.all([
-                API.request('clientes', 'GET'),
-                API.request('proveedores', 'GET'),
-                API.request('cobranzas', 'GET'),
-                API.request('precios-cliente', 'GET'),
-                API.request('caja', 'GET'),
-                API.request('recepcion', 'GET'),
-                API.request('pagos-proveedores', 'GET')
-            ]);
-            this._datos = { clientes, proveedores, cobranzas, precios, caja, recepcion, pagos };
-            this._pintarTipo();
-        } catch (error) {
-            console.error('Error loading cuentas:', error);
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">Google no respondió a tiempo. Esperá un minuto y volvé a entrar.</td></tr>';
-        }
-    },
-
-    cambiarTipo(tipo) {
-        this.tipo = tipo === 'proveedor' ? 'proveedor' : 'cliente';
-        this._pintarTipo();
-    },
-
-    elegir(id) {
-        this.elegido[this.tipo] = String(id || '');
-        this.render();
-    },
-
-    // Abre la cuenta de alguien desde otra pantalla.
-    abrir(tipo, id) {
-        this.tipo = tipo === 'proveedor' ? 'proveedor' : 'cliente';
-        this.elegido[this.tipo] = String(id || '');
-        Navigation.navigateTo('cuentas');
-    },
-
-    _pintarTipo() {
-        const esCliente = this.tipo === 'cliente';
-        document.getElementById('btn-cuentas-clientes')?.classList.toggle('activo', esCliente);
-        document.getElementById('btn-cuentas-proveedores')?.classList.toggle('activo', !esCliente);
-        const label = document.getElementById('cuentas-select-label');
-        if (label) label.textContent = esCliente ? 'Cliente' : 'Proveedor';
-        const select = document.getElementById('cuentas-select');
-        if (!select || !this._datos) return;
-        const lista = (esCliente ? this._datos.clientes : this._datos.proveedores) || [];
-        const ordenada = [...lista].sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
-        select.innerHTML = `<option value="">${esCliente ? 'Elegí un cliente' : 'Elegí un proveedor'}</option>` +
-            ordenada.map(x => `<option value="${Utils.esc(x.id)}">${Utils.esc(x.nombre || '')}</option>`).join('');
-        select.value = this.elegido[this.tipo] || '';
-        this.render();
-    },
-
-    _fechaLarga(iso) {
-        const f = Utils.fechaIso(iso);
-        if (!f) return '';
-        return new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-    },
-
-    _medio(texto) {
-        const partes = String(texto || '').split('·');
-        return partes.length > 1 ? partes[partes.length - 1].trim() : '';
-    },
-
-    _num(v) {
-        return parseFloat(v) || 0;
-    },
-
-    // Una fila por producto (como la planilla que usaban): fecha, producto, cantidad, precio y total.
-    // Los pagos van en su propia fila con el medio. La comisión de reparto va en una fila por día.
-    _movimientosCliente(id) {
-        const { cobranzas, precios, caja } = this._datos;
-        const movimientos = [];
-        const lineasPorDia = {};
-        (precios || []).filter(p => String(p.cliente_id) === id && this._num(p.cantidad) > 0).forEach(p => {
-            const fecha = Utils.fechaIso(p.fecha);
-            if (fecha) (lineasPorDia[fecha] = lineasPorDia[fecha] || []).push(p);
-        });
-        const cargasDelDia = (fecha, totalCobranza) => {
-            let suma = 0;
-            let cantidadDia = 0;
-            const comisiones = {};
-            (lineasPorDia[fecha] || []).forEach(p => {
-                const cantidad = this._num(p.cantidad);
-                const precio = Utils.parsePrice(p.precio_cliente) || 0;
-                const total = Math.round(cantidad * precio);
-                suma += total;
-                cantidadDia += cantidad;
-                const comision = Utils.parsePrice(p.comision_unitaria) || 0;
-                if (comision > 0) {
-                    const c = comisiones[comision] || (comisiones[comision] = { cantidad: 0, total: 0 });
-                    c.cantidad += cantidad;
-                    c.total += Math.round(cantidad * comision);
-                }
-                movimientos.push({ fecha, orden: 0, producto: p.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
-            });
-            Object.keys(comisiones).forEach(valor => {
-                const c = comisiones[valor];
-                suma += c.total;
-                movimientos.push({ fecha, orden: 0, producto: 'Comisión de reparto', cantidad: Math.round(c.cantidad * 100) / 100, precio: Number(valor), total: c.total, pago: 0, medio: '' });
-            });
-            // Si la cobranza guardada no coincide con los precios (datos viejos), manda la cobranza.
-            if (totalCobranza !== null && Math.round(totalCobranza - suma) !== 0) {
-                movimientos.push({ fecha, orden: 0, producto: 'Ajuste de la carga', cantidad: '', precio: '', total: Math.round(totalCobranza - suma), pago: 0, medio: '' });
-            }
-        };
-        const fechasConCobranza = new Set();
-        (cobranzas || []).filter(c => String(c.cliente_id) === id).forEach(c => {
-            const fecha = Utils.fechaIso(c.fecha);
-            fechasConCobranza.add(fecha);
-            cargasDelDia(fecha, Utils.parsePrice(c.total) || 0);
-            let registrado = 0;
-            (caja || []).filter(m => String(m.referencia) === String(c.id)).forEach(m => {
-                const monto = Utils.parsePrice(m.monto) || 0;
-                if (!monto) return;
-                const egreso = String(m.tipo).toLowerCase() === 'egreso';
-                registrado += egreso ? -monto : monto;
-                movimientos.push({
-                    fecha: Utils.fechaIso(m.fecha) || fecha, orden: 1,
-                    producto: egreso ? 'Ajuste de cobro' : '', cantidad: '', precio: '', total: 0,
-                    pago: egreso ? -monto : monto, medio: this._medio(m.nota)
-                });
-            });
-            // Cobros viejos que no dejaron movimiento en la caja: se muestran en la fecha de la carga.
-            const resto = Math.round((Utils.parsePrice(c.pagado) || 0) - registrado);
-            if (resto !== 0) movimientos.push({ fecha, orden: 1, producto: '', cantidad: '', precio: '', total: 0, pago: resto, medio: '' });
-        });
-        Object.keys(lineasPorDia).forEach(fecha => {
-            if (!fechasConCobranza.has(fecha)) cargasDelDia(fecha, null);
-        });
-        return movimientos;
-    },
-
-    // Lo que entregó (confirmado en la recepción: llegó × precio real) y cada pago con su medio.
-    _movimientosProveedor(id) {
-        const { recepcion, pagos } = this._datos;
-        const movimientos = [];
-        (recepcion || []).forEach(r => {
-            const confirmado = r.confirmado === true || r.confirmado === 'true';
-            if (!confirmado || String(r.proveedor_id) !== id) return;
-            const cantidad = this._num(r.llego);
-            const precio = Utils.parsePrice(r.precio_real) || 0;
-            const total = Math.round(cantidad * precio);
-            if (total <= 0) return;
-            movimientos.push({ fecha: Utils.fechaIso(r.fecha), orden: 0, producto: r.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
-        });
-        (pagos || []).filter(p => String(p.proveedor_id) === id).forEach(p => {
-            const monto = Utils.parsePrice(p.monto) || 0;
-            if (!monto) return;
-            const medio = [p.metodo ? String(p.metodo).toUpperCase() : '', p.nota].filter(Boolean).join(' · ');
-            movimientos.push({ fecha: Utils.fechaIso(p.fecha), orden: 1, producto: '', cantidad: '', precio: '', total: 0, pago: monto, medio });
-        });
-        return movimientos;
-    },
-
-    _cuenta() {
-        const id = this.elegido[this.tipo];
-        if (!id || !this._datos) return null;
-        const lista = (this.tipo === 'cliente' ? this._datos.clientes : this._datos.proveedores) || [];
-        const quien = lista.find(x => String(x.id) === id);
-        const movimientos = (this.tipo === 'cliente' ? this._movimientosCliente(id) : this._movimientosProveedor(id))
-            .sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)) || a.orden - b.orden);
-        let saldo = 0;
-        movimientos.forEach(m => {
-            saldo = Math.round(saldo + m.total - m.pago);
-            m.saldo = saldo;
-        });
-        return {
-            nombre: quien?.nombre || '',
-            movimientos,
-            cargas: movimientos.reduce((s, m) => s + m.total, 0),
-            pagos: movimientos.reduce((s, m) => s + m.pago, 0),
-            saldo
-        };
-    },
-
-    render() {
-        const tbody = document.getElementById('cuentas-tbody');
-        const resumen = document.getElementById('cuentas-resumen');
-        if (!tbody) return;
-        Utils.hideTableLoader(tbody);
-        const tabla = tbody.closest('table');
-        tabla.querySelector('tfoot')?.remove();
-        const cuenta = this._cuenta();
-        if (!cuenta) {
-            if (resumen) resumen.hidden = true;
-            tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">${this._datos ? `Elegí un ${this.tipo} para ver su cuenta.` : 'Cargando...'}</td></tr>`;
-            return;
-        }
-        const esCliente = this.tipo === 'cliente';
-        if (resumen) {
-            resumen.hidden = false;
-            resumen.innerHTML = `
-                <div class="pagos-resumen-card"><span>Total cargas</span><strong>${Utils.formatCurrency(cuenta.cargas)}</strong></div>
-                <div class="pagos-resumen-card"><span>Total pagos</span><strong>${Utils.formatCurrency(cuenta.pagos)}</strong></div>
-                <div class="pagos-resumen-card ${cuenta.saldo > 0 ? 'is-deuda' : ''}"><span>${esCliente ? 'Saldo que debe' : 'Saldo a pagar'}</span><strong>${Utils.formatCurrency(cuenta.saldo)}</strong></div>
-            `;
-        }
-        if (!cuenta.movimientos.length) {
-            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">Todavía no tiene cargas ni pagos.</td></tr>';
-            return;
-        }
-        const cant = n => (n === '' || n === null || n === undefined ? '' : String(n).replace('.', ','));
-        const plata = n => (n === '' || !n ? '' : Utils.formatCurrency(n));
-        tbody.innerHTML = cuenta.movimientos.map(m => `
-            <tr>
-                <td data-label="Fecha" class="cuentas-fecha">${this._fechaLarga(m.fecha)}</td>
-                <td data-label="Producto">${Utils.esc(m.producto)}</td>
-                <td data-label="Cantidad" class="cuentas-dinero">${cant(m.cantidad)}</td>
-                <td data-label="Precio" class="cuentas-dinero">${plata(m.precio)}</td>
-                <td data-label="Total" class="cuentas-dinero">${plata(m.total)}</td>
-                <td data-label="Pago" class="cuentas-dinero cuentas-pago">${plata(m.pago)}</td>
-                <td data-label="Medio">${Utils.esc(m.medio)}</td>
-                <td data-label="Saldo" class="cuentas-dinero"><strong>${Utils.formatCurrency(m.saldo)}</strong></td>
-            </tr>
-        `).join('');
-        tabla.insertAdjacentHTML('beforeend', `
-            <tfoot>
-                <tr>
-                    <td colspan="4">Total</td>
-                    <td class="cuentas-dinero">${Utils.formatCurrency(cuenta.cargas)}</td>
-                    <td class="cuentas-dinero">${Utils.formatCurrency(cuenta.pagos)}</td>
-                    <td></td>
-                    <td class="cuentas-dinero">${Utils.formatCurrency(cuenta.saldo)}</td>
-                </tr>
-            </tfoot>
-        `);
-    },
-
-    // Mismo diseño que los demás PDF de la app (encabezado azul, recuadro con el nombre, filas alternadas).
-    _htmlPdf(cuenta) {
-        const esCliente = this.tipo === 'cliente';
-        const generado = new Date().toLocaleString('es-AR');
-        const etiquetaSaldo = esCliente ? 'Saldo que debe' : 'Saldo a pagar';
-        const cant = n => (n === '' || n === null || n === undefined ? '' : String(n).replace('.', ','));
-        const plata = n => (n === '' || !n ? '' : Utils.formatCurrency(n));
-        let fechaAnterior = '';
-        const cuerpo = cuenta.movimientos.map((m, i) => {
-            const fecha = this._fechaLarga(m.fecha);
-            const mostrarFecha = fecha !== fechaAnterior;
-            fechaAnterior = fecha;
-            const esPago = !!m.pago;
-            return `
-            <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
-                <td class="col-fecha">${mostrarFecha ? Utils.esc(fecha) : ''}</td>
-                <td class="${esPago ? 'pago' : ''}">${Utils.esc(m.producto || (esPago ? 'Pago' : ''))}</td>
-                <td class="col-num">${cant(m.cantidad)}</td>
-                <td class="col-num">${plata(m.precio)}</td>
-                <td class="col-money">${plata(m.total)}</td>
-                <td class="col-money pago">${plata(m.pago)}</td>
-                <td class="pago">${Utils.esc(m.medio)}</td>
-                <td class="col-money saldo">${Utils.formatCurrency(m.saldo)}</td>
-            </tr>`;
-        }).join('');
-        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Cuenta corriente</title>
-            <style>
-                * { margin: 0; padding: 0; box-sizing: border-box; }
-                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; padding: 32px 36px; background: #fff; }
-                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 3px solid #1a73e8; }
-                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
-                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
-                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
-                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
-                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 14px 20px; border-radius: 8px; margin-bottom: 20px; }
-                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
-                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 10px 8px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
-                thead th.col-money, thead th.col-num { text-align: right; }
-                tbody td { padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
-                .row-even { background: #fff; }
-                .row-odd { background: #f8fafc; }
-                td.col-fecha { color: #475569; width: 150px; }
-                td.col-num { text-align: right; white-space: nowrap; }
-                td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
-                td.col-money.saldo { color: #1e293b; }
-                td.pago, td.col-money.pago { color: #15803d; }
-                .totals-wrap { margin-top: 18px; display: flex; justify-content: flex-end; }
-                .totals-table { width: 300px; box-shadow: none; }
-                .totals-table td { padding: 8px 14px; font-size: 14px; font-weight: 700; border: none; }
-                .totals-table td:last-child { text-align: right; }
-                .totals-table tr.linea td { color: #475569; font-weight: 500; font-size: 13px; }
-                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; font-size: 16px; }
-                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
-                .footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
-            </style></head><body>
-            <div class="doc-header">
-                <div class="brand"><h1>Luciano Cargas</h1><p>Cuenta corriente</p></div>
-                <div class="doc-meta"><strong>${etiquetaSaldo}</strong>${Utils.formatCurrency(cuenta.saldo)}<br><span>Generado: ${Utils.esc(generado)}</span></div>
-            </div>
-            <div class="cliente-box"><div class="label">${esCliente ? 'Cliente' : 'Proveedor'}</div><div class="name">${Utils.esc(cuenta.nombre)}</div></div>
-            <table>
-                <thead><tr>
-                    <th>Fecha</th><th>Producto</th><th class="col-num">Cant.</th><th class="col-num">Precio</th>
-                    <th class="col-money">Total</th><th class="col-money">Pago</th><th>Medio</th><th class="col-money">Saldo</th>
-                </tr></thead>
-                <tbody>${cuerpo || '<tr><td colspan="8">Todavía no tiene cargas ni pagos.</td></tr>'}</tbody>
-            </table>
-            <div class="totals-wrap"><table class="totals-table">
-                <tr class="linea"><td>Total cargas</td><td>${Utils.formatCurrency(cuenta.cargas)}</td></tr>
-                <tr class="linea"><td>Total pagos</td><td>${Utils.formatCurrency(cuenta.pagos)}</td></tr>
-                <tr class="saldo"><td>${etiquetaSaldo}</td><td>${Utils.formatCurrency(cuenta.saldo)}</td></tr>
-            </table></div>
-            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
-            </body></html>`;
-    },
-
-    async descargarPdf() {
-        const cuenta = this._cuenta();
-        if (!cuenta) {
-            Utils.showInfo(`Elegí un ${this.tipo} primero.`);
-            return;
-        }
-        try {
-            const doc = await Precios._pdfDesdeHtml(this._htmlPdf(cuenta));
-            doc.save(`cuenta-${String(cuenta.nombre).replace(/[^\w\-]+/g, '-')}.pdf`);
-        } catch (error) {
-            console.error('Error armando el PDF de la cuenta:', error);
-            Utils.showError('No se pudo armar el PDF: ' + error.message);
         }
     }
 };
@@ -11816,9 +11578,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });
     addButtonListener('btn-ajustar-stock', () => Stock.ajustar(), 'Ajustando...');
     addButtonListener('btn-verificar-stock', () => Stock.verificarStockBajo(), 'Verificando...');
-    addButtonListener('btn-saldos-excel', () => Dashboard.descargarExcelSaldos(), 'Armando Excel...');
+    addButtonListener('btn-saldos-pdf', () => Dashboard.descargarPdfSaldos('ambos'), 'Armando PDF...');
     addButtonListener('btn-precios-planilla-excel', () => Precios.descargarPlanillaExcel(), 'Armando Excel...');
-    addButtonListener('btn-cuentas-pdf', () => Cuentas.descargarPdf(), 'Armando PDF...');
     addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
     addButtonListener('btn-ir-reparto', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-caja-repartir', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
