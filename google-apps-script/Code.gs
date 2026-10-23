@@ -583,10 +583,6 @@ function handleRequest(e, method) {
         result = getHistorial();
         break;
       
-      case 'historial/delete':
-        result = deleteHistorial(data.id);
-        break;
-      
       // Notificaciones
       case 'notificaciones/verificar-stock':
         result = verificarStockBajo();
@@ -958,6 +954,13 @@ function resetAllDatos(confirmacion) {
     throw new Error('Confirmación inválida. Debe enviar confirmacion: BORRAR TODO');
   }
 
+  // Antes de vaciar nada se guarda una copia completa de la planilla en el Drive del dueño del
+  // script. Si la copia falla, no se borra nada.
+  var original = getSpreadsheet();
+  var nombreRespaldo = 'Respaldo ' + original.getName() + ' ' +
+    Utilities.formatDate(new Date(), 'America/Argentina/Buenos_Aires', 'dd-MM-yyyy HH.mm');
+  var respaldo = original.copy(nombreRespaldo);
+
   var hojasOperativas = [
     CONFIG.SHEETS.CLIENTES,
     CONFIG.SHEETS.PROVEEDORES,
@@ -1000,7 +1003,8 @@ function resetAllDatos(confirmacion) {
   return {
     success: true,
     hojasLimpiadas: hojasOperativas.length + 1,
-    mensaje: 'Todos los datos fueron eliminados. Las hojas quedaron solo con encabezados.'
+    respaldo: { nombre: nombreRespaldo, url: respaldo.getUrl() },
+    mensaje: 'Todos los datos fueron eliminados. Antes se guardó una copia: ' + nombreRespaldo
   };
 }
 
@@ -2265,9 +2269,24 @@ function getCamiones(fecha) {
   }).sort(function(a, b) { return a.orden - b.orden; });
 }
 
+/** Cómo están los camiones de un día: [[id, nombre, [clientes]], ...] en orden. */
+function firmaCamiones_(camiones) {
+  return (camiones || []).map(function(c) {
+    return [String(c.id || ''), String(c.nombre || ''), (Array.isArray(c.clientes) ? c.clientes : []).map(String)];
+  });
+}
+
 function guardarCamiones(data) {
   if (!data || !data.fecha) throw new Error('La fecha es requerida');
   var fechaNorm = normalizeFecha(data.fecha);
+  // Al guardar se reemplazan todos los camiones del día. Si otra persona los cambió desde que esta
+  // pantalla los leyó, no se pisa su trabajo: se avisa y la pantalla vuelve a leerlos.
+  if (data.previo !== undefined && data.previo !== null && data.previo !== '') {
+    var previo = typeof data.previo === 'string' ? JSON.parse(data.previo) : data.previo;
+    if (JSON.stringify(firmaCamiones_(getCamiones(fechaNorm))) !== JSON.stringify(previo)) {
+      throw new Error('CAMIONES_CAMBIADOS: Otra persona cambió los camiones de este día.');
+    }
+  }
   var sheet = getSheet(CONFIG.SHEETS.CAMIONES);
   var values = readUsedValues_(sheet);
   var headers = values.length ? values[0] : [];
@@ -2305,7 +2324,7 @@ function guardarCamiones(data) {
   }
 
   invalidateSheetCache(CONFIG.SHEETS.CAMIONES);
-  return { success: true, fecha: fechaNorm };
+  return { success: true, fecha: fechaNorm, firma: firmaCamiones_(getCamiones(fechaNorm)) };
 }
 
 // ========== RECEPCIÓN ==========
@@ -2708,6 +2727,9 @@ function savePreciosCliente(data) {
   data.items.forEach(function(item) {
     var key = fechaNormalizada + '|' + item.cliente_id + '|' + item.producto_id;
     var rowIdx = preciosIndex[key];
+    // Cuando solo cambió la comisión del día, el precio de esa línea no se toca: puede haberlo
+    // cargado otra persona después de que esta pantalla lo leyó.
+    var soloComision = item.solo_comision === true || item.solo_comision === 'true';
     var precioCliente = normalizeAmount(item.precio_cliente);
     var comision = item.comision_unitaria !== undefined && item.comision_unitaria !== null && item.comision_unitaria !== ''
       ? normalizeAmount(item.comision_unitaria)
@@ -2718,8 +2740,8 @@ function savePreciosCliente(data) {
     var precioRealLinea = traePrecioReal && normalizeAmount(item.precio_real) > 0 ? normalizeAmount(item.precio_real) : '';
 
     if (rowIdx !== undefined) {
-      values[rowIdx][precioIdx] = precioCliente;
-      if (cantidadIdx !== -1 && item.cantidad !== undefined) values[rowIdx][cantidadIdx] = item.cantidad || 0;
+      if (!soloComision) values[rowIdx][precioIdx] = precioCliente;
+      if (cantidadIdx !== -1 && item.cantidad !== undefined && !soloComision) values[rowIdx][cantidadIdx] = item.cantidad || 0;
       if (comisionIdx !== -1) values[rowIdx][comisionIdx] = comision;
       if (precioRealIdx !== -1 && traePrecioReal) values[rowIdx][precioRealIdx] = precioRealLinea;
     } else {
@@ -3980,21 +4002,6 @@ function calcularEstadoDia(fecha, pedidos) {
 
 function getHistorial() {
   return getCierres();
-}
-
-function deleteHistorial(id) {
-  const sheet = getSheet(CONFIG.SHEETS.CIERRE_DIA);
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === id) {
-      sheet.deleteRow(i + 1);
-      return { success: true };
-    }
-  }
-  
-  throw new Error('Registro de historial no encontrado');
 }
 
 // ========== FUNCIONES DE PRUEBA ==========

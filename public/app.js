@@ -1169,23 +1169,39 @@ const Sync = {
     _pendiente: false,
     _aplicando: false,
 
+    // Versión de los datos con la que quedó la copia guardada en el navegador (sobrevive a recargar).
+    CLAVE_VERSION: 'sg_ver_datos',
+
+    _recordarVersion() {
+        try { localStorage.setItem(this.CLAVE_VERSION, String(this.ver)); } catch (error) { /* sin almacenamiento */ }
+    },
+
     observar(ver, esEscritura) {
         const nueva = Number(ver);
         if (!Number.isFinite(nueva)) return;
         if (this.ver === null) {
+            // Al abrir la app se usa la copia guardada (clientes, proveedores… hasta 45 min). Si los
+            // datos cambiaron mientras estaba cerrada, esa copia está vieja: se vuelve a leer todo.
+            let guardada = NaN;
+            try { guardada = Number(localStorage.getItem(this.CLAVE_VERSION)); } catch (error) { /* sin almacenamiento */ }
             this.ver = nueva;
+            if (guardada === nueva) return;
+            this._pedirRefresco();
             return;
         }
         if (nueva === this.ver) return;
         // Una escritura propia suma exactamente 1. Cualquier otro salto es de otra persona.
         const soloMia = esEscritura === true && nueva === this.ver + 1;
         if (nueva > this.ver) this.ver = nueva;
-        if (!soloMia) this._pedirRefresco();
+        if (soloMia) this._recordarVersion();
+        else this._pedirRefresco();
     },
 
     iniciar() {
         if (this._timer) return;
         this._timer = setInterval(() => this.chequear(), this.INTERVALO);
+        // Al abrir se pregunta ya: si la copia guardada en el navegador quedó vieja, se nota enseguida.
+        this.chequear();
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) this.chequear();
         });
@@ -1249,8 +1265,10 @@ const Sync = {
         }
         DataLoader.invalidateFlujo(AppState.currentDate);
         // Una sola lectura trae catálogo, día y cobranzas.
+        const versionLeida = this.ver;
         await API.getBootstrap(AppState.currentDate, true);
         CacheManager.hydrateAppStateFromCache();
+        if (this.ver === versionLeida) this._recordarVersion();
         try { await DiaOperativo.refresh(); } catch (error) { /* se recalcula al navegar */ }
         await Navigation.loadPageData(AppState.currentPage);
     }
@@ -1738,8 +1756,10 @@ const API = {
         return await this.request('camiones', 'GET', { fecha });
     },
 
-    async guardarCamiones(fecha, camiones) {
-        return await this.request('camiones', 'POST', { fecha, camiones });
+    async guardarCamiones(fecha, camiones, previo) {
+        const data = { fecha, camiones };
+        if (previo !== undefined) data.previo = previo;
+        return await this.request('camiones', 'POST', data);
     },
 
     async getTopProductosVendidos(dias = 7, limite = 5) {
@@ -2126,12 +2146,6 @@ const API = {
         CacheManager.set(cacheKey, result);
         return result;
     },
-
-    async deleteHistorial(id) {
-        const result = await this.request('historial/delete', 'POST', { id });
-        CacheManager.invalidate('historial');
-        return result;
-    }
 };
 
 // Navegación
@@ -3517,6 +3531,7 @@ const Camiones = {
 
         API.getCamiones(fecha).then(remotos => {
             if (this._carga !== token || AppState.currentDate !== fecha) return;
+            if (Array.isArray(remotos)) this._firmas[fecha] = this._firma(remotos);
             if (Array.isArray(remotos) && remotos.length) {
                 this.lista = this._normalizar(remotos);
                 this._guardarLocal(fecha, this.lista);
@@ -3805,6 +3820,30 @@ const Camiones = {
         localStorage.setItem('sg_camiones:' + fecha, JSON.stringify(lista));
     },
 
+    // Cómo estaban los camiones de cada día la última vez que se leyeron o guardaron. Al guardar se
+    // manda: si otra persona los cambió mientras tanto, el servidor no pisa su trabajo.
+    _firmas: {},
+    _cola: Promise.resolve(),
+
+    _firma(lista) {
+        return JSON.stringify((lista || []).map(c => [
+            String(c.id || ''),
+            String(c.nombre || ''),
+            (Array.isArray(c.clientes) ? c.clientes : []).map(String)
+        ]));
+    },
+
+    async _recargarPorCambioAjeno(fecha) {
+        const remotos = await API.getCamiones(fecha).catch(() => null);
+        if (!Array.isArray(remotos)) return;
+        this._firmas[fecha] = this._firma(remotos);
+        if (AppState.currentDate !== fecha) return;
+        this.lista = this._normalizar(remotos);
+        this._guardarLocal(fecha, this.lista);
+        if (AppState.currentPage === 'camiones') this.render();
+        Utils.showWarning('Otra persona cambió los camiones de este día mientras armabas los tuyos. Se actualizaron con lo último: revisalos y volvé a hacer tu cambio.');
+    },
+
     _persistir(pintar = true) {
         const fecha = AppState.currentDate;
         const payload = this.lista.map((camion, index) => ({
@@ -3817,10 +3856,23 @@ const Camiones = {
         if (pintar) this.render();
         clearTimeout(this._guardando);
         this._guardando = setTimeout(() => {
-            Utils.enSegundoPlano(() => API.guardarCamiones(fecha, payload), () => {
-                if (this._avisoScript) return;
-                this._avisoScript = true;
-                Utils.avisar('Quedó en esta compu. Publicá el script para verlo en otro dispositivo.');
+            // De a uno: cada guardado usa la foto que dejó el anterior.
+            this._cola = this._cola.then(async () => {
+                Sync.escribiendo++;
+                try {
+                    const resultado = await API.guardarCamiones(fecha, payload, this._firmas[fecha]);
+                    if (resultado && Array.isArray(resultado.firma)) this._firmas[fecha] = JSON.stringify(resultado.firma);
+                } catch (error) {
+                    if (String(error && error.message || '').includes('CAMIONES_CAMBIADOS')) {
+                        await this._recargarPorCambioAjeno(fecha);
+                        return;
+                    }
+                    if (this._avisoScript) return;
+                    this._avisoScript = true;
+                    Utils.avisar('Quedó en esta compu. Publicá el script para verlo en otro dispositivo.');
+                } finally {
+                    Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
+                }
             });
         }, 400);
     },
@@ -4654,6 +4706,13 @@ const Pedidos = {
             const producto = productos.find(p => String(p.id) === String(productoId));
             const cliente = clientes.find(c => String(c.id) === String(clienteId));
             const anterior = { ...pedido };
+            // Solo se manda lo que cambió: si dos personas tocan el mismo pedido, no se pisan.
+            const cambios = Utils.cambiosDe(
+                { cliente_id: pedido.cliente_id, producto_id: pedido.producto_id, cantidad: pedido.cantidad, proveedor_id: proveedorActual },
+                { cliente_id: clienteId, producto_id: productoId, cantidad, proveedor_id: proveedorId }
+            );
+            if (!Object.keys(cambios).length) return;
+            if (cambios.producto_id !== undefined) cambios.tipo = producto?.tipo || pedido.tipo;
             Object.assign(pedido, {
                 cliente_id: clienteId,
                 producto_id: productoId,
@@ -4668,14 +4727,7 @@ const Pedidos = {
             Utils.avisar('Pedido actualizado');
 
             Utils.enSegundoPlano(async () => {
-                await API.updatePedido(id, {
-                    fecha: pedido.fecha,
-                    cliente_id: clienteId,
-                    producto_id: productoId,
-                    tipo: pedido.tipo,
-                    cantidad,
-                    proveedor_id: proveedorId
-                });
+                await API.updatePedido(id, { fecha: pedido.fecha, ...cambios });
                 CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
             }, () => {
                 Object.assign(pedido, anterior);
@@ -5108,14 +5160,7 @@ const Pedidos = {
     },
 
     async guardarProveedorDelPedido(pedido, proveedorId) {
-        await API.updatePedido(pedido.id, {
-            fecha: pedido.fecha,
-            cliente_id: pedido.cliente_id,
-            producto_id: pedido.producto_id,
-            tipo: pedido.tipo,
-            cantidad: pedido.cantidad,
-            proveedor_id: proveedorId
-        });
+        await API.updatePedido(pedido.id, { fecha: pedido.fecha, proveedor_id: proveedorId });
         pedido.proveedor_id = proveedorId;
         const lista = AppState.pedidos || [];
         const local = lista.find(p => String(p.id) === String(pedido.id));
@@ -6059,6 +6104,10 @@ const Recepcion = {
 const Precios = {
     selectedClienteId: null,
     comisionPorUnidad: 350,
+    // Varias personas cargan precios a la vez: al guardar se mandan solo las líneas que tocó
+    // este usuario. Si se mandaran todas, pisaría con lo viejo de su pantalla lo que cargó otro.
+    _tocadas: new Set(),
+    _comisionEditada: false,
     recepciones: [], // Para obtener precio_real
 
     // "cliente": la tabla de siempre para cargar precios. "planilla": todo el día de un vistazo.
@@ -6311,7 +6360,9 @@ const Precios = {
     updateComision() {
         const comisionInput = document.getElementById('precios-comision');
         if (comisionInput) {
+            const antes = this.comisionPorUnidad;
             this.comisionPorUnidad = Utils.parsePrice(comisionInput.value) || 0;
+            if (this.comisionPorUnidad !== antes) this._comisionEditada = true;
             comisionInput.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
             localStorage.setItem('precios-comision', this.comisionPorUnidad.toString());
             this.render();
@@ -6751,6 +6802,7 @@ const Precios = {
     },
     
     async save() {
+        const todas = [];
         const items = [];
         const precios = AppState.precios;
         
@@ -6761,7 +6813,7 @@ const Precios = {
             const precioData = precios.find(p => p.id === id);
             if (precioData) {
                 precioData.precio_cliente = precio;
-                items.push({
+                const item = {
                     cliente_id: precioData.cliente_id,
                     producto_id: precioData.producto_id,
                     cantidad: precioData.cantidad || 0,
@@ -6769,16 +6821,27 @@ const Precios = {
                     comision_unitaria: this.comisionPorUnidad,
                     // 0 = el de la recepción (se guarda vacío)
                     precio_real: Utils.parsePrice(precioData.precio_real) || 0
-                });
+                };
+                todas.push(item);
+                if (this._tocadas.has(String(id))) {
+                    items.push(item);
+                } else if (this._comisionEditada) {
+                    // Solo cambia la comisión: el servidor no toca el precio de esta línea.
+                    items.push({ ...item, solo_comision: true });
+                }
             }
         });
         
-        if (items.length === 0) {
+        if (todas.length === 0) {
             Utils.showError('No hay precios para guardar');
             return;
         }
+        if (items.length === 0) {
+            Utils.avisar('No hay cambios para guardar');
+            return;
+        }
 
-        const sinPrecio = items.filter(item => Number(item.cantidad) > 0 && !(item.precio_cliente > 0)).length;
+        const sinPrecio = todas.filter(item => Number(item.cantidad) > 0 && !(item.precio_cliente > 0)).length;
         if (sinPrecio > 0) {
             const seguir = await Utils.showConfirm(`Hay ${sinPrecio} producto(s) sin precio al cliente. No vas a poder cerrar el día hasta cargarlos. ¿Guardar igual?`);
             if (!seguir) return;
@@ -6787,6 +6850,10 @@ const Precios = {
         this.sincronizarCobranza();
         CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
         Utils.avisar('Precios guardados');
+        const tocadasAntes = new Set(this._tocadas);
+        const comisionAntes = this._comisionEditada;
+        this._tocadas.clear();
+        this._comisionEditada = false;
 
         Utils.enSegundoPlano(async () => {
             await API.savePreciosCliente({
@@ -6796,6 +6863,8 @@ const Precios = {
             });
             CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
         }, async (error) => {
+            tocadasAntes.forEach(id => this._tocadas.add(id));
+            if (comisionAntes) this._comisionEditada = true;
             Utils.showError(API._esCorteDeConexion(error) ? 'No se pudieron guardar los precios. Revisá la conexión.' : 'No se pudieron guardar los precios: ' + (error && error.message || ''));
             await this.load();
             this.sincronizarCobranza();
@@ -8060,7 +8129,8 @@ const Cierre = {
             
             // Validar que todo esté completo
             const resultadoCierre = await API.cerrarDia(fecha);
-            Utils.showSuccess('Día cerrado correctamente');
+            Utils.showSuccess('Día cerrado correctamente. Se está armando el reporte en PDF…');
+            Historial.generarReportePDF(fecha, { silencioso: true });
             const faltantesStock = (resultadoCierre && resultadoCierre.faltantes_stock) || [];
             if (faltantesStock.length) {
                 await Utils.showWarning('Se vendió más de lo que había cargado en stock: '
@@ -10562,8 +10632,8 @@ const Mantenimiento = {
     solicitarReset() {
         const content = `
             <p style="margin-bottom:12px;color:#991b1b;line-height:1.5;">
-                Vas a borrar <strong>todos</strong> los datos de la app y del Google Sheet.
-                Esta acción <strong>no se puede deshacer</strong>.
+                Vas a borrar <strong>todos</strong> los datos de la app.
+                Antes de borrar se guarda una <strong>copia completa</strong> en Google Drive, con la fecha de hoy.
             </p>
             <div class="form-group">
                 <label for="reset-confirm-input">Escribí <strong>${this.CONFIRM_PHRASE}</strong> para confirmar:</label>
@@ -10582,19 +10652,28 @@ const Mantenimiento = {
         }, 'Eliminar todo');
     },
 
-    async _despuesDeBorrar() {
+    async _despuesDeBorrar(resultado) {
         this.limpiarDatosLocales();
         CacheManager.clear();
         await DiaOperativo.refresh();
-        Utils.showSuccess('Todos los datos fueron eliminados. El sistema quedó limpio.');
+        const respaldo = resultado && resultado.respaldo;
+        if (respaldo && respaldo.nombre) {
+            Utils.showModal('Datos eliminados', `
+                <p>La app quedó vacía. Antes de borrar se guardó una copia completa de todos los datos en Google Drive:</p>
+                <p style="margin:12px 0;"><strong>${Utils.esc(respaldo.nombre)}</strong></p>
+                ${respaldo.url ? `<p><a href="${Utils.esc(respaldo.url)}" target="_blank" rel="noopener">Abrir la copia</a></p>` : ''}
+            `, null);
+        } else {
+            Utils.showSuccess('Todos los datos fueron eliminados. El sistema quedó limpio.');
+        }
         Navigation.navigateTo('dashboard');
     },
 
     async ejecutarReset() {
         Utils.showLoader();
         try {
-            await API.resetAllDatos(this.CONFIRM_PHRASE);
-            await this._despuesDeBorrar();
+            const resultado = await API.resetAllDatos(this.CONFIRM_PHRASE);
+            await this._despuesDeBorrar(resultado);
         } catch (error) {
             const mensaje = String(error.message || '');
             const puedeHaberBorrado = mensaje.includes('No se pudo conectar') || mensaje.includes('tardó más de');
@@ -10666,8 +10745,7 @@ const Historial = {
                 <td><span class="status-badge status-${cierre.estado || 'cerrado'}">${cierre.estado || 'Cerrado'}</span></td>
                 <td>
                     <button class="btn btn-primary btn-table-action" onclick="Historial.verDia('${cierre.fecha}')">Ver día</button>
-                    <button class="btn btn-secondary btn-table-action" onclick="Historial.generarReportePDF('${cierre.fecha}')">Reporte</button>
-                    <button class="btn btn-danger btn-table-action" onclick="Historial.delete('${cierre.id}', '${cierre.fecha}')">Eliminar</button>
+                    <button class="btn btn-secondary btn-table-action" onclick="Historial.generarReportePDF('${Utils.fechaIso(cierre.fecha)}')">Descargar PDF</button>
                 </td>
             `;
             tbody.appendChild(tr);
@@ -10732,187 +10810,161 @@ const Historial = {
         }
     },
 
-    async generarReportePDF(fecha) {
-        Utils.showLoader();
+    // Reporte del cierre en PDF (mismo diseño que los demás PDF de la app): ventas por cliente,
+    // lo que llegó, cobros, proveedores y caja de ese día. Se baja solo al cerrar el día y desde el
+    // historial. Los datos se piden al servidor en el momento.
+    async generarReportePDF(fecha, opciones = {}) {
+        const dia = Utils.fechaIso(fecha);
+        if (!dia) return;
+        if (!opciones.silencioso) Utils.showLoader();
         try {
-            // Cargar todos los datos del día en paralelo
-            const [pedidos, recepciones, precios, cobranzas] = await Promise.all([
-                API.getPedidos(fecha).catch(() => []),
-                API.getRecepcion(fecha).catch(() => []),
-                API.getPreciosCliente(fecha).catch(() => []),
-                API.getCobranzas(fecha).catch(() => [])
+            const [pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores] = await Promise.all([
+                API.request('pedidos', 'GET', { fecha: dia }),
+                API.request('recepcion', 'GET', { fecha: dia }),
+                API.request('precios-cliente', 'GET', { fecha: dia }),
+                API.request('cobranzas', 'GET', { fecha: dia }),
+                API.request('pagos-proveedores', 'GET'),
+                API.request('caja', 'GET'),
+                API.request('proveedores', 'GET')
             ]);
-
-            Utils.hideLoader();
-
-            const fechaFormateada = fecha
-                ? new Date(fecha + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })
-                : '';
-
-            // Agrupar pedidos por cliente
-            const pedidosPorCliente = {};
-            pedidos.forEach(p => {
-                if (!pedidosPorCliente[p.cliente_nombre]) pedidosPorCliente[p.cliente_nombre] = [];
-                pedidosPorCliente[p.cliente_nombre].push(p);
-            });
-
-            // Calcular total del día
-            const totalDia = cobranzas.reduce((sum, c) => sum + Utils.parsePrice(c.total), 0);
-            const totalCobrado = cobranzas.reduce((sum, c) => sum + Utils.parsePrice(c.pagado), 0);
-            const totalPendiente = cobranzas.reduce((sum, c) => sum + Utils.parsePrice(c.saldo), 0);
-
-            const formatPeso = (n) => Utils.formatCurrency(n || 0);
-
-            // Sección pedidos por cliente
-            let seccionPedidos = '';
-            Object.entries(pedidosPorCliente).forEach(([cliente, items]) => {
-                const preciosCliente = precios.filter(pr => pr.cliente_nombre === cliente);
-                seccionPedidos += `
-                    <tr style="background:#f0f4ff;">
-                        <td colspan="4" style="font-weight:bold;padding:6px 8px;">👤 ${cliente}</td>
-                    </tr>`;
-                items.forEach(item => {
-                    const precioReg = preciosCliente.find(pr => pr.producto_id === item.producto_id);
-                    const precioUnit = precioReg ? Utils.parsePrice(precioReg.precio_cliente) || 0 : 0;
-                    const subtotal = item.cantidad * precioUnit;
-                    seccionPedidos += `
-                    <tr>
-                        <td style="padding:4px 8px 4px 20px;">${Utils.esc(item.producto_nombre || '')}</td>
-                        <td style="padding:4px 8px;text-align:center;">${item.cantidad}</td>
-                        <td style="padding:4px 8px;text-align:right;">${formatPeso(precioUnit)}</td>
-                        <td style="padding:4px 8px;text-align:right;">${formatPeso(subtotal)}</td>
-                    </tr>`;
-                });
-            });
-
-            // Sección recepción
-            let seccionRecepcion = recepciones.map(r => `
-                <tr>
-                    <td style="padding:4px 8px;">${Utils.esc(r.producto_nombre || '')}</td>
-                    <td style="padding:4px 8px;text-align:center;">${r.llego || 0}</td>
-                    <td style="padding:4px 8px;text-align:right;">${formatPeso(r.precio_real)}</td>
-                    <td style="padding:4px 8px;text-align:right;">${formatPeso((r.llego || 0) * (r.precio_real || 0))}</td>
-                </tr>`).join('');
-
-            // Sección cobranzas
-            let seccionCobranzas = cobranzas.map(c => `
-                <tr>
-                    <td style="padding:4px 8px;">${Utils.esc(c.cliente_nombre || '')}</td>
-                    <td style="padding:4px 8px;text-align:right;">${formatPeso(c.total)}</td>
-                    <td style="padding:4px 8px;text-align:right;">${formatPeso(c.pagado)}</td>
-                    <td style="padding:4px 8px;text-align:right;color:${Utils.parsePrice(c.saldo) > 0 ? '#dc3545' : '#28a745'};">${formatPeso(c.saldo)}</td>
-                </tr>`).join('');
-
-            const html = `
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<title>Reporte - ${fechaFormateada}</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: Arial, sans-serif; font-size: 13px; color: #222; padding: 30px; }
-  h1 { font-size: 22px; color: #1a73e8; margin-bottom: 4px; }
-  .subtitle { color: #555; margin-bottom: 24px; font-size: 13px; }
-  h2 { font-size: 15px; margin: 20px 0 8px; color: #333; border-bottom: 2px solid #1a73e8; padding-bottom: 4px; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
-  th { background: #1a73e8; color: white; padding: 6px 8px; text-align: left; font-size: 12px; }
-  tr:nth-child(even) { background: #f8f9fa; }
-  .resumen { display: flex; gap: 20px; margin-top: 20px; }
-  .resumen-card { flex: 1; border: 1px solid #ddd; border-radius: 6px; padding: 12px; text-align: center; }
-  .resumen-card .valor { font-size: 20px; font-weight: bold; margin-top: 4px; }
-  .verde { color: #28a745; }
-  .rojo { color: #dc3545; }
-  .footer { margin-top: 30px; text-align: center; font-size: 11px; color: #999; border-top: 1px solid #eee; padding-top: 10px; }
-  @media print {
-    body { padding: 15px; }
-    button { display: none; }
-  }
-</style>
-</head>
-<body>
-  <h1>📦 Luciano Cargas — Reporte del Día</h1>
-  <p class="subtitle">Fecha: <strong>${fechaFormateada}</strong> &nbsp;|&nbsp; Generado: ${new Date().toLocaleString('es-AR')}</p>
-
-  <h2>🛒 Pedidos por Cliente</h2>
-  <table>
-    <thead><tr><th>Producto</th><th style="text-align:center;">Cantidad</th><th style="text-align:right;">Precio Unit.</th><th style="text-align:right;">Subtotal</th></tr></thead>
-    <tbody>${seccionPedidos || '<tr><td colspan="4" style="padding:8px;text-align:center;color:#999;">Sin pedidos</td></tr>'}</tbody>
-  </table>
-
-  <h2>📥 Recepción de Mercadería</h2>
-  <table>
-    <thead><tr><th>Producto</th><th style="text-align:center;">Cantidad recibida</th><th style="text-align:right;">Precio proveedor</th><th style="text-align:right;">Total costo</th></tr></thead>
-    <tbody>${seccionRecepcion || '<tr><td colspan="4" style="padding:8px;text-align:center;color:#999;">Sin recepciones</td></tr>'}</tbody>
-  </table>
-
-  <h2>💵 Cobranzas del Día</h2>
-  <table>
-    <thead><tr><th>Cliente</th><th style="text-align:right;">Total</th><th style="text-align:right;">Cobrado</th><th style="text-align:right;">Saldo</th></tr></thead>
-    <tbody>${seccionCobranzas || '<tr><td colspan="4" style="padding:8px;text-align:center;color:#999;">Sin cobranzas</td></tr>'}</tbody>
-  </table>
-
-  <div class="resumen">
-    <div class="resumen-card">
-      <div style="font-size:12px;color:#555;">TOTAL FACTURADO</div>
-      <div class="valor">${formatPeso(totalDia)}</div>
-    </div>
-    <div class="resumen-card">
-      <div style="font-size:12px;color:#555;">TOTAL COBRADO</div>
-      <div class="valor verde">${formatPeso(totalCobrado)}</div>
-    </div>
-    <div class="resumen-card">
-      <div style="font-size:12px;color:#555;">SALDO PENDIENTE</div>
-      <div class="valor ${totalPendiente > 0 ? 'rojo' : 'verde'}">${formatPeso(totalPendiente)}</div>
-    </div>
-  </div>
-
-  <div class="footer">Sistema de Gestión Luciano Cargas — Documento generado automáticamente</div>
-
-  <script>window.onload = () => window.print();<\/script>
-</body>
-</html>`;
-
-            const printResult = Utils.openPrintHtml(html);
-            if (printResult.mode === 'iframe') {
-                Utils.showInfo('Diálogo de impresión abierto en esta pestaña. Elegí "Guardar como PDF".');
-            } else {
-                Utils.showSuccess('Reporte generado. Usá "Guardar como PDF" en la impresión.');
-            }
-
+            const doc = await Precios._pdfDesdeHtml(this._htmlReporte(dia, { pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores }));
+            doc.save(`cierre-${dia}.pdf`);
+            if (!opciones.silencioso) Utils.avisar('Se descargó el reporte del día en PDF.');
         } catch (error) {
             console.error('Error generando reporte:', error);
-            Utils.showError('Error al generar el reporte: ' + error.message);
+            Utils.showError('No se pudo armar el reporte del día: ' + error.message + '. Podés bajarlo después desde Historial de días.');
         } finally {
-            Utils.hideLoader();
+            if (!opciones.silencioso) Utils.hideLoader();
         }
     },
 
-    async delete(id, fecha) {
-        // La hoja guarda la fecha como fecha-hora ("2026-10-13T03:00:00.000Z"): se toma solo el día.
-        const diaIso = Utils.fechaIso(fecha);
-        const fechaFormateada = diaIso
-            ? new Date(diaIso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit', year: 'numeric' })
-            : fecha;
+    _htmlReporte(dia, datos) {
+        const esc = Utils.esc;
+        const plata = n => Utils.formatCurrency(Math.round(Number(n) || 0));
+        const cant = n => String(Math.round((parseFloat(n) || 0) * 100) / 100).replace('.', ',');
+        const delDia = lista => (lista || []).filter(x => Utils.fechaIso(x.fecha) === dia);
+        const fechaTexto = new Date(dia + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+        const fechaLarga = fechaTexto.charAt(0).toUpperCase() + fechaTexto.slice(1);
+        const proveedorNombre = id => ((datos.proveedores || []).find(p => String(p.id) === String(id)) || {}).nombre || 'Sin proveedor';
 
-        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR el historial del día ${fechaFormateada}?\n\nEsta acción NO se puede deshacer. Se eliminará el registro del cierre.\n\n¿Desea continuar?`;
+        // Ventas por cliente (las líneas de precios del día)
+        const porCliente = {};
+        (datos.precios || []).filter(p => (parseFloat(p.cantidad) || 0) > 0).forEach(p => {
+            const c = porCliente[p.cliente_id] || (porCliente[p.cliente_id] = { nombre: p.cliente_nombre || 'Cliente', lineas: [], comision: 0, cantidad: 0 });
+            const cantidad = parseFloat(p.cantidad) || 0;
+            const precio = Utils.parsePrice(p.precio_cliente) || 0;
+            c.lineas.push({ producto: p.producto_nombre || 'Producto', cantidad, precio, total: Math.round(cantidad * precio) });
+            c.comision += Math.round(cantidad * (Utils.parsePrice(p.comision_unitaria) || 0));
+            c.cantidad += cantidad;
+        });
+        const cobranzaDe = id => (datos.cobranzas || []).find(c => String(c.cliente_id) === String(id)) || {};
+        let totalVendido = 0, totalCobrado = 0, totalDebe = 0;
+        const bloquesClientes = Object.keys(porCliente).sort((a, b) => porCliente[a].nombre.localeCompare(porCliente[b].nombre, 'es')).map(id => {
+            const c = porCliente[id];
+            const cob = cobranzaDe(id);
+            const total = c.lineas.reduce((s, l) => s + l.total, 0) + c.comision;
+            const cobrado = Utils.parsePrice(cob.pagado) || 0;
+            const debe = cob.saldo !== undefined ? (Utils.parsePrice(cob.saldo) || 0) : Math.max(0, total - cobrado);
+            totalVendido += total; totalCobrado += cobrado; totalDebe += debe;
+            const filas = c.lineas.map((l, i) => `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(l.producto)}</td><td class="num">${cant(l.cantidad)}</td><td class="num">${plata(l.precio)}</td><td class="money">${plata(l.total)}</td></tr>`).join('');
+            const comision = c.comision ? `<tr class="row-odd"><td>Comisión de reparto</td><td class="num">${cant(c.cantidad)}</td><td></td><td class="money">${plata(c.comision)}</td></tr>` : '';
+            return `
+                <div class="cliente-box"><span class="name">${esc(c.nombre)}</span>
+                    <span class="meta">Total ${plata(total)} · Cobrado <b class="verde">${plata(cobrado)}</b> · Debe <b class="${debe > 0 ? 'rojo' : 'verde'}">${plata(debe)}</b></span></div>
+                <table><thead><tr><th>Producto</th><th class="num">Cant.</th><th class="num">Precio</th><th class="money">Total</th></tr></thead>
+                <tbody>${filas}${comision}</tbody></table>`;
+        }).join('') || '<p class="vacio">No hubo ventas este día.</p>';
 
-        const confirmar = await Utils.showConfirm(confirmMsg);
-        if (!confirmar) return;
+        // Lo que llegó
+        let totalMercaderia = 0;
+        const recibido = (datos.recepcion || []).filter(r => r.confirmado === true || r.confirmado === 'true');
+        const filasRecepcion = recibido.map((r, i) => {
+            const total = Math.round((parseFloat(r.llego) || 0) * (Utils.parsePrice(r.precio_real) || 0));
+            totalMercaderia += total;
+            return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(r.producto_nombre || '')}</td><td>${esc(r.proveedor_nombre || proveedorNombre(r.proveedor_id))}</td><td class="num">${cant(r.pedido_total)}</td><td class="num">${cant(r.llego)}</td><td class="num">${plata(r.precio_real)}</td><td class="money">${plata(total)}</td></tr>`;
+        }).join('');
 
-        Utils.showLoader();
-        try {
-            await API.deleteHistorial(id);
-            Utils.showSuccess('Historial eliminado correctamente');
-            CacheManager.invalidate('historial');
-            await this.load();
-        } catch (error) {
-            console.error('Error deleting historial:', error);
-            Utils.showError('Error al eliminar historial: ' + error.message);
-        } finally {
-            Utils.hideLoader();
-        }
-    }
+        // Proveedores: mercadería del día, lo pagado ese día y lo que se le debe hoy
+        const porProveedor = {};
+        recibido.forEach(r => {
+            const id = String(r.proveedor_id || '');
+            const p = porProveedor[id] || (porProveedor[id] = { mercaderia: 0, pagado: 0 });
+            p.mercaderia += Math.round((parseFloat(r.llego) || 0) * (Utils.parsePrice(r.precio_real) || 0));
+        });
+        const pagosDia = delDia(datos.pagos);
+        pagosDia.forEach(p => {
+            const id = String(p.proveedor_id || '');
+            const x = porProveedor[id] || (porProveedor[id] = { mercaderia: 0, pagado: 0 });
+            x.pagado += Utils.parsePrice(p.monto) || 0;
+        });
+        const totalPagado = pagosDia.reduce((s, p) => s + (Utils.parsePrice(p.monto) || 0), 0);
+        const filasProveedores = Object.keys(porProveedor).map((id, i) => {
+            const prov = (datos.proveedores || []).find(p => String(p.id) === id) || {};
+            const x = porProveedor[id];
+            return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(prov.nombre || 'Sin proveedor')}</td><td class="money">${plata(x.mercaderia)}</td><td class="money verde">${plata(x.pagado)}</td><td class="money ${(Utils.parsePrice(prov.saldo) || 0) > 0 ? 'rojo' : ''}">${plata(prov.saldo)}</td></tr>`;
+        }).join('');
+
+        // Caja del día
+        const movimientos = delDia(datos.caja);
+        const ingresos = movimientos.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + (Utils.parsePrice(m.monto) || 0), 0);
+        const egresos = movimientos.filter(m => m.tipo === 'egreso').reduce((s, m) => s + (Utils.parsePrice(m.monto) || 0), 0);
+        const filasCaja = movimientos.map((m, i) => `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${m.tipo === 'egreso' ? 'Egreso' : 'Ingreso'}</td><td>${esc(m.nota || '')}</td><td class="money ${m.tipo === 'egreso' ? 'rojo' : 'verde'}">${plata(m.monto)}</td></tr>`).join('');
+
+        const tabla = (cabeza, filas, vacio) => filas
+            ? `<table><thead><tr>${cabeza}</tr></thead><tbody>${filas}</tbody></table>`
+            : `<p class="vacio">${vacio}</p>`;
+
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Cierre del día</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; padding: 30px 36px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 2px; }
+                .resumen { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 18px; }
+                .resumen div { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-radius: 8px; padding: 10px 12px; }
+                .resumen span { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #64748b; font-weight: 600; }
+                .resumen b { font-size: 17px; color: #1e293b; }
+                h2 { font-size: 15px; color: #1a73e8; margin: 18px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #dbeafe; }
+                .cliente-box { background: #f1f5f9; border-left: 4px solid #1a73e8; padding: 8px 12px; border-radius: 6px; margin: 10px 0 6px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+                .cliente-box .name { font-size: 14px; font-weight: 700; }
+                .cliente-box .meta { font-size: 11px; color: #475569; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 6px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+                thead th.num, thead th.money { text-align: right; }
+                tbody td { padding: 7px 10px; border-bottom: 1px solid #e2e8f0; }
+                .row-even { background: #fff; } .row-odd { background: #f8fafc; }
+                td.num { text-align: right; white-space: nowrap; }
+                td.money { text-align: right; white-space: nowrap; font-weight: 700; color: #1a73e8; }
+                .verde { color: #15803d !important; } .rojo { color: #dc2626 !important; }
+                .vacio { color: #64748b; padding: 8px 0; }
+                .footer { margin-top: 26px; padding-top: 12px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Reporte de cierre del día</p></div>
+                <div class="doc-meta"><strong>${esc(fechaLarga)}</strong>Generado: ${esc(new Date().toLocaleString('es-AR', { hour12: false }))}<br>${(datos.pedidos || []).length} pedidos</div>
+            </div>
+            <div class="resumen">
+                <div><span>Vendido</span><b>${plata(totalVendido)}</b></div>
+                <div><span>Cobrado</span><b class="verde">${plata(totalCobrado)}</b></div>
+                <div><span>Quedó debiendo</span><b class="${totalDebe > 0 ? 'rojo' : ''}">${plata(totalDebe)}</b></div>
+                <div><span>Mercadería recibida</span><b>${plata(totalMercaderia)}</b></div>
+            </div>
+            <h2>Ventas por cliente</h2>
+            ${bloquesClientes}
+            <h2>Lo que llegó</h2>
+            ${tabla('<th>Producto</th><th>Proveedor</th><th class="num">Pedido</th><th class="num">Llegó</th><th class="num">Precio real</th><th class="money">Total</th>', filasRecepcion, 'No se confirmó mercadería este día.')}
+            <h2>Proveedores</h2>
+            ${tabla('<th>Proveedor</th><th class="money">Mercadería del día</th><th class="money">Pagado este día</th><th class="money">Le debés hoy</th>', filasProveedores, 'Sin movimientos con proveedores este día.')}
+            <p class="vacio">Total pagado a proveedores este día: <b>${plata(totalPagado)}</b></p>
+            <h2>Caja del día</h2>
+            ${tabla('<th>Tipo</th><th>Detalle</th><th class="money">Monto</th>', filasCaja, 'Sin movimientos de caja este día.')}
+            <p class="vacio">Ingresos <b class="verde">${plata(ingresos)}</b> · Egresos <b class="rojo">${plata(egresos)}</b> · Saldo del día <b>${plata(ingresos - egresos)}</b></p>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
 };
 
 const Caja = {
@@ -11555,6 +11607,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const esCampoPrecio = el => el.classList && (el.classList.contains('precio-cliente') || el.classList.contains('precio-real'));
         preciosTbody.addEventListener('input', (e) => {
             if (!esCampoPrecio(e.target)) return;
+            Precios._tocadas.add(String(e.target.getAttribute('data-id')));
             Precios.refrescarCalculo();
         });
         preciosTbody.addEventListener('focusout', (e) => {

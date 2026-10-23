@@ -695,16 +695,16 @@
                 <div class="danger-panel-icon">⚠️</div>
                 <div class="danger-panel-body">
                     <h3>Zona peligrosa</h3>
-                    <p>Esta acción <strong>elimina permanentemente</strong> todos los datos del sistema:</p>
+                    <p>Esta acción deja la app vacía. <strong>Antes de borrar se guarda una copia completa</strong> de todos los datos en Google Drive ("Respaldo … con la fecha"), así no se pierde nada:</p>
                     <ul class="danger-panel-list">
                         <li>Clientes, productos y proveedores</li>
                         <li>Pedidos, recepciones y precios</li>
                         <li>Cobranzas, pagos, cierres e historial</li>
                         <li>Stock y movimientos de caja</li>
                         <li>Caché local del navegador (excepto tu sesión)</li>
-                        <li>Google Sheets — todas las hojas vuelven a quedar vacías con solo encabezados</li>
+                        <li>Google Sheets — todas las hojas vuelven a quedar vacías con solo encabezados (la copia queda aparte en Drive)</li>
                     </ul>
-                    <p class="danger-panel-warning">No se puede deshacer. Usalo solo para pruebas o empezar de cero.</p>
+                    <p class="danger-panel-warning">Usalo solo para pruebas o empezar de cero.</p>
                     <button type="button" class="btn btn-danger" id="btn-reset-todos-datos">Eliminar todos los datos</button>
                 </div>
             </div>
@@ -841,7 +841,7 @@
     <script src="services/whatsapp.js?v=20261021web"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261023cambios"></script>
+    <script src="app.js?v=20261023multiusuario2"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {
