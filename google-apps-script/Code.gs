@@ -1226,15 +1226,67 @@ function assertDiaAbierto_(fecha) {
  * (pierde el 0) y "+54..." o "=..." en fórmula. Se hace una sola vez por hoja.
  */
 function ensureTextColumns_(sheet, sheetName, columnas) {
-  var props = PropertiesService.getScriptProperties();
-  var key = 'FMT_TEXTO_' + tenantClave_() + '_' + sheetName;
-  if (props.getProperty(key) === '1') return;
-  var headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  // Antes se hacía una sola vez y las filas agregadas después quedaban sin formato de texto:
+  // un teléfono "+54 9 ..." se convertía en una fórmula rota (#ERROR!) y el número no se veía.
+  // Ahora se aplica a toda la columna cada vez, y se reparan las celdas que ya quedaron rotas.
+  repararTextos_(sheet, columnas);
+}
+
+/** Celdas que Sheets tomó como fórmula ("+54 9 ..." → #ERROR!): se recupera lo escrito como texto. */
+function repararTextos_(sheet, columnas) {
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var lastRow = sheet.getLastRow();
+  var reparadas = 0;
   columnas.forEach(function(nombre) {
     var i = headers.indexOf(nombre);
-    if (i !== -1) sheet.getRange(1, i + 1, Math.max(sheet.getMaxRows(), 2), 1).setNumberFormat('@');
+    if (i === -1) return;
+    var columna = sheet.getRange(2, i + 1, Math.max(sheet.getMaxRows() - 1, 1), 1);
+    if (lastRow >= 2) {
+      var rango = sheet.getRange(2, i + 1, lastRow - 1, 1);
+      var formulas = rango.getFormulas();
+      if (formulas.some(function(f) { return f[0]; })) {
+        var valores = rango.getValues();
+        var arreglados = formulas.map(function(f, k) {
+          if (!f[0]) return [valores[k][0]];
+          reparadas++;
+          return [String(f[0]).replace(/^=/, '')];
+        });
+        columna.setNumberFormat('@');
+        rango.setValues(arreglados);
+        return;
+      }
+    }
+    columna.setNumberFormat('@');
   });
-  props.setProperty(key, '1');
+  return reparadas;
+}
+
+/** Escribe una fila dejando antes como texto las celdas indicadas (las filas nuevas no traen formato). */
+function escribirFilaTexto_(sheet, fila, valores, columnasTexto) {
+  if (fila > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), fila - sheet.getMaxRows());
+  var headers = sheet.getRange(1, 1, 1, valores.length).getValues()[0];
+  (columnasTexto || []).forEach(function(nombre) {
+    var i = headers.indexOf(nombre);
+    if (i !== -1) sheet.getRange(fila, i + 1).setNumberFormat('@');
+  });
+  sheet.getRange(fila, 1, 1, valores.length).setValues([valores]);
+}
+
+/**
+ * Ejecutar UNA vez desde el editor de Apps Script (Ejecutar → repararTelefonos) para recuperar
+ * los teléfonos que quedaron como #ERROR! en Clientes y Proveedores de todas las hojas.
+ */
+function repararTelefonos() {
+  paraCadaUsuario_(function(email) {
+    var c = repararTextos_(getSheet(CONFIG.SHEETS.CLIENTES), ['nombre', 'telefono']);
+    var p = repararTextos_(getSheet(CONFIG.SHEETS.PROVEEDORES), ['nombre', 'rubro', 'telefono']);
+    invalidateSheetCache();
+    invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
+    bumpDataVersion_();
+    Logger.log('✅ ' + email + ': ' + c + ' celda(s) de clientes y ' + p + ' de proveedores reparadas');
+  });
 }
 
 /** Cuántas filas de otra hoja apuntan a este registro. */
@@ -1331,7 +1383,7 @@ function createCliente(data) {
     true
   ];
   
-  sheet.appendRow(newRow);
+  escribirFilaTexto_(sheet, sheet.getLastRow() + 1, newRow, ['nombre', 'telefono']);
   invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
   return { id: id, nombre: nombre, telefono: limpiarTexto_(data.telefono), activo: true };
@@ -1365,7 +1417,7 @@ function updateCliente(data) {
     }
     if (telIdx !== -1 && data.telefono !== undefined) row[telIdx] = limpiarTexto_(data.telefono);
     if (activoIdx !== -1 && traeActivo) row[activoIdx] = activoValue;
-    sheet.getRange(i + 1, 1, 1, row.length).setValues([row]);
+    escribirFilaTexto_(sheet, i + 1, row, ['nombre', 'telefono']);
 
     invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
     invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
@@ -1496,7 +1548,7 @@ function createProveedor(data) {
     row[cols.activo] = true;
   }
 
-  sheet.appendRow(row);
+  escribirFilaTexto_(sheet, sheet.getLastRow() + 1, row, ['nombre', 'rubro', 'telefono']);
   invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
   return { id: id, nombre: nombreProveedor, rubro: rubroProveedor, telefono: telefonoProveedor, activo: true };
@@ -1527,7 +1579,7 @@ function updateProveedor(data) {
     if (cols.rubro !== -1 && data.rubro !== undefined) row[cols.rubro] = limpiarTexto_(data.rubro);
     if (cols.telefono !== -1 && data.telefono !== undefined) row[cols.telefono] = limpiarTexto_(data.telefono);
     if (cols.activo !== -1 && traeActivo) row[cols.activo] = activoValue;
-    sheet.getRange(i + 1, 1, 1, row.length).setValues([row]);
+    escribirFilaTexto_(sheet, i + 1, row, ['nombre', 'rubro', 'telefono']);
 
     invalidateSheetCache(CONFIG.SHEETS.PROVEEDORES);
     invalidateServerCacheForSheet(CONFIG.SHEETS.PROVEEDORES);
