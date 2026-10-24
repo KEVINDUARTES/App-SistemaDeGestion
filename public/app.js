@@ -1917,8 +1917,23 @@ const API = {
         return result;
     },
     
+    // Todo viaja dentro de la dirección (JSONP) y Google rechaza las de más de ~12.000 caracteres
+    // (Error 400). Un día con 80+ productos superaba ese límite: la lista de precios no se terminaba
+    // de armar y la comisión no se guardaba. Las listas largas se mandan en tandas.
+    TANDA_ITEMS: 25,
+
+    async _enTandas(endpoint, data) {
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (items.length <= this.TANDA_ITEMS) return this.request(endpoint, 'POST', data);
+        let result = null;
+        for (let i = 0; i < items.length; i += this.TANDA_ITEMS) {
+            result = await this.request(endpoint, 'POST', { ...data, items: items.slice(i, i + this.TANDA_ITEMS) });
+        }
+        return result;
+    },
+
     async saveRecepcion(data) {
-        const result = await this.request('recepcion', 'POST', data);
+        const result = await this._enTandas('recepcion', data);
         DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
         this._invalidateFlujo();
         return result;
@@ -1965,7 +1980,7 @@ const API = {
     },
     
     async savePreciosCliente(data) {
-        const result = await this.request('precios-cliente', 'POST', data);
+        const result = await this._enTandas('precios-cliente', data);
         DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
         // Los totales a cobrar salen de estos precios: lo guardado antes quedó viejo.
         CacheManager.invalidatePattern('cobranzas');
@@ -6332,6 +6347,7 @@ const Precios = {
             AppState.precios = flujoLocal.precios || [];
             this.recepciones = flujoLocal.recepcion || [];
             AppState.fechaCargada = fecha;
+            this._sincronizarComision();
             this.limpiarPrecioClienteAutomatico();
             this.render();
             this.loadClientesFilter();
@@ -6342,6 +6358,7 @@ const Precios = {
         if (hasStale) {
             if (!AppState.precios.length && cachedPrecios) AppState.precios = cachedPrecios;
             this.recepciones = CacheManager.peek(`recepcion:${fecha}`) || this.recepciones;
+            this._sincronizarComision();
             this.limpiarPrecioClienteAutomatico();
             this.render();
             if (Array.isArray(preciosFrescos) || AppState.fechaCargada === fecha) {
@@ -6367,19 +6384,7 @@ const Precios = {
                 filtroCliente.value = savedClienteId;
             }
             
-            // Restaurar comisión si existe (solo si el elemento existe en el DOM)
-            const comisionInput = document.getElementById('precios-comision');
-            const savedComision = localStorage.getItem('precios-comision');
-            const comisionGuardada = (AppState.precios || []).find(p => Utils.parsePrice(p.comision_unitaria) > 0);
-            if (comisionGuardada) {
-                this.comisionPorUnidad = Utils.parsePrice(comisionGuardada.comision_unitaria);
-            } else if (savedComision) {
-                this.comisionPorUnidad = Utils.parsePrice(savedComision) || 350;
-            }
-            if (comisionInput) {
-                comisionInput.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
-            }
-
+            this._sincronizarComision();
             this.limpiarPrecioClienteAutomatico();
             this.render();
         } catch (error) {
@@ -6434,7 +6439,62 @@ const Precios = {
             comisionInput.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
             localStorage.setItem('precios-comision', this.comisionPorUnidad.toString());
             this.render();
+            if (this.comisionPorUnidad !== antes) {
+                clearTimeout(this._comisionTimer);
+                this._comisionTimer = setTimeout(() => this._guardarComision(), 1200);
+            }
         }
+    },
+
+    // La comisión del día es la que está guardada en sus líneas de precios. Se lee en cada carga de la
+    // pantalla (también cuando los datos ya estaban en memoria): si no, el campo quedaba en 350 y las
+    // cuentas y el próximo guardado usaban ese valor viejo.
+    _sincronizarComision() {
+        if (this._comisionTimer && this._comisionEditada) return; // el usuario la está cambiando
+        const guardada = (AppState.precios || []).find(p => Utils.parsePrice(p.comision_unitaria) > 0);
+        if (guardada) {
+            this.comisionPorUnidad = Utils.parsePrice(guardada.comision_unitaria);
+        } else {
+            let enNavegador = null;
+            try { enNavegador = localStorage.getItem('precios-comision'); } catch (error) { /* sin almacenamiento */ }
+            if (enNavegador !== null && enNavegador !== '') this.comisionPorUnidad = Utils.parsePrice(enNavegador) || 0;
+        }
+        const input = document.getElementById('precios-comision');
+        if (input && document.activeElement !== input) {
+            input.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
+        }
+    },
+
+    // La comisión es una sola por día: se guarda sola apenas se cambia, en todas las líneas del día
+    // (aunque haya un cliente filtrado) y sin tocar los precios. Antes quedaba solo en pantalla hasta
+    // tocar "Guardar precios", y al recargar o al armarse la lista volvía la anterior.
+    _guardarComision() {
+        this._comisionTimer = null;
+        const fecha = AppState.currentDate;
+        const comision = this.comisionPorUnidad;
+        const lineas = (AppState.precios || []).filter(p => !p.fecha || Utils.fechaIso(p.fecha) === fecha);
+        if (!lineas.length || DiaOperativo.diaCerrado(fecha)) return;
+        lineas.forEach(p => { p.comision_unitaria = comision; });
+        this.sincronizarCobranza();
+        this.refrescarCalculo();
+        CacheManager.set(`precios:${fecha}`, AppState.precios);
+        const items = lineas.map(p => ({
+            cliente_id: p.cliente_id,
+            producto_id: p.producto_id,
+            cantidad: p.cantidad || 0,
+            precio_cliente: Utils.parsePrice(p.precio_cliente) || 0,
+            comision_unitaria: comision,
+            solo_comision: true
+        }));
+        this._comisionEditada = false;
+        Utils.enSegundoPlano(async () => {
+            await API.savePreciosCliente({ fecha, comision_por_unidad: comision, items });
+            CacheManager.set(`precios:${fecha}`, AppState.precios);
+            Utils.avisar(`Comisión de ${Utils.formatCurrency(comision)} guardada para todo el día`);
+        }, (error) => {
+            this._comisionEditada = true;
+            Utils.showError('No se pudo guardar la comisión: ' + (error && error.message || 'revisá la conexión') + '. Tocá "Guardar precios" para reintentar.');
+        });
     },
 
     // El precio al cliente lo carga el usuario. Si quedó precio real + comisión
