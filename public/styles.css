@@ -960,6 +960,25 @@ body {
     background: var(--color-success-light);
 }
 
+.recepcion-filtro {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 12px;
+}
+
+.recepcion-filtro label {
+    font-weight: 600;
+    color: var(--color-gray-700);
+}
+
+.recepcion-filtro select {
+    width: auto;
+    min-width: 240px;
+    max-width: 100%;
+}
+
 tr.fila-resaltada td {
     background: var(--color-warning-light) !important;
     transition: background 0.4s;

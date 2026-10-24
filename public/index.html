@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261022sincuentas">
+    <link rel="stylesheet" href="styles.css?v=20261024filtroprov">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -398,6 +398,13 @@
                 </div>
                 <p class="dia-operativo-hint">Confirmá <strong>cada producto</strong> cuando llegue. Al confirmar se arma la lista de precios al cliente con lo que llegó. Los que falten podés confirmarlos otro día (poné 0 en "Llegó" si no vino).</p>
                 <p class="dia-operativo-hint">En <strong>Precio real</strong> poné lo que te cobró el proveedor <strong>por cada uno</strong>, no el total. Si pediste 10 y llegaron 9, cargá el costo de <strong>uno solo</strong>. No es el precio al cliente.</p>
+            </div>
+            <div class="recepcion-filtro">
+                <label for="recepcion-filtro-proveedor">Proveedor:</label>
+                <select id="recepcion-filtro-proveedor" class="form-control" onchange="Recepcion.filtrarProveedor(this.value)">
+                    <option value="">Todos los proveedores</option>
+                </select>
+                <span id="recepcion-filtro-cuenta" class="modal-hint"></span>
             </div>
             <div class="table-container">
                 <table class="data-table">
@@ -841,7 +848,7 @@
     <script src="services/whatsapp.js?v=20261021web"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261023multiusuario2"></script>
+    <script src="app.js?v=20261024hojagrande"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

@@ -3032,6 +3032,7 @@ const Productos = {
                 <select id="modal-producto-tipo" class="form-control" required>
                     <option value="">Seleccionar...</option>
                     <option value="verdura">Verdura</option>
+                    <option value="fruta">Fruta</option>
                     <option value="bebida">Bebida</option>
                     <option value="mercadería">Mercadería</option>
                 </select>
@@ -3118,6 +3119,7 @@ const Productos = {
                 <label>Tipo</label>
                 <select id="modal-producto-tipo" class="form-control" required>
                     <option value="verdura" ${producto.tipo === 'verdura' ? 'selected' : ''}>Verdura</option>
+                    <option value="fruta" ${producto.tipo === 'fruta' ? 'selected' : ''}>Fruta</option>
                     <option value="bebida" ${producto.tipo === 'bebida' ? 'selected' : ''}>Bebida</option>
                     <option value="mercadería" ${producto.tipo === 'mercadería' ? 'selected' : ''}>Mercadería</option>
                 </select>
@@ -3626,8 +3628,10 @@ const Camiones = {
             const proveedorId = String(pedido.proveedor_id || proveedor?.id || '');
             const key = [pedido.producto_id, proveedorId, clienteId].join('|');
             if (!grupos.has(key)) {
+                const productoCat = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
                 grupos.set(key, {
                     producto: pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto'),
+                    tipo: String(productoCat?.tipo || pedido.tipo || '').toLowerCase(),
                     clienteId,
                     cliente: this._nombreCliente(clienteId),
                     puesto: nombreProveedor,
@@ -3636,11 +3640,16 @@ const Camiones = {
             }
             grupos.get(key).cantidad += parseFloat(pedido.cantidad) || 0;
         });
+        // Como lo cargan en el camión: verduras de la A a la Z, después frutas, después el resto.
+        const ordenTipo = { verdura: 0, fruta: 1, bebida: 2, 'mercadería': 3 };
+        const rango = tipo => (ordenTipo[tipo] !== undefined ? ordenTipo[tipo] : 4);
         return [...grupos.values()].filter(fila => fila.cantidad > 0).sort((a, b) => {
-            const puesto = a.puesto.localeCompare(b.puesto, 'es');
-            if (puesto) return puesto;
+            const tipo = rango(a.tipo) - rango(b.tipo);
+            if (tipo) return tipo;
             const producto = a.producto.localeCompare(b.producto, 'es');
             if (producto) return producto;
+            const puesto = a.puesto.localeCompare(b.puesto, 'es');
+            if (puesto) return puesto;
             return a.cliente.localeCompare(b.cliente, 'es');
         });
     },
@@ -3986,6 +3995,10 @@ const Camiones = {
         return { clientes, productos, total };
     },
 
+    // Letra grande y fija: si no entra en una hoja, sigue en la próxima (con el encabezado repetido).
+    // Cada hoja mide exactamente un A4 (794 × 1123 px) para que el PDF corte justo entre hojas.
+    FILAS_POR_HOJA: 30,
+
     _htmlHoja(lista, imprimir) {
         const fecha = this._fechaHoja();
         const fechaCorta = AppState.currentDate
@@ -3993,19 +4006,29 @@ const Camiones = {
             : '';
         const bloques = lista.map(camion => {
             const { clientes, productos, total } = this._matriz(camion);
-            const n = Math.max(productos.length, 1);
-            const filaPx = n > 100 ? 6.2 : n > 70 ? 7.4 : n > 45 ? 9 : n > 28 ? 12 : 15;
-            const fuente = n > 100 ? 6 : n > 70 ? 6.5 : n > 45 ? 7.5 : n > 28 ? 9 : 11;
-            const cabeza = clientes.length > 7 ? 6 : clientes.length > 4 ? 7 : 8;
+            const cabeza = clientes.length > 8 ? 10 : 12;
             const columnas = clientes.map(cliente => `<th class="cli">${this._esc(cliente.nombre)}</th>`).join('');
-            const cuerpo = productos.length
-                ? productos.map((row, i) => {
-                    const celdas = clientes.map(cliente => `<td class="n">${this._esc(this._cant(row.cants[cliente.id] || 0))}</td>`).join('');
-                    return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td class="prod">${this._esc(row.producto)}</td>${celdas}<td class="tot">${this._esc(this._cant(row.total))}</td><td class="prov">${this._esc(row.puesto)}</td></tr>`;
-                }).join('')
-                : `<tr><td class="vacio" colspan="${clientes.length + 3}">Este camión no tiene pedidos.</td></tr>`;
-            return `
-            <section class="hoja" style="--fila:${filaPx}px;--fuente:${fuente}px;--cabeza:${cabeza}px;">
+            const paginas = [];
+            for (let i = 0; i < Math.max(productos.length, 1); i += this.FILAS_POR_HOJA) paginas.push(productos.slice(i, i + this.FILAS_POR_HOJA));
+            return paginas.map((filas, nPag) => {
+                const ultima = nPag === paginas.length - 1;
+                const cuerpo = productos.length
+                    ? filas.map((row, i) => {
+                        const celdas = clientes.map(cliente => `<td class="n">${this._esc(this._cant(row.cants[cliente.id] || 0))}</td>`).join('');
+                        return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td class="prod">${this._esc(row.producto)}</td>${celdas}<td class="tot">${this._esc(this._cant(row.total))}</td><td class="prov">${this._esc(row.puesto)}</td></tr>`;
+                    }).join('')
+                    : `<tr><td class="vacio" colspan="${clientes.length + 3}">Este camión no tiene pedidos.</td></tr>`;
+                const totales = ultima ? `
+                  <div class="totals-wrap">
+                    <table class="totals-table">
+                      <tr class="saldo">
+                        <td>Total a cargar</td>
+                        <td>${this._esc(this._cant(total))}</td>
+                      </tr>
+                    </table>
+                  </div>` : '<p class="sigue">Sigue en la próxima hoja →</p>';
+                return `
+            <section class="hoja" style="--cabeza:${cabeza}px;">
               <div class="doc-header">
                 <div class="brand">
                   <h1>Luciano Cargas</h1>
@@ -4019,6 +4042,7 @@ const Camiones = {
               <div class="camion-banner">
                 <div class="label">Camión</div>
                 <div class="name">${this._esc(camion.nombre)}</div>
+                ${paginas.length > 1 ? `<div class="pagina">Hoja ${nPag + 1} de ${paginas.length}</div>` : ''}
               </div>
               <table>
                 <thead>
@@ -4031,16 +4055,10 @@ const Camiones = {
                 </thead>
                 <tbody>${cuerpo}</tbody>
               </table>
-              <div class="totals-wrap">
-                <table class="totals-table">
-                  <tr class="saldo">
-                    <td>Total a cargar</td>
-                    <td>${this._esc(this._cant(total))}</td>
-                  </tr>
-                </table>
-              </div>
+              ${totales}
               <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas · ${this._esc(fechaCorta)}</div>
             </section>`;
+            }).join('');
         }).join('');
         const imprimirScript = imprimir
             ? '<script>window.addEventListener("load", function(){ setTimeout(function(){ window.print(); }, 200); });<\/script>'
@@ -4048,36 +4066,39 @@ const Camiones = {
         return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Hoja de carga</title>
             <style>
                 * { margin: 0; padding: 0; box-sizing: border-box; }
-                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #1e293b; background: #fff; width: 794px; padding: 8px 10px 6px; }
-                .doc-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 6px; padding-bottom: 4px; border-bottom: 2px solid #1a73e8; }
-                .brand h1 { font-size: 16px; font-weight: 700; color: #1a73e8; letter-spacing: -0.3px; line-height: 1; }
-                .brand p { font-size: 9px; color: #64748b; margin-top: 2px; }
-                .doc-meta { text-align: right; font-size: 9px; color: #475569; line-height: 1.3; }
-                .doc-meta strong { color: #1e293b; display: block; font-size: 11px; }
-                .camion-banner { background: #1a73e8; color: #fff; padding: 5px 10px; border-radius: 6px; margin-bottom: 6px; display: flex; align-items: baseline; gap: 8px; }
-                .camion-banner .label { font-size: 8px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; font-weight: 600; }
-                .camion-banner .name { font-size: 13px; font-weight: 700; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #1e293b; background: #fff; width: 794px; }
+                .hoja { width: 794px; height: 1123px; padding: 30px 28px 24px; overflow: hidden; position: relative; break-after: page; page-break-after: always; }
+                .hoja:last-child { break-after: auto; page-break-after: auto; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 22px; font-weight: 700; color: #1a73e8; letter-spacing: -0.3px; line-height: 1; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 3px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.35; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; }
+                .camion-banner { background: #1a73e8; color: #fff; padding: 7px 12px; border-radius: 6px; margin-bottom: 10px; display: flex; align-items: baseline; gap: 10px; }
+                .camion-banner .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; font-weight: 600; }
+                .camion-banner .name { font-size: 18px; font-weight: 700; }
+                .camion-banner .pagina { margin-left: auto; font-size: 13px; font-weight: 600; }
                 table { width: 100%; border-collapse: collapse; }
-                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; text-align: center; font-weight: 700; line-height: 1.1; padding: 3px 2px; font-size: var(--cabeza, 8px); }
-                thead th.prod, thead th.prov { text-align: left; padding-left: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+                thead th { background: #1a73e8; color: #fff; text-align: center; font-weight: 700; line-height: 1.15; padding: 6px 3px; font-size: var(--cabeza, 12px); }
+                thead th.prod, thead th.prov { text-align: left; padding-left: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
                 thead th.cli { white-space: normal; }
-                tbody td { padding: 0 2px; font-size: var(--fuente, 9px); line-height: 1.05; border-bottom: 1px solid #e8eef5; height: var(--fila, 14px); white-space: nowrap; }
+                tbody td { padding: 0 4px; font-size: 15px; line-height: 1.1; border-bottom: 1px solid #cbd5e1; height: 27px; white-space: nowrap; }
                 .row-even { background: #fff; }
-                .row-odd { background: #f8fafc; }
-                td.prod { font-weight: 600; text-align: left; width: 128px; overflow: hidden; text-overflow: ellipsis; }
-                td.n { text-align: center; color: #334155; }
-                td.tot { text-align: center; width: 38px; font-weight: 700; color: #1a73e8; background: #e8f1fd; }
-                td.prov { text-align: left; font-weight: 600; padding-left: 4px; width: 92px; overflow: hidden; text-overflow: ellipsis; }
+                .row-odd { background: #f1f5f9; }
+                td.prod { font-weight: 700; text-align: left; width: 190px; max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+                td.n { text-align: center; color: #0f172a; font-weight: 600; }
+                td.tot { text-align: center; width: 56px; font-weight: 800; color: #1a73e8; background: #e8f1fd; }
+                td.prov { text-align: left; font-weight: 600; padding-left: 6px; width: 130px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
                 td.vacio { text-align: center; color: #64748b; padding: 12px; }
-                .totals-wrap { margin-top: 6px; display: flex; justify-content: flex-end; }
-                .totals-table { width: 220px; border-collapse: collapse; }
-                .totals-table td { padding: 4px 8px; font-size: 11px; font-weight: 700; border: none; background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; }
+                .totals-wrap { margin-top: 10px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 260px; border-collapse: collapse; }
+                .totals-table td { padding: 7px 10px; font-size: 16px; font-weight: 700; border: none; background: #1a73e8; color: #fff; }
                 .totals-table td:first-child { font-weight: 500; }
                 .totals-table td:last-child { text-align: right; }
-                .footer { margin-top: 4px; padding-top: 3px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 8px; color: #94a3b8; }
-                .hoja { break-after: page; page-break-after: always; }
-                .hoja:last-child { break-after: auto; page-break-after: auto; }
-                @media print { body { padding: 6px 8px; } @page { margin: 8mm; } }
+                .sigue { margin-top: 10px; text-align: right; font-size: 13px; color: #475569; font-weight: 600; }
+                .footer { position: absolute; left: 28px; right: 28px; bottom: 16px; padding-top: 4px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 10px; color: #94a3b8; }
+                @page { size: A4; margin: 0; }
+                @media print { body { width: auto; } }
             </style></head><body>${bloques}${imprimirScript}</body></html>`;
     },
 
@@ -5325,6 +5346,43 @@ const Pedidos = {
 const Recepcion = {
     vista: 'hoy',
     _actionsBound: false,
+    // Filtro por proveedor: con muchos productos, se confirma lo de un proveedor sin recorrer toda la lista.
+    _filtroProveedor: '',
+
+    _proveedorDe(item) {
+        return String(item.proveedor_id || '') || 'sin-proveedor';
+    },
+
+    filtrarProveedor(valor) {
+        this._filtroProveedor = String(valor || '');
+        this.render();
+    },
+
+    _pintarFiltroProveedor() {
+        const select = document.getElementById('recepcion-filtro-proveedor');
+        if (!select) return;
+        const vistos = new Map();
+        (AppState.recepcion || []).forEach(item => {
+            const id = this._proveedorDe(item);
+            if (!vistos.has(id)) vistos.set(id, { nombre: item.proveedor_nombre || 'Sin proveedor', total: 0, pendientes: 0 });
+            const v = vistos.get(id);
+            v.total += 1;
+            if (!(item.confirmado === true || item.confirmado === 'true')) v.pendientes += 1;
+        });
+        // Si el proveedor elegido ya no está en este día, se vuelve a "Todos".
+        if (this._filtroProveedor && !vistos.has(this._filtroProveedor)) this._filtroProveedor = '';
+        const opciones = [...vistos.entries()].sort((a, b) => a[1].nombre.localeCompare(b[1].nombre, 'es'));
+        select.innerHTML = '<option value="">Todos los proveedores</option>' + opciones.map(([id, v]) =>
+            `<option value="${Utils.esc(id)}">${Utils.esc(v.nombre)} (${v.pendientes ? v.pendientes + ' sin confirmar' : 'todo confirmado'})</option>`
+        ).join('');
+        select.value = this._filtroProveedor;
+    },
+
+    _visibles() {
+        const lista = AppState.recepcion || [];
+        if (!this._filtroProveedor) return lista;
+        return lista.filter(item => this._proveedorDe(item) === this._filtroProveedor);
+    },
 
     findById(list, id) {
         if (!list || id === null || id === undefined) return null;
@@ -5715,15 +5773,20 @@ const Recepcion = {
         
         // Ocultar loader local
         Utils.hideTableLoader(tbody);
+        this._pintarFiltroProveedor();
         
         if (AppState.recepcion.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No hay recepciones para el día seleccionado</td></tr>';
             return;
         }
+
+        const visibles = this._visibles();
+        const cuenta = document.getElementById('recepcion-filtro-cuenta');
+        if (cuenta) cuenta.textContent = this._filtroProveedor ? `Mostrando ${visibles.length} de ${AppState.recepcion.length} productos` : '';
         
         let rowsHtml = '';
         
-        AppState.recepcion.forEach(item => {
+        visibles.forEach(item => {
             const confirmada = item.confirmado === true || item.confirmado === 'true';
             const rowClass = confirmada ? ' class="recepcion-row-confirmada"' : '';
             const disabled = confirmada ? ' disabled' : '';
@@ -5735,12 +5798,16 @@ const Recepcion = {
                    </div>`
                 : `<button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${item.producto_id}">Confirmar</button>`;
 
+            // Sin confirmar y sin cargar, los campos quedan vacíos (el 0 es solo de ayuda): así se escribe
+            // directo, sin borrar un 0 en cada producto. Vacío vale lo mismo que 0 al confirmar.
+            const llegoValor = confirmada || Number(item.llego) > 0 ? (item.llego || 0) : '';
+            const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
             rowsHtml += `
                 <tr${rowClass}>
                     <td>${Utils.esc(item.producto_nombre || '')}</td>
                     <td>${item.pedido_total || 0}</td>
-                    <td><input type="number" class="recepcion-llego" data-id="${item.id}" data-producto-id="${item.producto_id}" value="${item.llego || 0}" min="0"${disabled}></td>
-                    <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${item.producto_id}" data-price-input="true" value="${Utils.formatPrice(item.precio_real || 0)}" placeholder="Costo del proveedor"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
+                    <td><input type="number" class="recepcion-llego" data-id="${item.id}" data-producto-id="${item.producto_id}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
+                    <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${item.producto_id}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
                     <td>${Utils.esc(item.proveedor_nombre || '')}</td>
                     <td class="recepcion-acciones">${accionCell}</td>
                 </tr>
@@ -5790,7 +5857,8 @@ const Recepcion = {
     },
 
     async confirmarCompletos() {
-        const pendientes = (AppState.recepcion || []).filter(item => item.confirmado !== true && item.confirmado !== 'true');
+        // Con un proveedor elegido, se confirma solo lo que se ve en pantalla.
+        const pendientes = this._visibles().filter(item => item.confirmado !== true && item.confirmado !== 'true');
         if (pendientes.length === 0) {
             Utils.showInfo('No hay productos pendientes de confirmar.');
             return;
@@ -10341,6 +10409,7 @@ const Stock = {
         if (tipo === 'bebida') return 'Bebida';
         if (tipo === 'verdura') return 'Verdura';
         if (tipo === 'mercadería') return 'Mercadería';
+        if (tipo === 'fruta') return 'Fruta';
         return tipo ? String(tipo) : '';
     },
 
