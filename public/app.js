@@ -6311,6 +6311,32 @@ const Comisiones = {
         return `General (${Utils.formatCurrency(Utils.parsePrice(general) || 0)})`;
     },
 
+    // La comisión se le muestra al cliente aparte, como una línea al final: "1200 bultos × $500".
+    // Los productos con porcentaje suman sus bultos (500 kg al 10 % = 50 bultos) a la general; los de
+    // monto fijo van en su propia línea. El total es el mismo que se cobra (línea por línea).
+    resumen(lineas) {
+        const grupos = new Map();
+        (lineas || []).forEach(l => {
+            const cantidad = parseFloat(l.cantidad) || 0;
+            const unitaria = Utils.parseComision(l.comision_unitaria) || 0;
+            if (cantidad <= 0 || unitaria <= 0) return;
+            const pct = this.porcentaje(l.comision_pct);
+            const tarifa = pct > 0 ? Math.round(unitaria * 10000 / pct) / 100 : unitaria;
+            const bultos = pct > 0 ? cantidad * pct / 100 : cantidad;
+            const g = grupos.get(tarifa) || { tarifa, bultos: 0, total: 0 };
+            g.bultos += bultos;
+            g.total += Math.round(cantidad * unitaria);
+            grupos.set(tarifa, g);
+        });
+        return [...grupos.values()]
+            .map(g => ({ ...g, bultos: Math.round(g.bultos * 100) / 100 }))
+            .sort((a, b) => b.total - a.total);
+    },
+
+    bultosTexto(n) {
+        return String(n).replace('.', ',');
+    },
+
     textoCorto(producto) {
         const regla = this.reglaDe(producto.id);
         if (regla.tipo === 'ninguna') return 'Sin comisión';
@@ -7461,12 +7487,14 @@ const Precios = {
                 cantidad,
                 precioUnitario,
                 comision: comisionUnidad,
+                comisionPct: this._comisionLinea(precio, precioUnitario).comision_pct,
                 total
             });
         });
 
         const comision = totalComision;
         const saldoTotal = totalProductos + comision;
+        const comisiones = Comisiones.resumen(filas.map(f => ({ cantidad: f.cantidad, comision_unitaria: f.comision, comision_pct: f.comisionPct })));
 
         return {
             clienteNombre,
@@ -7475,6 +7503,7 @@ const Precios = {
             totalProductos,
             totalCantidad,
             comision,
+            comisiones,
             saldoTotal
         };
     },
@@ -7582,7 +7611,13 @@ const Precios = {
                                 <th>Total</th>
                             </tr>
                         </thead>
-                        <tbody>${filasPreview}</tbody>
+                        <tbody>${filasPreview}${(datos.comisiones || []).map(c => `
+                            <tr>
+                                <td>Comisión de reparto</td>
+                                <td>${Comisiones.bultosTexto(c.bultos)}</td>
+                                <td>${Utils.formatComision(c.tarifa)}</td>
+                                <td>${Utils.formatCurrency(c.total)}</td>
+                            </tr>`).join('')}</tbody>
                         <tfoot>
                             <tr>
                                 <td colspan="3" style="text-align:right;font-weight:600;">Total a pagar</td>
@@ -7642,12 +7677,25 @@ const Precios = {
                 doc.addPage();
                 y = 20;
             }
-            const unitario = (parseFloat(fila.precioUnitario) || 0) + (fila.comision !== undefined ? (parseFloat(fila.comision) || 0) : extra);
+            const unitario = parseFloat(fila.precioUnitario) || 0;
             const subtotal = unitario * (parseFloat(fila.cantidad) || 0);
             doc.text(String(fila.cantidad ?? ''), 14, y);
             doc.text(String(fila.producto || '').slice(0, 42), 32, y);
             doc.text(Utils.formatCurrency(unitario), 130, y);
             doc.text(Utils.formatCurrency(subtotal), 165, y);
+            y += 7;
+        });
+        // La comisión va aparte, al final: "1200 bultos × $500".
+        const comisiones = datos.comisiones || (extra > 0 && datos.totalCantidad > 0 ? [{ bultos: datos.totalCantidad, tarifa: extra, total: Math.round(datos.totalCantidad * extra) }] : []);
+        comisiones.forEach(c => {
+            if (y > 275) {
+                doc.addPage();
+                y = 20;
+            }
+            doc.text(Comisiones.bultosTexto(c.bultos), 14, y);
+            doc.text('Comisión de reparto', 32, y);
+            doc.text(Utils.formatComision(c.tarifa), 130, y);
+            doc.text(Utils.formatCurrency(c.total), 165, y);
             y += 7;
         });
         doc.setFontSize(12);
@@ -7745,17 +7793,27 @@ const Precios = {
                 : '';
 
             const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
-            const filasHtml = datos.filas.map((f, i) => {
-                const unitario = (parseFloat(f.precioUnitario) || 0) + (f.comision !== undefined ? (parseFloat(f.comision) || 0) : extra);
+            // Cada producto a su precio; la comisión va aparte, al final: "1200 bultos × $500".
+            const filasProductos = datos.filas.map((f, i) => {
+                const unitario = parseFloat(f.precioUnitario) || 0;
                 const subtotal = unitario * (parseFloat(f.cantidad) || 0);
                 return `
                 <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
                     <td class="col-cant">${f.cantidad}</td>
-                    <td class="col-prod">${f.producto}</td>
+                    <td class="col-prod">${Utils.esc(f.producto)}</td>
                     <td class="col-money">${Utils.formatCurrency(unitario)}</td>
                     <td class="col-money col-total">${Utils.formatCurrency(subtotal)}</td>
                 </tr>`;
             }).join('');
+            const comisiones = datos.comisiones || (extra > 0 && datos.totalCantidad > 0 ? [{ bultos: datos.totalCantidad, tarifa: extra, total: Math.round(datos.totalCantidad * extra) }] : []);
+            const filasComision = comisiones.map(c => `
+                <tr class="row-comision">
+                    <td class="col-cant">${Comisiones.bultosTexto(c.bultos)}</td>
+                    <td class="col-prod">Comisión de reparto</td>
+                    <td class="col-money">${Utils.formatComision(c.tarifa)}</td>
+                    <td class="col-money col-total">${Utils.formatCurrency(c.total)}</td>
+                </tr>`).join('');
+            const filasHtml = filasProductos + filasComision;
 
             const html = `
 <!DOCTYPE html>
@@ -7861,6 +7919,7 @@ const Precios = {
     border: none;
   }
   .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); }
+  tr.row-comision td { background: #fff7e0; font-weight: 600; border-top: 2px solid #f0d58a; }
   .footer {
     margin-top: 36px;
     padding-top: 16px;
@@ -7991,7 +8050,9 @@ const CuentaCorriente = {
             });
             if (comision) {
                 suma += comision;
-                movs.push({ fecha, orden: 0, producto: 'Comisión de reparto', cantidad: '', precio: '', total: comision, pago: 0, medio: '' });
+                Comisiones.resumen(lineas).forEach(r => {
+                    movs.push({ fecha, orden: 0, producto: 'Comisión de reparto', cantidad: r.bultos, precio: r.tarifa, total: r.total, pago: 0, medio: '' });
+                });
             }
             const totalCobranza = Utils.parsePrice(c.total) || 0;
             if (totalCobranza !== suma) {
@@ -11440,7 +11501,8 @@ const Historial = {
         // Ventas por cliente (las líneas de precios del día)
         const porCliente = {};
         (datos.precios || []).filter(p => (parseFloat(p.cantidad) || 0) > 0).forEach(p => {
-            const c = porCliente[p.cliente_id] || (porCliente[p.cliente_id] = { nombre: p.cliente_nombre || 'Cliente', lineas: [], comision: 0, cantidad: 0 });
+            const c = porCliente[p.cliente_id] || (porCliente[p.cliente_id] = { nombre: p.cliente_nombre || 'Cliente', lineas: [], comision: 0, cantidad: 0, precios: [] });
+            c.precios.push(p);
             const cantidad = parseFloat(p.cantidad) || 0;
             const precio = Utils.parsePrice(p.precio_cliente) || 0;
             c.lineas.push({ producto: p.producto_nombre || 'Producto', cantidad, precio, total: Math.round(cantidad * precio) });
@@ -11457,7 +11519,7 @@ const Historial = {
             const debe = cob.saldo !== undefined ? (Utils.parsePrice(cob.saldo) || 0) : Math.max(0, total - cobrado);
             totalVendido += total; totalCobrado += cobrado; totalDebe += debe;
             const filas = c.lineas.map((l, i) => `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(l.producto)}</td><td class="num">${cant(l.cantidad)}</td><td class="num">${plata(l.precio)}</td><td class="money">${plata(l.total)}</td></tr>`).join('');
-            const comision = c.comision ? `<tr class="row-odd"><td>Comisión de reparto</td><td class="num">${cant(c.cantidad)}</td><td></td><td class="money">${plata(c.comision)}</td></tr>` : '';
+            const comision = Comisiones.resumen(c.precios).map(r => `<tr class="row-odd"><td>Comisión de reparto</td><td class="num">${cant(r.bultos)}</td><td class="num">${Utils.formatComision(r.tarifa)}</td><td class="money">${plata(r.total)}</td></tr>`).join('');
             return `
                 <div class="cliente-box"><span class="name">${esc(c.nombre)}</span>
                     <span class="meta">Total ${plata(total)} · Cobrado <b class="verde">${plata(cobrado)}</b> · Debe <b class="${debe > 0 ? 'rojo' : 'verde'}">${plata(debe)}</b></span></div>

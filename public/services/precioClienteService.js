@@ -41,21 +41,26 @@ const PrecioClienteService = {
         } = datos;
 
         const extra = Math.round(parseFloat(comisionPorUnidad) || 0);
+        const formatCant = n => String(n).replace('.', ',');
+        // Cada producto a su precio; la comisión va aparte, al final: "1200 bultos x $500".
         const lineasProductos = filas
             .map(f => {
                 const cantidad = parseFloat(f.cantidad) || 0;
-                const comisionLinea = f.comision !== undefined ? (parseFloat(f.comision) || 0) : extra;
-                const unitarioConComision = (parseFloat(f.precioUnitario) || 0) + comisionLinea;
-                const subtotal = unitarioConComision * cantidad;
-                return `• ${f.producto} x${cantidad} — ${this.formatCurrency(unitarioConComision)}/u = ${this.formatCurrency(subtotal)}`;
+                const unitario = parseFloat(f.precioUnitario) || 0;
+                return `• ${f.producto} x${formatCant(cantidad)} — ${this.formatCurrency(unitario)}/u = ${this.formatCurrency(unitario * cantidad)}`;
             })
+            .join('\n');
+        const comisiones = datos.comisiones
+            || (extra > 0 && totalCantidad > 0 ? [{ bultos: totalCantidad, tarifa: extra, total: Math.round(totalCantidad * extra) }] : []);
+        const lineasComision = comisiones
+            .map(c => `• Comisión de reparto: ${formatCant(c.bultos)} bultos x ${this.formatCurrency(c.tarifa)} = ${this.formatCurrency(c.total)}`)
             .join('\n');
 
         let mensaje = `Hola ${clienteNombre || 'cliente'}, te enviamos el detalle de tu pedido`;
         if (fechaLabel) {
             mensaje += ` del ${fechaLabel}`;
         }
-        mensaje += `:\n\n${lineasProductos}\n\n`;
+        mensaje += `:\n\n${lineasProductos}\n${lineasComision ? lineasComision + '\n' : ''}\n`;
         mensaje += `*Total a pagar: ${this.formatCurrency(saldoTotal)}*\n\nMuchas gracias.`;
 
         return mensaje;
