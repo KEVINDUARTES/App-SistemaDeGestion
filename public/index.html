@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261024filtroprov">
+    <link rel="stylesheet" href="styles.css?v=20261026comcant">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -289,6 +289,7 @@
                             <th>Nombre</th>
                             <th>Tipo</th>
                             <th>Proveedor</th>
+                            <th>Comisión</th>
                             <th>Acciones</th>
                         </tr>
                     </thead>
@@ -452,7 +453,7 @@
                     </select>
                 </div>
                 <div class="form-group" style="flex: 1; min-width: 200px;">
-                    <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión de reparto por unidad</label>
+                    <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión general por unidad</label>
                     <input type="text" id="precios-comision" class="form-control" value="350" data-price-input="true" inputmode="numeric" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
                 </div>
                 <div class="form-group" style="display: flex; gap: 10px;">
@@ -460,6 +461,8 @@
                 </div>
             </div>
             
+            <div id="precios-comisiones" class="precios-comisiones" hidden></div>
+
             <div class="precios-vistas" role="tablist">
                 <button type="button" class="btn btn-sm" id="btn-precios-vista-cliente" role="tab" onclick="Precios.cambiarVista('cliente')">Por cliente</button>
                 <button type="button" class="btn btn-sm" id="btn-precios-vista-planilla" role="tab" onclick="Precios.cambiarVista('planilla')">Planilla del día</button>
@@ -513,6 +516,7 @@
                             <th>Cant.</th>
                             <th title="Sale de la recepción. Podés cambiarlo en una línea: solo cambia la ganancia, no lo que le debés al proveedor.">Precio real <span class="th-hint">c/u · editable</span></th>
                             <th title="Lo que le cobrás al cliente por cada unidad">Precio cliente <span class="th-hint">c/u</span></th>
+                            <th title="Comisión de reparto por unidad, según el producto">Comisión <span class="th-hint">c/u</span></th>
                             <th>Ganancia</th>
                             <th>Total</th>
                         </tr>
@@ -722,6 +726,7 @@
             <div class="page-header">
                 <h2>Historial de días</h2>
             </div>
+            <div id="historial-drive" class="historial-drive"></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -847,8 +852,8 @@
     <script src="auth.js?v=20261013hoja"></script>
     <script src="services/whatsapp.js?v=20261021web"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
-    <script src="services/precioClienteService.js?v=20260928manual"></script>
-    <script src="app.js?v=20261026cobrarllegado"></script>
+    <script src="services/precioClienteService.js?v=20261026comcant"></script>
+    <script src="app.js?v=20261026comcant"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

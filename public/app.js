@@ -566,6 +566,19 @@ const Utils = {
         return `$ ${Utils.formatPrice(value)}`;
     },
 
+    // La comisión por unidad puede tener centavos (5 % de $350 = $17,50 por kilo). Se redondea
+    // recién el total de la línea, igual que en el servidor.
+    parseComision(value) {
+        if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
+        const raw = String(value ?? '').trim();
+        if (/^\d+([.,]\d{1,2})?$/.test(raw)) return Math.round(parseFloat(raw.replace(',', '.')) * 100) / 100;
+        return Utils.parsePrice(value);
+    },
+
+    formatComision(value) {
+        return `$ ${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 2 }).format(Utils.parseComision(value))}`;
+    },
+
     formatPriceInputValue(input) {
         if (!input) return;
         const currentValue = input.value || '';
@@ -2161,6 +2174,56 @@ const API = {
         CacheManager.set(cacheKey, result);
         return result;
     },
+
+    // El PDF no entra en una URL (Google corta cerca de los 12.000 caracteres): va en el cuerpo de un
+    // POST. Si la respuesta no se puede leer (corte de red o el redirect de Google), se pregunta al
+    // servidor si el PDF quedó guardado antes de dar error.
+    async subirPdfCierre(fecha, pdfBase64) {
+        const rid = 'pdf_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
+        const url = `${API_CONFIG.baseUrl}?endpoint=${encodeURIComponent('drive/cierre')}&method=POST&apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&token=${encodeURIComponent(Auth.getToken())}&rid=${rid}`;
+        const control = new AbortController();
+        const corte = setTimeout(() => control.abort(), 120000);
+        Sync.escribiendo++;
+        try {
+            let respuesta = null;
+            try {
+                const resp = await fetch(url, { method: 'POST', body: JSON.stringify({ fecha, pdf: pdfBase64 }), signal: control.signal });
+                respuesta = await resp.json();
+            } catch (error) {
+                console.warn('No se pudo leer la respuesta al subir el PDF:', error);
+            }
+            if (respuesta) {
+                if (respuesta.sesion === false) {
+                    Auth.logout();
+                    throw new Error(respuesta.error || 'Tu sesión venció. Volvé a iniciar sesión.');
+                }
+                if (respuesta.ver !== undefined) Sync.observar(respuesta.ver, true);
+                if (respuesta.success !== true) throw new Error(String(respuesta.error || 'No se pudo guardar en Drive').replace(/^Error:\s*/, ''));
+                CacheManager.invalidate('historial');
+                return respuesta.data;
+            }
+            CacheManager.invalidate('historial');
+            const cierres = await this._executeRequest('historial', 'GET', null, 0).catch(() => []);
+            const dia = (cierres || []).find(c => Utils.fechaIso(c.fecha) === fecha && c.pdf_drive);
+            if (dia) return { fecha, url: dia.pdf_drive };
+            throw new Error('No se pudo conectar con Google. Revisá la conexión y volvé a intentar.');
+        } finally {
+            clearTimeout(corte);
+            Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
+        }
+    },
+
+    async getDriveConfig() {
+        return this.request('drive/config', 'GET');
+    },
+
+    async compartirDrive(email) {
+        return this.request('drive/compartir', 'POST', { email });
+    },
+
+    async quitarAccesoDrive(email) {
+        return this.request('drive/quitar', 'POST', { email });
+    },
 };
 
 // Navegación
@@ -3004,7 +3067,7 @@ const Productos = {
         Utils.hideTableLoader(tbody);
         
         if (AppState.productos.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;">No hay productos registrados. Agregue productos para poder crear pedidos.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No hay productos registrados. Agregue productos para poder crear pedidos.</td></tr>';
             return;
         }
         
@@ -3019,6 +3082,7 @@ const Productos = {
                     <td>${Utils.esc(producto.nombre || '')}</td>
                     <td><span class="status-badge ${tipoBadgeClass}">${producto.tipo || ''}</span></td>
                     <td>${proveedor ? proveedor.nombre : 'Sin proveedor'}</td>
+                    <td>${Comisiones.textoCorto(producto)}</td>
                     <td>
                         <button class="btn btn-secondary" onclick="Productos.edit('${producto.id}')">Editar</button>
                         <button class="btn btn-danger" onclick="Productos.delete('${producto.id}')">Eliminar</button>
@@ -3060,6 +3124,7 @@ const Productos = {
                 </select>
                 <small>Si no tienes proveedores, puedes agregarlo después</small>
             </div>
+            ${Comisiones.camposHtml()}
         `;
         
         Utils.showModal('Agregar producto', content, async () => {
@@ -3071,12 +3136,15 @@ const Productos = {
                 Utils.showError('Complete todos los campos obligatorios');
                 return true;
             }
+            const comision = Comisiones.leerCampos();
+            if (!comision) return true;
             
             try {
                 const result = await API.createProducto({
                     nombre: nombre,
                     tipo: tipo,
-                    proveedor_default: proveedorId || ''
+                    proveedor_default: proveedorId || '',
+                    ...comision
                 });
                 
                 console.log('✅ Producto creado, resultado:', result);
@@ -3087,6 +3155,7 @@ const Productos = {
                         nombre,
                         tipo,
                         proveedor_default: proveedorId || '',
+                        ...comision,
                         ...result
                     };
                     Utils.upsertInList(AppState.productos, nuevo);
@@ -3102,6 +3171,7 @@ const Productos = {
                 Utils.showError('Error al crear producto: ' + error.message);
             }
         });
+        Comisiones.activarCampos();
 
         if (!CacheManager.get('proveedores')) {
             API.getProveedores().then(lista => {
@@ -3146,6 +3216,7 @@ const Productos = {
                     ${proveedores.map(p => `<option value="${p.id}" ${p.id === producto.proveedor_default ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
                 </select>
             </div>
+            ${Comisiones.camposHtml(producto)}
         `;
         
         Utils.showModal('Editar producto', content, async () => {
@@ -3157,28 +3228,38 @@ const Productos = {
                 Utils.showError('Complete todos los campos obligatorios');
                 return true;
             }
+            const comision = Comisiones.leerCampos();
+            if (!comision) return true;
+            const reglaAntes = Comisiones.reglaDe(id);
             
             try {
                 await API.updateProducto(id, {
                     nombre: nombre,
                     tipo: tipo,
-                    proveedor_default: proveedorId || ''
+                    proveedor_default: proveedorId || '',
+                    ...comision
                 });
                 
                 Utils.upsertInList(AppState.productos, {
                     id,
                     nombre,
                     tipo,
-                    proveedor_default: proveedorId || ''
+                    proveedor_default: proveedorId || '',
+                    ...comision
                 });
                 CacheManager.set('productos', AppState.productos);
                 Productos.render();
                 Utils.showSuccess('Producto actualizado correctamente');
+                const reglaNueva = Comisiones.reglaDe(id);
+                if (reglaNueva.tipo !== reglaAntes.tipo || reglaNueva.valor !== reglaAntes.valor) {
+                    Precios.aplicarReglaProducto(id);
+                }
             } catch (error) {
                 console.error('Error updating producto:', error);
-                Utils.showError('Error al actualizar producto');
+                Utils.showError('Error al actualizar producto: ' + error.message);
             }
         });
+        Comisiones.activarCampos();
     },
 
     async delete(id) {
@@ -6183,6 +6264,108 @@ const Recepcion = {
     }
 };
 
+// Comisión de reparto: cada producto tiene su regla. Por defecto usa la comisión general del día;
+// también puede no llevar, llevar un monto fijo por unidad o un porcentaje de la cantidad (la sandía
+// va por kilo: de 500 kg al 10 % se cobra la comisión general por 50 bultos).
+const Comisiones = {
+    TIPOS: [
+        { valor: '', texto: 'General del día' },
+        { valor: 'ninguna', texto: 'Sin comisión' },
+        { valor: 'monto', texto: 'Monto fijo por unidad' },
+        { valor: 'porcentaje', texto: 'Porcentaje de la cantidad' }
+    ],
+
+    porcentaje(valor) {
+        const n = parseFloat(String(valor ?? '').replace(',', '.'));
+        return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n * 100) / 100, 100) : 0;
+    },
+
+    reglaDe(productoId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        let tipo = String(producto?.comision_tipo || '').toLowerCase();
+        if (tipo === 'general' || !this.TIPOS.some(t => t.valor === tipo)) tipo = '';
+        const valor = tipo === 'porcentaje' ? this.porcentaje(producto.comision_valor)
+            : tipo === 'monto' ? (Utils.parsePrice(producto.comision_valor) || 0) : 0;
+        return { tipo, valor };
+    },
+
+    // Comisión por unidad de una línea según la regla del producto y la comisión general del día.
+    // Porcentaje: cada unidad paga ese porcentaje de la general (500 kg al 10 % = 50 bultos).
+    deLinea(productoId, precioCliente, general) {
+        const regla = this.reglaDe(productoId);
+        if (regla.tipo === 'ninguna') return { comision_unitaria: 0, comision_pct: 0 };
+        if (regla.tipo === 'monto') return { comision_unitaria: regla.valor, comision_pct: 0 };
+        if (regla.tipo === 'porcentaje') {
+            return { comision_unitaria: Math.round((Utils.parsePrice(general) || 0) * regla.valor) / 100, comision_pct: regla.valor };
+        }
+        return { comision_unitaria: Utils.parsePrice(general) || 0, comision_pct: 0 };
+    },
+
+    texto(regla, general) {
+        if (regla.tipo === 'ninguna') return 'Sin comisión';
+        if (regla.tipo === 'monto') return `${Utils.formatCurrency(regla.valor)} por unidad`;
+        if (regla.tipo === 'porcentaje') {
+            const porUnidad = Math.round((Utils.parsePrice(general) || 0) * regla.valor) / 100;
+            return `${String(regla.valor).replace('.', ',')} % de la cantidad (${Utils.formatComision(porUnidad)} por unidad)`;
+        }
+        return `General (${Utils.formatCurrency(Utils.parsePrice(general) || 0)})`;
+    },
+
+    textoCorto(producto) {
+        const regla = this.reglaDe(producto.id);
+        if (regla.tipo === 'ninguna') return 'Sin comisión';
+        if (regla.tipo === 'monto') return Utils.formatCurrency(regla.valor);
+        if (regla.tipo === 'porcentaje') return `${String(regla.valor).replace('.', ',')} % de la cantidad`;
+        return 'General';
+    },
+
+    // Campos del formulario de producto (agregar y editar).
+    camposHtml(producto = {}) {
+        const regla = producto.id ? this.reglaDe(producto.id) : { tipo: '', valor: 0 };
+        return `
+            <div class="form-group">
+                <label for="modal-producto-comision-tipo">Comisión de reparto</label>
+                <select id="modal-producto-comision-tipo" class="form-control">
+                    ${this.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.tipo ? 'selected' : ''}>${t.texto}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group" id="modal-producto-comision-grupo" ${regla.tipo === 'monto' || regla.tipo === 'porcentaje' ? '' : 'hidden'}>
+                <label for="modal-producto-comision-valor" id="modal-producto-comision-label">${regla.tipo === 'porcentaje' ? 'Porcentaje de la cantidad (%)' : 'Monto por unidad ($)'}</label>
+                <input type="text" id="modal-producto-comision-valor" class="form-control" inputmode="decimal" value="${regla.valor ? String(regla.valor).replace('.', ',') : ''}" placeholder="${regla.tipo === 'porcentaje' ? 'Ej: 10' : 'Ej: 500'}">
+                <small id="modal-producto-comision-ayuda" ${regla.tipo === 'porcentaje' ? '' : 'hidden'}>Ej: 10 → de 500 kg se cobra la comisión general por 50 bultos.</small>
+            </div>
+        `;
+    },
+
+    activarCampos() {
+        const select = document.getElementById('modal-producto-comision-tipo');
+        if (!select) return;
+        select.addEventListener('change', () => {
+            const grupo = document.getElementById('modal-producto-comision-grupo');
+            const label = document.getElementById('modal-producto-comision-label');
+            const input = document.getElementById('modal-producto-comision-valor');
+            const conValor = select.value === 'monto' || select.value === 'porcentaje';
+            grupo.hidden = !conValor;
+            label.textContent = select.value === 'porcentaje' ? 'Porcentaje de la cantidad (%)' : 'Monto por unidad ($)';
+            document.getElementById('modal-producto-comision-ayuda').hidden = select.value !== 'porcentaje';
+            input.placeholder = select.value === 'porcentaje' ? 'Ej: 10' : 'Ej: 500';
+            if (conValor) input.focus();
+        });
+    },
+
+    // Lee el formulario. Devuelve null (y avisa) si falta el valor.
+    leerCampos() {
+        const tipo = document.getElementById('modal-producto-comision-tipo')?.value || '';
+        const crudo = document.getElementById('modal-producto-comision-valor')?.value || '';
+        const valor = tipo === 'porcentaje' ? this.porcentaje(crudo) : tipo === 'monto' ? (Utils.parsePrice(crudo) || 0) : '';
+        if ((tipo === 'monto' || tipo === 'porcentaje') && !(valor > 0)) {
+            Utils.showError(tipo === 'porcentaje' ? 'Poné el porcentaje de comisión (por ejemplo 10).' : 'Poné el monto de comisión por unidad.');
+            return null;
+        }
+        return { comision_tipo: tipo, comision_valor: valor };
+    }
+};
+
 // Precios
 const Precios = {
     selectedClienteId: null,
@@ -6348,7 +6531,6 @@ const Precios = {
             this.recepciones = flujoLocal.recepcion || [];
             AppState.fechaCargada = fecha;
             this._sincronizarComision();
-            this.limpiarPrecioClienteAutomatico();
             this.render();
             this.loadClientesFilter();
             return;
@@ -6359,14 +6541,13 @@ const Precios = {
             if (!AppState.precios.length && cachedPrecios) AppState.precios = cachedPrecios;
             this.recepciones = CacheManager.peek(`recepcion:${fecha}`) || this.recepciones;
             this._sincronizarComision();
-            this.limpiarPrecioClienteAutomatico();
             this.render();
             if (Array.isArray(preciosFrescos) || AppState.fechaCargada === fecha) {
                 this.loadClientesFilter();
                 return;
             }
         } else {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">Buscando precios…</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">Buscando precios…</td></tr>';
         }
 
         try {
@@ -6385,12 +6566,11 @@ const Precios = {
             }
             
             this._sincronizarComision();
-            this.limpiarPrecioClienteAutomatico();
             this.render();
         } catch (error) {
             console.error('Error loading precios:', error);
             Utils.hideTableLoader(tbody);
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 30px; color: #d32f2f;">Error al cargar precios. Por favor, intenta nuevamente.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 30px; color: #d32f2f;">Error al cargar precios. Por favor, intenta nuevamente.</td></tr>';
         }
     },
     
@@ -6438,8 +6618,10 @@ const Precios = {
             if (this.comisionPorUnidad !== antes) this._comisionEditada = true;
             comisionInput.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
             localStorage.setItem('precios-comision', this.comisionPorUnidad.toString());
-            this.render();
             if (this.comisionPorUnidad !== antes) {
+                // Sin rearmar la tabla: si no, el campo de precio que se acaba de tocar desaparece.
+                this.refrescarCalculo();
+                this.renderComisionesProducto();
                 clearTimeout(this._comisionTimer);
                 this._comisionTimer = setTimeout(() => this._guardarComision(), 1200);
             }
@@ -6451,7 +6633,7 @@ const Precios = {
     // cuentas y el próximo guardado usaban ese valor viejo.
     _sincronizarComision() {
         if (this._comisionTimer && this._comisionEditada) return; // el usuario la está cambiando
-        const guardada = (AppState.precios || []).find(p => Utils.parsePrice(p.comision_unitaria) > 0);
+        const guardada = this._lineaGeneral(AppState.precios);
         if (guardada) {
             this.comisionPorUnidad = Utils.parsePrice(guardada.comision_unitaria);
         } else {
@@ -6465,16 +6647,34 @@ const Precios = {
         }
     },
 
-    // La comisión es una sola por día: se guarda sola apenas se cambia, en todas las líneas del día
-    // (aunque haya un cliente filtrado) y sin tocar los precios. Antes quedaba solo en pantalla hasta
-    // tocar "Guardar precios", y al recargar o al armarse la lista volvía la anterior.
+    // Una línea de un producto que usa la comisión general (de ahí se lee la del día).
+    _lineaGeneral(lineas) {
+        return (lineas || []).find(p => Comisiones.reglaDe(p.producto_id).tipo === '' && Utils.parsePrice(p.comision_unitaria) > 0);
+    },
+
+    // Comisión por unidad de una línea. En un día cerrado vale lo que quedó guardado (es lo que se
+    // cobró); en un día abierto sale de la regla del producto.
+    _comisionLinea(precio, precioCliente = precio.precio_cliente) {
+        if (DiaOperativo.diaCerrado(AppState.currentDate)) {
+            return { comision_unitaria: Utils.parseComision(precio.comision_unitaria) || 0, comision_pct: Comisiones.porcentaje(precio.comision_pct) };
+        }
+        return Comisiones.deLinea(precio.producto_id, precioCliente, this.comisionPorUnidad);
+    },
+
+    // La comisión general es una por día: se guarda sola apenas se cambia, en todas las líneas del día
+    // de los productos que usan la general o un porcentaje de ella (aunque haya un cliente filtrado)
+    // y sin tocar los precios. Los de sin comisión o monto fijo no cambian.
     _guardarComision() {
         this._comisionTimer = null;
         const fecha = AppState.currentDate;
         const comision = this.comisionPorUnidad;
-        const lineas = (AppState.precios || []).filter(p => !p.fecha || Utils.fechaIso(p.fecha) === fecha);
-        if (!lineas.length || DiaOperativo.diaCerrado(fecha)) return;
-        lineas.forEach(p => { p.comision_unitaria = comision; });
+        const lineas = (AppState.precios || []).filter(p =>
+            (!p.fecha || Utils.fechaIso(p.fecha) === fecha) && ['', 'porcentaje'].includes(Comisiones.reglaDe(p.producto_id).tipo));
+        if (!lineas.length || DiaOperativo.diaCerrado(fecha)) {
+            this._comisionEditada = false;
+            return;
+        }
+        lineas.forEach(p => Object.assign(p, Comisiones.deLinea(p.producto_id, p.precio_cliente, comision)));
         this.sincronizarCobranza();
         this.refrescarCalculo();
         CacheManager.set(`precios:${fecha}`, AppState.precios);
@@ -6483,34 +6683,21 @@ const Precios = {
             producto_id: p.producto_id,
             cantidad: p.cantidad || 0,
             precio_cliente: Utils.parsePrice(p.precio_cliente) || 0,
-            comision_unitaria: comision,
+            comision_unitaria: p.comision_unitaria,
+            comision_pct: p.comision_pct,
             solo_comision: true
         }));
         this._comisionEditada = false;
         Utils.enSegundoPlano(async () => {
             await API.savePreciosCliente({ fecha, comision_por_unidad: comision, items });
             CacheManager.set(`precios:${fecha}`, AppState.precios);
-            Utils.avisar(`Comisión de ${Utils.formatCurrency(comision)} guardada para todo el día`);
+            Utils.avisar(`Comisión general de ${Utils.formatCurrency(comision)} guardada (y los productos con porcentaje)`);
         }, (error) => {
             this._comisionEditada = true;
             Utils.showError('No se pudo guardar la comisión: ' + (error && error.message || 'revisá la conexión') + '. Tocá "Guardar precios" para reintentar.');
         });
     },
 
-    // El precio al cliente lo carga el usuario. Si quedó precio real + comisión
-    // (del botón que sacamos), lo dejamos vacío.
-    limpiarPrecioClienteAutomatico() {
-        const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
-        (AppState.precios || []).forEach(precio => {
-            const recepcion = (this.recepciones || []).find(r => String(r.producto_id) === String(precio.producto_id));
-            const precioReal = Utils.parsePrice(recepcion?.precio_real) || 0;
-            const precioCliente = Utils.parsePrice(precio.precio_cliente) || 0;
-            if (precioReal > 0 && extra > 0 && precioCliente === precioReal + extra) {
-                precio.precio_cliente = 0;
-            }
-        });
-    },
-    
     render() {
         const tbody = document.getElementById('precios-tbody');
         const tfoot = document.getElementById('precios-tfoot');
@@ -6546,7 +6733,7 @@ const Precios = {
         }
         
         if (preciosFiltrados.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; padding: 30px; color: #666;">' +
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 30px; color: #666;">' +
                 '<div style="margin-bottom: 10px;">📋 No hay precios para el día de hoy' + 
                 (this.selectedClienteId ? ' para este cliente' : '') + '</div>' +
                 '<div style="font-size: 12px; color: #999;">Haz clic en "Generar lista" después de confirmar la recepción de productos</div>' +
@@ -6555,6 +6742,7 @@ const Precios = {
             // Ocultar resumen y footer si no hay datos
             if (tfoot) tfoot.hidden = true;
             if (resumenDiv) resumenDiv.style.display = 'none';
+            this.renderComisionesProducto();
             return;
         }
         
@@ -6562,6 +6750,7 @@ const Precios = {
         let totalProductos = 0;
         let totalCantidad = 0;
         let totalGanancia = 0;
+        let totalComision = 0;
         let clienteNombre = '';
         
         let rowsHtml = '';
@@ -6586,20 +6775,21 @@ const Precios = {
             precio.precio_real = precioRealEditado ? precioRealLinea : 0;
             const precioReal = precioRealEditado ? precioRealLinea : precioRealRecepcion;
             
-            const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
-            const pareceAutomatico = precioRealRecepcion > 0 && extra > 0 && precioUnitario === precioRealRecepcion + extra;
-            const precioManual = pareceAutomatico ? 0 : precioUnitario;
-            if (pareceAutomatico) {
-                precio.precio_cliente = 0;
-            }
+            // El precio al cliente es siempre el que escribió el usuario (aunque coincida con
+            // precio real + comisión: antes ese caso se borraba solo).
+            const precioManual = precioUnitario;
 
             const gananciaPorUnidad = precioManual > 0 ? precioManual - precioReal : 0;
             const gananciaTotal = gananciaPorUnidad * cantidad;
             const total = cantidad * precioManual;
+            const com = this._comisionLinea(precio, precioManual);
+            precio.comision_unitaria = com.comision_unitaria;
+            precio.comision_pct = com.comision_pct;
             
             totalProductos += total;
             totalCantidad += cantidad;
             totalGanancia += gananciaTotal;
+            totalComision += Math.round(cantidad * com.comision_unitaria);
             
             if (!clienteNombre && precio.cliente_nombre) {
                 clienteNombre = precio.cliente_nombre;
@@ -6612,6 +6802,7 @@ const Precios = {
                     <td>${cantidad}</td>
                     <td><input type="text" class="precio-real${precioRealEditado ? ' precio-real-editado' : ''}" data-id="${precio.id}" data-auto="${precioRealRecepcion}" data-price-input="true" value="${precioReal > 0 ? Utils.formatPrice(precioReal) : ''}" style="width: 100px;" placeholder="${precioRealRecepcion > 0 ? Utils.formatPrice(precioRealRecepcion) : 'Costo c/u'}" title="${precioRealEditado ? `Cambiado a mano (el de la recepción es ${Utils.formatCurrency(precioRealRecepcion)}). Borralo para volver al de la recepción.` : 'Sale de la recepción. Podés cambiarlo: solo cambia la ganancia de esta línea, no lo que le debés al proveedor.'}"></td>
                     <td><input type="text" class="precio-cliente" data-id="${precio.id}" data-price-input="true" value="${precioManual > 0 ? Utils.formatPrice(precioManual) : ''}" onchange="Precios.onPrecioChange()" style="width: 100px;" placeholder="Precio al cliente" title="Lo que le cobrás al cliente por unidad. La comisión se suma aparte."></td>
+                    <td class="precio-comision-celda">${this._htmlComision(com)}</td>
                     <td style="color: ${gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${precioManual > 0 ? `${gananciaTotal > 0 ? '+' : ''}${Utils.formatCurrency(gananciaTotal)}` : '—'}</td>
                     <td>${precioManual > 0 ? Utils.formatCurrency(total) : '—'}</td>
                 </tr>
@@ -6622,7 +6813,7 @@ const Precios = {
         Utils.enablePriceInputs(tbody);
         
         // Calcular comisión y saldo total
-        const comision = totalCantidad * this.comisionPorUnidad;
+        const comision = totalComision;
         const saldoTotal = totalProductos + comision;
         
         if (resumenDiv) {
@@ -6643,18 +6834,183 @@ const Precios = {
         
         // Totales siempre visibles: productos, comisión de reparto y saldo a cobrar
         if (tfoot) {
-            tfoot.innerHTML = `
+            tfoot.innerHTML = this._htmlTotales(totalProductos, totalGanancia, comision, saldoTotal);
+            tfoot.hidden = false;
+        }
+        this.renderComisionesProducto();
+    },
+
+    // Panel "Comisión por producto": la regla de cada producto del día. Se guarda en el producto
+    // (queda para los próximos días) y se aplica en el momento a las líneas de este día.
+    renderComisionesProducto() {
+        const caja = document.getElementById('precios-comisiones');
+        if (!caja) return;
+        const fecha = AppState.currentDate;
+        const productos = new Map();
+        (AppState.precios || []).forEach(p => {
+            if (p.fecha && Utils.fechaIso(p.fecha) !== fecha) return;
+            const pid = String(p.producto_id);
+            if (!productos.has(pid)) productos.set(pid, Utils.nombreCatalogo(p, 'producto') || 'Producto');
+        });
+        if (!productos.size) {
+            caja.hidden = true;
+            caja.innerHTML = '';
+            return;
+        }
+        const cerrado = DiaOperativo.diaCerrado(fecha);
+        const lista = [...productos.entries()].sort((a, b) => a[1].localeCompare(b[1], 'es'));
+        const propias = lista.filter(([pid]) => Comisiones.reglaDe(pid).tipo !== '').length;
+        const abierto = caja.querySelector('details')?.open || false;
+        const filas = lista.map(([pid, nombre]) => {
+            const regla = Comisiones.reglaDe(pid);
+            const conValor = regla.tipo === 'monto' || regla.tipo === 'porcentaje';
+            return `
+                <tr data-producto="${Utils.esc(pid)}">
+                    <td>${Utils.esc(nombre)}</td>
+                    <td>
+                        <select class="form-control comision-tipo" ${cerrado ? 'disabled' : ''} aria-label="Comisión de ${Utils.esc(nombre)}">
+                            ${Comisiones.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.tipo ? 'selected' : ''}>${t.texto}</option>`).join('')}
+                        </select>
+                    </td>
+                    <td>
+                        <input type="text" class="form-control comision-valor" inputmode="decimal" ${conValor ? '' : 'hidden'} ${cerrado ? 'disabled' : ''}
+                            value="${conValor ? String(regla.valor).replace('.', ',') : ''}" placeholder="${regla.tipo === 'porcentaje' ? '%' : '$'}" aria-label="Valor de la comisión de ${Utils.esc(nombre)}">
+                    </td>
+                    <td class="comision-texto">${Comisiones.texto(regla, this.comisionPorUnidad)}</td>
+                </tr>`;
+        }).join('');
+        caja.hidden = false;
+        caja.innerHTML = `
+            <details ${abierto ? 'open' : ''}>
+                <summary>Comisión por producto <span class="th-hint">${propias ? `${propias} producto(s) con comisión propia` : 'todos usan la general'}</span></summary>
+                <p class="dia-operativo-hint">Cada producto puede usar la comisión general, no llevar comisión, llevar un monto fijo por unidad o un porcentaje de la cantidad (la sandía por kilo: 500 kg al 10 % paga la comisión general de 50 bultos). Queda guardado en el producto para los próximos días.</p>
+                <div class="table-container">
+                    <table class="data-table precios-comisiones-tabla">
+                        <thead><tr><th>Producto</th><th>Comisión</th><th>Valor</th><th>Se cobra</th></tr></thead>
+                        <tbody>${filas}</tbody>
+                    </table>
+                </div>
+            </details>`;
+        if (cerrado) return;
+        caja.querySelectorAll('tr[data-producto]').forEach(tr => {
+            const pid = tr.dataset.producto;
+            const select = tr.querySelector('.comision-tipo');
+            const input = tr.querySelector('.comision-valor');
+            select.addEventListener('change', () => {
+                const conValor = select.value === 'monto' || select.value === 'porcentaje';
+                input.hidden = !conValor;
+                input.placeholder = select.value === 'porcentaje' ? '%' : '$';
+                if (conValor) {
+                    input.value = '';
+                    input.focus();
+                    return;
+                }
+                this.cambiarReglaProducto(pid, select.value, '');
+            });
+            const guardarValor = () => {
+                if (select.value !== 'monto' && select.value !== 'porcentaje') return;
+                const valor = select.value === 'porcentaje' ? Comisiones.porcentaje(input.value) : (Utils.parsePrice(input.value) || 0);
+                if (!(valor > 0)) return;
+                const regla = Comisiones.reglaDe(pid);
+                if (regla.tipo === select.value && regla.valor === valor) return;
+                this.cambiarReglaProducto(pid, select.value, valor);
+            };
+            input.addEventListener('change', guardarValor);
+            input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
+        });
+    },
+
+    async cambiarReglaProducto(productoId, tipo, valor) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        if (!producto) {
+            Utils.showError('No se encontró el producto. Recargá la página.');
+            return;
+        }
+        const antes = { comision_tipo: producto.comision_tipo, comision_valor: producto.comision_valor };
+        producto.comision_tipo = tipo;
+        producto.comision_valor = valor;
+        CacheManager.set('productos', AppState.productos);
+        this.aplicarReglaProducto(productoId);
+        try {
+            await API.updateProducto(productoId, { comision_tipo: tipo, comision_valor: valor });
+            CacheManager.set('productos', AppState.productos);
+        } catch (error) {
+            Object.assign(producto, antes);
+            CacheManager.set('productos', AppState.productos);
+            this.aplicarReglaProducto(productoId);
+            Utils.showError(`No se pudo guardar la comisión de ${producto.nombre}: ${error.message}`);
+        }
+    },
+
+    // Aplica la regla de comisión de un producto a sus líneas del día que se está trabajando (si
+    // está abierto). Solo cambia la comisión: los precios quedan como están.
+    async aplicarReglaProducto(productoId) {
+        const fecha = AppState.currentDate;
+        if (!fecha || DiaOperativo.diaCerrado(fecha)) return;
+        let lineas = (AppState.precios || []).filter(p => !p.fecha || Utils.fechaIso(p.fecha) === fecha);
+        const enPantalla = lineas.length > 0;
+        if (!enPantalla) {
+            try {
+                lineas = await API.getPreciosCliente(fecha) || [];
+            } catch (error) {
+                return; // se aplica en el próximo "Armar lista"
+            }
+            const general = this._lineaGeneral(lineas.filter(p => String(p.producto_id) !== String(productoId)));
+            if (general) this.comisionPorUnidad = Utils.parsePrice(general.comision_unitaria);
+        }
+        const delProducto = lineas.filter(p => String(p.producto_id) === String(productoId));
+        if (!delProducto.length) return;
+        const items = delProducto.map(p => {
+            const com = Comisiones.deLinea(productoId, p.precio_cliente, this.comisionPorUnidad);
+            p.comision_unitaria = com.comision_unitaria;
+            p.comision_pct = com.comision_pct;
+            return {
+                cliente_id: p.cliente_id,
+                producto_id: p.producto_id,
+                cantidad: p.cantidad || 0,
+                precio_cliente: Utils.parsePrice(p.precio_cliente) || 0,
+                ...com,
+                solo_comision: true
+            };
+        });
+        if (enPantalla) {
+            CacheManager.set(`precios:${fecha}`, AppState.precios);
+            this.sincronizarCobranza();
+            if (AppState.currentPage === 'precios') this.render();
+        }
+        Utils.enSegundoPlano(async () => {
+            await API.savePreciosCliente({ fecha, comision_por_unidad: this.comisionPorUnidad, items });
+            CacheManager.invalidate(`precios:${fecha}`);
+            if (enPantalla) CacheManager.set(`precios:${fecha}`, AppState.precios);
+            Utils.avisar('Comisión del producto aplicada a los precios del día');
+        }, (error) => {
+            // Si otra persona ya cerró el día, lo cobrado no se toca: no hay nada que avisar.
+            if (/ya está cerrado/.test(String(error && error.message))) return;
+            Utils.showError('No se pudo aplicar la comisión a los precios del día: ' + (error && error.message || 'revisá la conexión') + '. Tocá "Armar lista" para reintentar.');
+        });
+    },
+
+    _htmlComision(com) {
+        if (!(com.comision_unitaria > 0)) return '<span class="precio-comision-nada">—</span>';
+        const pct = com.comision_pct > 0 ? ` <span class="th-hint">${String(com.comision_pct).replace('.', ',')} % cant.</span>` : '';
+        return `${Utils.formatComision(com.comision_unitaria)}${pct}`;
+    },
+
+    _htmlTotales(totalProductos, totalGanancia, comision, saldoTotal) {
+        return `
                 <tr style="background-color: #f8f9fa; font-weight: bold;">
                     <td colspan="3" style="text-align: right;">TOTAL PRODUCTOS:</td>
+                    <td></td>
                     <td></td>
                     <td></td>
                     <td style="color: ${totalGanancia >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}</td>
                     <td>${Utils.formatCurrency(totalProductos)}</td>
                 </tr>
                 <tr style="background-color: #fff3cd; font-weight: bold;">
-                    <td colspan="3" style="text-align: right;">COMISIÓN (${totalCantidad} × ${Utils.formatCurrency(this.comisionPorUnidad)}):</td>
+                    <td colspan="3" style="text-align: right;">COMISIÓN DE REPARTO:</td>
                     <td></td>
-                    <td>${Utils.formatCurrency(this.comisionPorUnidad)}</td>
+                    <td></td>
+                    <td></td>
                     <td></td>
                     <td>${Utils.formatCurrency(comision)}</td>
                 </tr>
@@ -6663,11 +7019,10 @@ const Precios = {
                     <td></td>
                     <td></td>
                     <td></td>
+                    <td></td>
                     <td>${Utils.formatCurrency(saldoTotal)}</td>
                 </tr>
             `;
-            tfoot.hidden = false;
-        }
     },
 
     // Se cobra lo que llegó (no lo pedido): si llega más o menos, se reparte entre los clientes en
@@ -6689,6 +7044,9 @@ const Precios = {
         });
     },
 
+    // Al salir de un campo de precio NO se rearma la tabla: si se rearmaba, el campo siguiente que
+    // la persona acababa de tocar desaparecía y lo que escribía se perdía (pasaba con un precio sí y
+    // otro no). Solo se recalculan comisión, ganancia y totales.
     onPrecioChange() {
         document.querySelectorAll('.precio-cliente').forEach(input => {
             const id = input.getAttribute('data-id');
@@ -6701,7 +7059,7 @@ const Precios = {
             }
         });
         
-        this.render();
+        this.refrescarCalculo();
     },
 
     // Actualiza ganancia y totales sin rearmar los inputs.
@@ -6714,6 +7072,7 @@ const Precios = {
         let totalProductos = 0;
         let totalCantidad = 0;
         let totalGanancia = 0;
+        let totalComision = 0;
 
         tbody.querySelectorAll('tr').forEach(tr => {
             const input = tr.querySelector('.precio-cliente');
@@ -6732,20 +7091,22 @@ const Precios = {
             precio.precio_real = precioRealEditado ? precioRealLinea : 0;
             if (inputReal) inputReal.classList.toggle('precio-real-editado', precioRealEditado);
             const precioReal = precioRealEditado ? precioRealLinea : precioRealRecepcion;
-            const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
-            const precioUnitario = Utils.parsePrice(input.value) || 0;
-            const pareceAutomatico = precioRealRecepcion > 0 && extra > 0 && precioUnitario === precioRealRecepcion + extra;
-            const precioManual = pareceAutomatico ? 0 : precioUnitario;
+            const precioManual = Utils.parsePrice(input.value) || 0;
             const gananciaTotal = precioManual > 0 ? (precioManual - precioReal) * cantidad : 0;
             const total = cantidad * precioManual;
 
             totalProductos += total;
             totalGanancia += gananciaTotal;
             precio.precio_cliente = precioManual;
+            const com = this._comisionLinea(precio, precioManual);
+            precio.comision_unitaria = com.comision_unitaria;
+            precio.comision_pct = com.comision_pct;
+            totalComision += Math.round(cantidad * com.comision_unitaria);
 
             const celdas = tr.querySelectorAll('td');
-            const gananciaTd = celdas[5];
-            const totalTd = celdas[6];
+            if (celdas[5]) celdas[5].innerHTML = this._htmlComision(com);
+            const gananciaTd = celdas[6];
+            const totalTd = celdas[7];
             if (gananciaTd) {
                 gananciaTd.style.color = gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)';
                 gananciaTd.style.fontWeight = '600';
@@ -6756,7 +7117,7 @@ const Precios = {
             }
         });
 
-        const comision = totalCantidad * this.comisionPorUnidad;
+        const comision = totalComision;
         const saldoTotal = totalProductos + comision;
         const resumenDiv = document.getElementById('precios-resumen-cliente');
         if (resumenDiv && resumenDiv.style.display !== 'none') {
@@ -6775,41 +7136,13 @@ const Precios = {
         }
 
         if (tfoot && !tfoot.hidden) {
-            tfoot.innerHTML = `
-                <tr style="background-color: #f8f9fa; font-weight: bold;">
-                    <td colspan="3" style="text-align: right;">TOTAL PRODUCTOS:</td>
-                    <td></td>
-                    <td></td>
-                    <td style="color: ${totalGanancia >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}</td>
-                    <td>${Utils.formatCurrency(totalProductos)}</td>
-                </tr>
-                <tr style="background-color: #fff3cd; font-weight: bold;">
-                    <td colspan="3" style="text-align: right;">COMISIÓN (${totalCantidad} × ${Utils.formatCurrency(this.comisionPorUnidad)}):</td>
-                    <td></td>
-                    <td>${Utils.formatCurrency(this.comisionPorUnidad)}</td>
-                    <td></td>
-                    <td>${Utils.formatCurrency(comision)}</td>
-                </tr>
-                <tr style="background-color: #d4edda; font-weight: bold; font-size: 16px;">
-                    <td colspan="3" style="text-align: right;">SALDO TOTAL:</td>
-                    <td></td>
-                    <td></td>
-                    <td></td>
-                    <td>${Utils.formatCurrency(saldoTotal)}</td>
-                </tr>
-            `;
+            tfoot.innerHTML = this._htmlTotales(totalProductos, totalGanancia, comision, saldoTotal);
         }
     },
     
     async armarLista(opciones = {}) {
         const silencioso = !!opciones.silencioso;
-        const guardada = (AppState.precios || []).find(p => Utils.parsePrice(p.comision_unitaria) > 0);
-        if (guardada) {
-            this.comisionPorUnidad = Utils.parsePrice(guardada.comision_unitaria);
-        } else {
-            const savedComision = localStorage.getItem('precios-comision');
-            if (savedComision) this.comisionPorUnidad = Utils.parsePrice(savedComision) || this.comisionPorUnidad;
-        }
+        this._sincronizarComision();
 
         const [recepciones, pedidos] = await Promise.all([
             API.getRecepcion(AppState.currentDate),
@@ -6868,18 +7201,13 @@ const Precios = {
                 );
                 const existente = existentes.find(p => Utils.parsePrice(p.precio_cliente) > 0) || existentes[0];
                 if (linea.cantidad <= 0 && !existente) return;
-                const precioReal = Utils.parsePrice(recepcion.precio_real) || 0;
-                const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
-                let precioCliente = Utils.parsePrice(existente?.precio_cliente) || 0;
-                if (precioReal > 0 && extra > 0 && precioCliente === precioReal + extra) {
-                    precioCliente = 0;
-                }
+                const precioCliente = Utils.parsePrice(existente?.precio_cliente) || 0;
                 preciosItems.push({
                     cliente_id: linea.cliente_id,
                     producto_id: linea.producto_id,
                     cantidad: linea.cantidad,
                     precio_cliente: precioCliente,
-                    comision_unitaria: this.comisionPorUnidad
+                    ...Comisiones.deLinea(linea.producto_id, precioCliente, this.comisionPorUnidad)
                 });
             });
         });
@@ -6894,7 +7222,7 @@ const Precios = {
                     producto_id: precio.producto_id,
                     cantidad: 0,
                     precio_cliente: Utils.parsePrice(precio.precio_cliente) || 0,
-                    comision_unitaria: this.comisionPorUnidad
+                    ...Comisiones.deLinea(precio.producto_id, precio.precio_cliente, this.comisionPorUnidad)
                 });
             });
         }
@@ -6948,7 +7276,7 @@ const Precios = {
                     producto_id: precioData.producto_id,
                     cantidad: precioData.cantidad || 0,
                     precio_cliente: precio,
-                    comision_unitaria: this.comisionPorUnidad,
+                    ...this._comisionLinea(precioData, precio),
                     // 0 = el de la recepción (se guarda vacío)
                     precio_real: Utils.parsePrice(precioData.precio_real) || 0
                 };
@@ -7019,7 +7347,7 @@ const Precios = {
             const cantidad = parseFloat(precio.cantidad) || 0;
             const unit = Utils.parsePrice(precio.precio_cliente) || 0;
             const comision = precio.comision_unitaria !== undefined && precio.comision_unitaria !== null && precio.comision_unitaria !== ''
-                ? Utils.parsePrice(precio.comision_unitaria)
+                ? Utils.parseComision(precio.comision_unitaria)
                 : comisionDefault;
             porCliente[cid].total += Math.round(cantidad * unit) + Math.round(cantidad * comision);
         });
@@ -7110,6 +7438,7 @@ const Precios = {
         const filas = [];
         let totalProductos = 0;
         let totalCantidad = 0;
+        let totalComision = 0;
         let clienteNombre = '';
 
         preciosFiltrados.forEach(precio => {
@@ -7118,9 +7447,11 @@ const Precios = {
                 ? preciosInputs[precio.id]
                 : Utils.parsePrice(precio.precio_cliente || 0);
             const total = cantidad * precioUnitario;
+            const comisionUnidad = this._comisionLinea(precio, precioUnitario).comision_unitaria;
 
             totalProductos += total;
             totalCantidad += cantidad;
+            totalComision += Math.round(cantidad * comisionUnidad);
             if (!clienteNombre && precio.cliente_nombre) {
                 clienteNombre = precio.cliente_nombre;
             }
@@ -7129,11 +7460,12 @@ const Precios = {
                 producto: precio.producto_nombre || '',
                 cantidad,
                 precioUnitario,
+                comision: comisionUnidad,
                 total
             });
         });
 
-        const comision = totalCantidad * this.comisionPorUnidad;
+        const comision = totalComision;
         const saldoTotal = totalProductos + comision;
 
         return {
@@ -7310,7 +7642,7 @@ const Precios = {
                 doc.addPage();
                 y = 20;
             }
-            const unitario = (parseFloat(fila.precioUnitario) || 0) + extra;
+            const unitario = (parseFloat(fila.precioUnitario) || 0) + (fila.comision !== undefined ? (parseFloat(fila.comision) || 0) : extra);
             const subtotal = unitario * (parseFloat(fila.cantidad) || 0);
             doc.text(String(fila.cantidad ?? ''), 14, y);
             doc.text(String(fila.producto || '').slice(0, 42), 32, y);
@@ -7414,7 +7746,7 @@ const Precios = {
 
             const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
             const filasHtml = datos.filas.map((f, i) => {
-                const unitario = (parseFloat(f.precioUnitario) || 0) + extra;
+                const unitario = (parseFloat(f.precioUnitario) || 0) + (f.comision !== undefined ? (parseFloat(f.comision) || 0) : extra);
                 const subtotal = unitario * (parseFloat(f.cantidad) || 0);
                 return `
                 <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
@@ -7653,7 +7985,7 @@ const CuentaCorriente = {
                 const cantidad = parseFloat(p.cantidad) || 0;
                 const precio = Utils.parsePrice(p.precio_cliente) || 0;
                 const total = Math.round(cantidad * precio);
-                comision += Math.round(cantidad * (Utils.parsePrice(p.comision_unitaria) || 0));
+                comision += Math.round(cantidad * (Utils.parseComision(p.comision_unitaria) || 0));
                 suma += total;
                 movs.push({ fecha, orden: 0, producto: p.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
             });
@@ -8259,8 +8591,8 @@ const Cierre = {
             
             // Validar que todo esté completo
             const resultadoCierre = await API.cerrarDia(fecha);
-            Utils.showSuccess('Día cerrado correctamente. Se está armando el reporte en PDF…');
-            Historial.generarReportePDF(fecha, { silencioso: true });
+            Utils.showSuccess('Día cerrado correctamente. Se está armando el reporte en PDF y guardando en Google Drive…');
+            Historial.generarReportePDF(fecha, { silencioso: true, drive: true });
             const faltantesStock = (resultadoCierre && resultadoCierre.faltantes_stock) || [];
             if (faltantesStock.length) {
                 await Utils.showWarning('Se vendió más de lo que había cargado en stock: '
@@ -8275,6 +8607,8 @@ const Cierre = {
         } catch (error) {
             // Si se cortó la conexión no se sabe si el servidor llegó a cerrar: se le pregunta.
             if (API._esCorteDeConexion(error) && await this._quedoCerrado(AppState.currentDate)) {
+                // Lo cerró esta misma acción: el reporte se arma igual.
+                Historial.generarReportePDF(AppState.currentDate, { silencioso: true, drive: true });
                 error = new Error('ya está cerrado');
             }
             if (String(error.message || '').includes('ya está cerrado')) {
@@ -9444,7 +9778,7 @@ const CobranzasHoy = {
             if (!id) return;
             const cantidad = parseFloat(precio.cantidad) || 0;
             const unit = Utils.parsePrice(precio.precio_cliente);
-            const comision = Utils.parsePrice(precio.comision_unitaria);
+            const comision = Utils.parseComision(precio.comision_unitaria);
             const subtotal = Math.round(cantidad * unit) + Math.round(cantidad * comision);
             if (!grupos.has(id)) {
                 grupos.set(id, {
@@ -10836,6 +11170,7 @@ const Historial = {
     async load() {
         const tbody = document.getElementById('historial-tbody');
         if (!tbody) return;
+        this.cargarDrive();
         
         const cached = CacheManager.peek('historial');
         if (Array.isArray(cached)) {
@@ -10877,6 +11212,11 @@ const Historial = {
                 <td>
                     <button class="btn btn-primary btn-table-action" onclick="Historial.verDia('${cierre.fecha}')">Ver día</button>
                     <button class="btn btn-secondary btn-table-action" onclick="Historial.generarReportePDF('${Utils.fechaIso(cierre.fecha)}')">Descargar PDF</button>
+                    ${cierre.pdf_drive
+                        ? `<a class="btn btn-secondary btn-table-action" href="${Utils.esc(cierre.pdf_drive)}" target="_blank" rel="noopener">Ver en Drive</a>`
+                        : (String(cierre.estado || 'cerrado') === 'cerrado'
+                            ? `<button class="btn btn-secondary btn-table-action" onclick="Historial.guardarEnDrive('${Utils.fechaIso(cierre.fecha)}')">Guardar en Drive</button>`
+                            : '')}
                 </td>
             `;
             tbody.appendChild(tr);
@@ -10908,7 +11248,7 @@ const Historial = {
             const filasPrecios = (precios || []).map(p => {
                 const cantidad = parseFloat(p.cantidad) || 0;
                 const unit = Utils.parsePrice(p.precio_cliente) || 0;
-                const comision = Utils.parsePrice(p.comision_unitaria) || 0;
+                const comision = Utils.parseComision(p.comision_unitaria) || 0;
                 const total = Math.round(cantidad * unit) + Math.round(cantidad * comision);
                 return `<tr><td>${Utils.esc(p.cliente_nombre || '')}</td><td>${Utils.esc(p.producto_nombre || '')}</td><td class="money">${cantidad}</td><td class="money">${Utils.formatCurrency(unit)}</td><td class="money">${Utils.formatCurrency(total)}</td></tr>`;
             }).join('') || '<tr><td colspan="5">Sin precios</td></tr>';
@@ -10942,12 +11282,15 @@ const Historial = {
     },
 
     // Reporte del cierre en PDF (mismo diseño que los demás PDF de la app): ventas por cliente,
-    // lo que llegó, cobros, proveedores y caja de ese día. Se baja solo al cerrar el día y desde el
-    // historial. Los datos se piden al servidor en el momento.
+    // lo que llegó, cobros, proveedores y caja de ese día. Al cerrar el día se baja y además se guarda
+    // en Google Drive; desde el historial se puede bajar o guardar en Drive. Los datos se piden al
+    // servidor en el momento.
     async generarReportePDF(fecha, opciones = {}) {
         const dia = Utils.fechaIso(fecha);
         if (!dia) return;
+        const descargar = opciones.descargar !== false;
         if (!opciones.silencioso) Utils.showLoader();
+        let doc = null;
         try {
             const [pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores] = await Promise.all([
                 API.request('pedidos', 'GET', { fecha: dia }),
@@ -10958,14 +11301,130 @@ const Historial = {
                 API.request('caja', 'GET'),
                 API.request('proveedores', 'GET')
             ]);
-            const doc = await Precios._pdfDesdeHtml(this._htmlReporte(dia, { pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores }));
-            doc.save(`cierre-${dia}.pdf`);
-            if (!opciones.silencioso) Utils.avisar('Se descargó el reporte del día en PDF.');
+            doc = await Precios._pdfDesdeHtml(this._htmlReporte(dia, { pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores }));
+            if (descargar) doc.save(`cierre-${dia}.pdf`);
+            if (descargar && !opciones.silencioso && !opciones.drive) Utils.avisar('Se descargó el reporte del día en PDF.');
         } catch (error) {
             console.error('Error generando reporte:', error);
             Utils.showError('No se pudo armar el reporte del día: ' + error.message + '. Podés bajarlo después desde Historial de días.');
+            if (!opciones.silencioso) Utils.hideLoader();
+            return;
+        }
+        if (!opciones.drive) {
+            if (!opciones.silencioso) Utils.hideLoader();
+            return;
+        }
+        try {
+            const pdf = doc.output('datauristring').split(',')[1];
+            const guardado = await API.subirPdfCierre(dia, pdf);
+            this._marcarEnDrive(dia, guardado && guardado.url);
+            Utils.avisar(`El reporte del ${Utils.formatDate(dia)} quedó guardado en Google Drive.`);
+        } catch (error) {
+            console.error('Error guardando el reporte en Drive:', error);
+            Utils.showError(`No se pudo guardar el reporte del ${Utils.formatDate(dia)} en Google Drive: ${error.message}`
+                + (descargar ? ' El PDF igual se descargó en la computadora.' : '')
+                + ' Podés volver a intentarlo desde Historial de días con "Guardar en Drive".');
         } finally {
             if (!opciones.silencioso) Utils.hideLoader();
+        }
+    },
+
+    guardarEnDrive(fecha) {
+        return this.generarReportePDF(fecha, { descargar: false, drive: true });
+    },
+
+    _marcarEnDrive(dia, url) {
+        if (!url) return;
+        (AppState.cierres || []).forEach(c => {
+            if (Utils.fechaIso(c.fecha) === dia) c.pdf_drive = url;
+        });
+        CacheManager.invalidate('historial');
+        if (AppState.currentPage === 'historial') {
+            this.render(AppState.cierres || []);
+            this.cargarDrive();
+        }
+    },
+
+    // Carpeta de Drive con los reportes y con quién está compartida.
+    async cargarDrive() {
+        const caja = document.getElementById('historial-drive');
+        if (!caja) return;
+        try {
+            this._drive = await API.getDriveConfig();
+        } catch (error) {
+            caja.innerHTML = `<p class="historial-drive-texto">Los reportes de cierre se guardan en Google Drive. ${Utils.esc(error.message)}</p>`;
+            return;
+        }
+        this._pintarDrive();
+    },
+
+    _pintarDrive() {
+        const caja = document.getElementById('historial-drive');
+        if (!caja) return;
+        const drive = this._drive || {};
+        const emails = drive.compartida_con || [];
+        const lista = emails.length
+            ? emails.map(email => `<li><span>${Utils.esc(email)}</span> <button type="button" class="btn btn-secondary btn-sm" data-quitar-drive="${Utils.esc(email)}">Quitar</button></li>`).join('')
+            : '<li class="historial-drive-vacio">Todavía no está compartida con nadie.</li>';
+        caja.innerHTML = `
+            <div class="historial-drive-head">
+                <div>
+                    <h3>Reportes en Google Drive</h3>
+                    <p class="historial-drive-texto">Cada vez que se cierra un día, el reporte en PDF se guarda solo en una carpeta de Google Drive, ordenada por año y mes.</p>
+                </div>
+                ${drive.carpeta_url
+                    ? `<a class="btn btn-primary" href="${Utils.esc(drive.carpeta_url)}" target="_blank" rel="noopener">Abrir carpeta</a>`
+                    : '<span class="historial-drive-texto">La carpeta se crea con el primer cierre.</span>'}
+            </div>
+            <div class="historial-drive-compartir">
+                <label for="historial-drive-email">Compartir la carpeta con (Gmail):</label>
+                <div class="historial-drive-fila">
+                    <input type="email" id="historial-drive-email" class="form-control" placeholder="nombre@gmail.com" autocomplete="off">
+                    <button type="button" class="btn btn-secondary" id="btn-historial-drive-compartir">Compartir</button>
+                </div>
+                <ul class="historial-drive-lista">${lista}</ul>
+            </div>
+        `;
+        caja.querySelector('#btn-historial-drive-compartir').addEventListener('click', () => this.compartirDrive());
+        caja.querySelector('#historial-drive-email').addEventListener('keydown', e => {
+            if (e.key === 'Enter') this.compartirDrive();
+        });
+        caja.querySelectorAll('[data-quitar-drive]').forEach(boton => {
+            boton.addEventListener('click', () => this.quitarAccesoDrive(boton.dataset.quitarDrive));
+        });
+    },
+
+    async compartirDrive() {
+        const input = document.getElementById('historial-drive-email');
+        const email = String(input?.value || '').trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            Utils.showError('Escribí un email válido, por ejemplo nombre@gmail.com');
+            return;
+        }
+        Utils.showLoader();
+        try {
+            this._drive = await API.compartirDrive(email);
+            this._pintarDrive();
+            Utils.avisar(`Listo: ${email} ya puede ver la carpeta (Google le manda un email con el link).`);
+        } catch (error) {
+            Utils.showError('No se pudo compartir la carpeta: ' + error.message);
+        } finally {
+            Utils.hideLoader();
+        }
+    },
+
+    async quitarAccesoDrive(email) {
+        const confirmar = await Utils.showConfirm(`¿Sacarle a ${email} el acceso a la carpeta de reportes?`);
+        if (!confirmar) return;
+        Utils.showLoader();
+        try {
+            this._drive = await API.quitarAccesoDrive(email);
+            this._pintarDrive();
+            Utils.avisar(`${email} ya no tiene acceso a la carpeta.`);
+        } catch (error) {
+            Utils.showError('No se pudo quitar el acceso: ' + error.message);
+        } finally {
+            Utils.hideLoader();
         }
     },
 
@@ -10985,7 +11444,7 @@ const Historial = {
             const cantidad = parseFloat(p.cantidad) || 0;
             const precio = Utils.parsePrice(p.precio_cliente) || 0;
             c.lineas.push({ producto: p.producto_nombre || 'Producto', cantidad, precio, total: Math.round(cantidad * precio) });
-            c.comision += Math.round(cantidad * (Utils.parsePrice(p.comision_unitaria) || 0));
+            c.comision += Math.round(cantidad * (Utils.parseComision(p.comision_unitaria) || 0));
             c.cantidad += cantidad;
         });
         const cobranzaDe = id => (datos.cobranzas || []).find(c => String(c.cliente_id) === String(id)) || {};
@@ -11239,7 +11698,7 @@ const Reparto = {
             if (!id || cubiertos.has(id)) return;
             const cantidad = parseFloat(precio.cantidad) || 0;
             const unit = Utils.parsePrice(precio.precio_cliente);
-            const comision = Utils.parsePrice(precio.comision_unitaria);
+            const comision = Utils.parseComision(precio.comision_unitaria);
             const subtotal = Math.round(cantidad * unit) + Math.round(cantidad * comision);
             if (subtotal <= 0) return;
             map.set(id, (map.get(id) || 0) + subtotal);

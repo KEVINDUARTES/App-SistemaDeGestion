@@ -582,7 +582,27 @@ function handleRequest(e, method) {
       case 'historial':
         result = getHistorial();
         break;
-      
+
+      // Reportes de cierre en Google Drive
+      case 'drive/cierre':
+        if (actualMethod !== 'POST') throw new Error('Método no permitido');
+        result = guardarPdfCierreEnDrive(data);
+        break;
+
+      case 'drive/config':
+        result = getDriveConfig();
+        break;
+
+      case 'drive/compartir':
+        if (actualMethod !== 'POST') throw new Error('Método no permitido');
+        result = compartirCarpetaCierres(data.email);
+        break;
+
+      case 'drive/quitar':
+        if (actualMethod !== 'POST') throw new Error('Método no permitido');
+        result = quitarAccesoCarpetaCierres(data.email);
+        break;
+
       // Notificaciones
       case 'notificaciones/verificar-stock':
         result = verificarStockBajo();
@@ -630,11 +650,8 @@ function handleRequest(e, method) {
         method: actualMethod || method
       };
       
-      // Asegurar que siempre hay un callback para JSONP
-      const safeCallback = callback || 'console.log';
-      Logger.log('📤 [ERROR] Enviando respuesta de error con callback: ' + safeCallback);
-      
-      return createResponse(errorResponse, 500, safeCallback);
+      // Con callback va como JSONP; sin callback (el PDF del cierre, que llega por POST) va como JSON.
+      return createResponse(errorResponse, 500, callback);
     } catch (responseError) {
       // Si incluso crear la respuesta falla, intentar respuesta básica
       Logger.log('❌ [ERROR CRÍTICO] Error creando respuesta de error: ' + responseError.toString());
@@ -1034,11 +1051,11 @@ function initializeSheet(sheet, sheetName) {
   const headers = {
     'Clientes': ['id', 'nombre', 'telefono', 'activo'],
     'Proveedores': ['id', 'nombre', 'rubro', 'telefono', 'activo'],
-    'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default'],
+    'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default', 'comision_tipo', 'comision_valor'],
     'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado', 'proveedor_id'],
     'Camiones': ['id', 'fecha', 'nombre', 'orden', 'clientes'],
     'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
-    'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria'],
+    'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria', 'precio_real', 'comision_pct'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
     'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos'],
     'PagosProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'metodo', 'nota'],
@@ -1147,8 +1164,19 @@ function ensureColumn(sheet, columnName) {
 function totalPrecioClienteLinea(precio) {
   var cantidad = parseFloat(precio.cantidad) || 0;
   var unit = normalizeAmount(precio.precio_cliente);
-  var comision = normalizeAmount(precio.comision_unitaria);
+  var comision = normalizeComision_(precio.comision_unitaria);
   return Math.round(cantidad * unit) + Math.round(cantidad * comision);
+}
+
+/**
+ * Comisión por unidad: puede tener centavos (la de porcentaje: 5 % de $350 = $17,50 por kilo).
+ * Se redondea recién el total de la línea; si se redondeara por unidad, en 500 kg se cobraría de más.
+ */
+function normalizeComision_(value) {
+  if (typeof value === 'number') return isFinite(value) ? Math.round(value * 100) / 100 : 0;
+  var raw = String(value === undefined || value === null ? '' : value).trim();
+  if (/^\d+([.,]\d{1,2})?$/.test(raw)) return Math.round(parseFloat(raw.replace(',', '.')) * 100) / 100;
+  return normalizeAmount(value);
 }
 
 /**
@@ -1874,15 +1902,22 @@ function createProducto(data) {
   }
 
   const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
+  ensureColumn(sheet, 'comision_tipo');
+  ensureColumn(sheet, 'comision_valor');
   const id = generateId();
-  
-  const newRow = [
-    id,
-    nombre,
-    data.tipo,
-    limpiarTexto_(data.unidad),
-    data.proveedor_default || ''
-  ];
+  const comision = comisionProducto_(data);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const valores = {
+    id: id,
+    nombre: nombre,
+    tipo: data.tipo,
+    unidad: limpiarTexto_(data.unidad),
+    proveedor_default: data.proveedor_default || '',
+    comision_tipo: comision.tipo,
+    comision_valor: comision.valor
+  };
+  const newRow = headers.map(function(h) { return valores[h] !== undefined ? valores[h] : ''; });
   
   sheet.appendRow(newRow);
   invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
@@ -1893,7 +1928,35 @@ function createProducto(data) {
   invalidateSheetCache(CONFIG.SHEETS.STOCK_BEBIDAS);
   invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
   
-  return { id: id, nombre: nombre, tipo: data.tipo, unidad: data.unidad || '', proveedor_default: data.proveedor_default || '' };
+  return { id: id, nombre: nombre, tipo: data.tipo, unidad: data.unidad || '', proveedor_default: data.proveedor_default || '',
+    comision_tipo: comision.tipo, comision_valor: comision.valor };
+}
+
+// Comisión de reparto de cada producto:
+//   ''/'general' → la comisión general del día (la de la pantalla de precios)
+//   'ninguna'    → no lleva
+//   'monto'      → monto fijo por unidad
+//   'porcentaje' → porcentaje de la cantidad, con la comisión general del día (la sandía va por kilo:
+//                  de 500 kg al 10 % se cobra comisión por 50 bultos)
+var TIPOS_COMISION_ = ['', 'general', 'ninguna', 'monto', 'porcentaje'];
+
+function porcentajeComision_(valor) {
+  var n = parseFloat(String(valor === undefined || valor === null ? '' : valor).replace(',', '.'));
+  if (!isFinite(n) || n <= 0) return 0;
+  return Math.min(Math.round(n * 100) / 100, 100);
+}
+
+function comisionProducto_(data) {
+  var tipo = String(data.comision_tipo === undefined || data.comision_tipo === null ? '' : data.comision_tipo).trim().toLowerCase();
+  if (TIPOS_COMISION_.indexOf(tipo) === -1) throw new Error('Tipo de comisión inválido: ' + tipo);
+  if (tipo === 'general') tipo = '';
+  var valor = '';
+  if (tipo === 'monto') valor = normalizeAmount(data.comision_valor);
+  if (tipo === 'porcentaje') valor = porcentajeComision_(data.comision_valor);
+  if ((tipo === 'monto' || tipo === 'porcentaje') && !(valor > 0)) {
+    throw new Error('Poné cuánto es la comisión del producto (un número mayor a cero)');
+  }
+  return { tipo: tipo, valor: valor };
 }
 
 /**
@@ -1907,14 +1970,34 @@ function updateProducto(data) {
   const idIdx = values[0] ? values[0].indexOf('id') : 0;
   const colId = idIdx === -1 ? 0 : idIdx;
   
+  // Solo se escriben los campos que vienen: cambiar la comisión no tiene que pisar el nombre o el
+  // proveedor que otra persona acaba de cambiar.
+  var traeComision = data.comision_tipo !== undefined;
+  if (traeComision) {
+    ensureColumn(sheet, 'comision_tipo');
+    ensureColumn(sheet, 'comision_valor');
+  }
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var col = function(nombre, porDefecto) {
+    var idx = headers.indexOf(nombre);
+    return (idx === -1 ? porDefecto : idx) + 1;
+  };
+
   for (let i = 1; i < values.length; i++) {
     if (idsMatch(values[i][colId], data.id)) {
-      var nombreProducto = limpiarTexto_(data.nombre);
-      if (!nombreProducto) throw new Error('El nombre del producto es requerido');
-      sheet.getRange(i + 1, 2).setValue(nombreProducto);
-      sheet.getRange(i + 1, 3).setValue(data.tipo);
-      sheet.getRange(i + 1, 4).setValue(limpiarTexto_(data.unidad));
-      sheet.getRange(i + 1, 5).setValue(data.proveedor_default || '');
+      if (data.nombre !== undefined) {
+        var nombreProducto = limpiarTexto_(data.nombre);
+        if (!nombreProducto) throw new Error('El nombre del producto es requerido');
+        sheet.getRange(i + 1, col('nombre', 1)).setValue(nombreProducto);
+      }
+      if (data.tipo !== undefined) sheet.getRange(i + 1, col('tipo', 2)).setValue(data.tipo);
+      if (data.unidad !== undefined) sheet.getRange(i + 1, col('unidad', 3)).setValue(limpiarTexto_(data.unidad));
+      if (data.proveedor_default !== undefined) sheet.getRange(i + 1, col('proveedor_default', 4)).setValue(data.proveedor_default || '');
+      if (traeComision) {
+        var comision = comisionProducto_(data);
+        sheet.getRange(i + 1, col('comision_tipo', 5)).setValue(comision.tipo);
+        sheet.getRange(i + 1, col('comision_valor', 6)).setValue(comision.valor);
+      }
       invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
       invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
       return { success: true };
@@ -2674,7 +2757,9 @@ function getPreciosCliente(fecha = null) {
 
     if (precio.fecha) precio.fecha = normalizeFecha(precio.fecha);
     precio.precio_cliente = normalizeAmount(precio.precio_cliente);
-    precio.comision_unitaria = normalizeAmount(precio.comision_unitaria);
+    precio.comision_unitaria = normalizeComision_(precio.comision_unitaria);
+    // Si la comisión de la línea es un porcentaje de la cantidad (0 = no).
+    precio.comision_pct = porcentajeComision_(precio.comision_pct);
     // Precio real cambiado a mano en esa línea (solo para la ganancia). 0 = el de la recepción.
     precio.precio_real = normalizeAmount(precio.precio_real);
 
@@ -2697,6 +2782,7 @@ function savePreciosCliente(data) {
   const sheet = getSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
   ensureColumn(sheet, 'comision_unitaria');
   ensureColumn(sheet, 'precio_real');
+  ensureColumn(sheet, 'comision_pct');
   
   // Normalizar fecha una sola vez
   const fechaNormalizada = normalizeFecha(data.fecha);
@@ -2713,6 +2799,7 @@ function savePreciosCliente(data) {
   const precioIdx = headers.indexOf('precio_cliente') !== -1 ? headers.indexOf('precio_cliente') : 5;
   const comisionIdx = headers.indexOf('comision_unitaria');
   const precioRealIdx = headers.indexOf('precio_real');
+  const pctIdx = headers.indexOf('comision_pct');
   const preciosIndex = {};
   
   for (let i = 1; i < values.length; i++) {
@@ -2731,18 +2818,24 @@ function savePreciosCliente(data) {
     // cargado otra persona después de que esta pantalla lo leyó.
     var soloComision = item.solo_comision === true || item.solo_comision === 'true';
     var precioCliente = normalizeAmount(item.precio_cliente);
-    var comision = item.comision_unitaria !== undefined && item.comision_unitaria !== null && item.comision_unitaria !== ''
-      ? normalizeAmount(item.comision_unitaria)
-      : comisionDia;
+    var traeComision = item.comision_unitaria !== undefined && item.comision_unitaria !== null && item.comision_unitaria !== '';
+    var comision = traeComision ? normalizeComision_(item.comision_unitaria) : comisionDia;
 
     // El precio real de la línea solo se toca si viene: armar la lista no lo manda y no lo borra.
     var traePrecioReal = item.precio_real !== undefined && item.precio_real !== null;
     var precioRealLinea = traePrecioReal && normalizeAmount(item.precio_real) > 0 ? normalizeAmount(item.precio_real) : '';
 
+    // Comisión en porcentaje de la cantidad (por ejemplo la sandía: de 500 kg se cobra comisión por
+    // 50 bultos): cada unidad paga ese porcentaje de la comisión general del día.
+    var traePct = item.comision_pct !== undefined && item.comision_pct !== null;
+    var pct = traePct ? porcentajeComision_(item.comision_pct) : 0;
+    if (pct > 0 && !traeComision) comision = Math.round(comisionDia * pct) / 100;
+
     if (rowIdx !== undefined) {
       if (!soloComision) values[rowIdx][precioIdx] = precioCliente;
       if (cantidadIdx !== -1 && item.cantidad !== undefined && !soloComision) values[rowIdx][cantidadIdx] = item.cantidad || 0;
       if (comisionIdx !== -1) values[rowIdx][comisionIdx] = comision;
+      if (pctIdx !== -1 && traePct) values[rowIdx][pctIdx] = pct || '';
       if (precioRealIdx !== -1 && traePrecioReal) values[rowIdx][precioRealIdx] = precioRealLinea;
     } else {
       var newRow = [];
@@ -2756,6 +2849,7 @@ function savePreciosCliente(data) {
       newRow[cantidadIdx] = item.cantidad || 0;
       newRow[precioIdx] = precioCliente;
       if (comisionIdx !== -1) newRow[comisionIdx] = comision;
+      if (pctIdx !== -1) newRow[pctIdx] = pct || '';
       if (precioRealIdx !== -1 && traePrecioReal) newRow[precioRealIdx] = precioRealLinea;
       rowsToAppend.push(newRow);
     }
@@ -4002,6 +4096,139 @@ function calcularEstadoDia(fecha, pedidos) {
 
 function getHistorial() {
   return getCierres();
+}
+
+// ========== REPORTES DE CIERRE EN GOOGLE DRIVE ==========
+// Al cerrar el día, la app arma el PDF del cierre y lo manda acá. Se guarda en el Drive de la cuenta
+// dueña del script, en una carpeta por planilla (los usuarios que comparten planilla comparten carpeta):
+//   Cierres - <nombre de la planilla> / 2026 / 10 - Octubre / Cierre 2026-10-23.pdf
+// La carpeta se comparte desde la app (Historial) con los emails que tengan que verla.
+
+var MESES_DRIVE_ = ['01 - Enero', '02 - Febrero', '03 - Marzo', '04 - Abril', '05 - Mayo', '06 - Junio',
+  '07 - Julio', '08 - Agosto', '09 - Septiembre', '10 - Octubre', '11 - Noviembre', '12 - Diciembre'];
+
+/** Corre algo de Drive y, si Google todavía no dio permiso, lo dice claro. */
+function conDrive_(fn) {
+  try {
+    return fn();
+  } catch (error) {
+    if (/permission|permiso|autoriz|authoriz/i.test(String(error && error.message))) {
+      throw new Error('Google Drive todavía no está autorizado. En el editor del script hay que ejecutar una vez la función "autorizarDrive".');
+    }
+    throw error;
+  }
+}
+
+/** Carpeta de cierres de la planilla actual. Sin "crear" devuelve null si todavía no existe. */
+function carpetaCierres_(crear) {
+  var props = PropertiesService.getScriptProperties();
+  var key = 'DRIVE_CIERRES_' + tenantClave_();
+  var id = props.getProperty(key);
+  if (id) {
+    try {
+      var carpeta = DriveApp.getFolderById(id);
+      if (!carpeta.isTrashed()) return carpeta;
+    } catch (error) {
+      // La borraron: se crea otra.
+    }
+  }
+  if (!crear) return null;
+  var nueva = DriveApp.createFolder('Cierres - ' + getSpreadsheet().getName());
+  props.setProperty(key, nueva.getId());
+  return nueva;
+}
+
+function subcarpeta_(padre, nombre) {
+  var existentes = padre.getFoldersByName(nombre);
+  return existentes.hasNext() ? existentes.next() : padre.createFolder(nombre);
+}
+
+/** Guarda el PDF de un día cerrado. Si ya había uno de ese día, lo reemplaza. */
+function guardarPdfCierreEnDrive(data) {
+  var fecha = normalizeFecha(data.fecha);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) throw new Error('Fecha inválida para el reporte del cierre');
+  var cierre = findCierreRow(fecha);
+  if (!cierre.row || cierre.estado !== 'cerrado') throw new Error('El día ' + fecha + ' todavía no está cerrado');
+
+  var contenido = String(data.pdf || '');
+  if (contenido.indexOf(',') !== -1) contenido = contenido.substring(contenido.indexOf(',') + 1);
+  var bytes = contenido ? Utilities.base64Decode(contenido) : [];
+  // Todo PDF empieza con "%PDF".
+  if (bytes.length < 5 || bytes[0] !== 37 || bytes[1] !== 80 || bytes[2] !== 68 || bytes[3] !== 70) {
+    throw new Error('El reporte que llegó no es un PDF');
+  }
+
+  return conDrive_(function() {
+    var partes = fecha.split('-');
+    var raiz = carpetaCierres_(true);
+    var carpeta = subcarpeta_(subcarpeta_(raiz, partes[0]), MESES_DRIVE_[Number(partes[1]) - 1]);
+    var nombre = 'Cierre ' + fecha + '.pdf';
+
+    var anteriores = [];
+    var mismos = carpeta.getFilesByName(nombre);
+    while (mismos.hasNext()) anteriores.push(mismos.next());
+    var archivo = carpeta.createFile(Utilities.newBlob(bytes, 'application/pdf', nombre));
+    anteriores.forEach(function(viejo) { viejo.setTrashed(true); });
+
+    ensureColumn(cierre.sheet, 'pdf_drive');
+    var headers = cierre.sheet.getRange(1, 1, 1, cierre.sheet.getLastColumn()).getValues()[0];
+    cierre.sheet.getRange(cierre.row, headers.indexOf('pdf_drive') + 1).setValue(archivo.getUrl());
+
+    return { fecha: fecha, nombre: nombre, url: archivo.getUrl(), carpeta_url: raiz.getUrl() };
+  });
+}
+
+function emailsConAcceso_(carpeta) {
+  var dueno = '';
+  try { dueno = String(carpeta.getOwner().getEmail() || '').toLowerCase(); } catch (error) { /* sin dueño visible */ }
+  return carpeta.getEditors()
+    .map(function(u) { return String(u.getEmail() || '').toLowerCase(); })
+    .filter(function(email) { return email && email !== dueno; });
+}
+
+/** Link de la carpeta y con quién está compartida (no crea nada). */
+function getDriveConfig() {
+  return conDrive_(function() {
+    var carpeta = carpetaCierres_(false);
+    if (!carpeta) return { carpeta_url: '', compartida_con: [] };
+    return { carpeta_url: carpeta.getUrl(), compartida_con: emailsConAcceso_(carpeta) };
+  });
+}
+
+function validarEmailDrive_(email) {
+  var limpio = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(limpio)) throw new Error('El email no es válido');
+  return limpio;
+}
+
+/** Da acceso de edición a la carpeta de cierres (Google le avisa por email a esa persona). */
+function compartirCarpetaCierres(email) {
+  var limpio = validarEmailDrive_(email);
+  return conDrive_(function() {
+    var carpeta = carpetaCierres_(true);
+    carpeta.addEditor(limpio);
+    return { carpeta_url: carpeta.getUrl(), compartida_con: emailsConAcceso_(carpeta) };
+  });
+}
+
+function quitarAccesoCarpetaCierres(email) {
+  var limpio = validarEmailDrive_(email);
+  return conDrive_(function() {
+    var carpeta = carpetaCierres_(false);
+    if (!carpeta) return { carpeta_url: '', compartida_con: [] };
+    carpeta.removeEditor(limpio);
+    return { carpeta_url: carpeta.getUrl(), compartida_con: emailsConAcceso_(carpeta) };
+  });
+}
+
+/**
+ * EJECUTAR UNA VEZ desde el editor después de pegar esta versión: Google pide permiso para usar
+ * Drive (donde se guardan los PDF de los cierres). Sin esto la app no puede guardar los reportes.
+ */
+function autorizarDrive() {
+  var raiz = DriveApp.getRootFolder();
+  Logger.log('✅ Drive autorizado. Los reportes de cierre se guardan en el Drive de: ' + Session.getEffectiveUser().getEmail()
+    + ' (carpeta "Cierres - …" dentro de ' + raiz.getName() + ')');
 }
 
 // ========== FUNCIONES DE PRUEBA ==========

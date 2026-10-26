@@ -44,7 +44,8 @@ const PrecioClienteService = {
         const lineasProductos = filas
             .map(f => {
                 const cantidad = parseFloat(f.cantidad) || 0;
-                const unitarioConComision = (parseFloat(f.precioUnitario) || 0) + extra;
+                const comisionLinea = f.comision !== undefined ? (parseFloat(f.comision) || 0) : extra;
+                const unitarioConComision = (parseFloat(f.precioUnitario) || 0) + comisionLinea;
                 const subtotal = unitarioConComision * cantidad;
                 return `• ${f.producto} x${cantidad} — ${this.formatCurrency(unitarioConComision)}/u = ${this.formatCurrency(subtotal)}`;
             })
