@@ -6670,10 +6670,12 @@ const Precios = {
         }
     },
 
+    // Se cobra lo que llegó (no lo pedido): si llega más o menos, se reparte entre los clientes en
+    // proporción a lo que pidió cada uno. Con un solo cliente, se le cobra todo lo que llegó.
     repartirRecibido(lineas, llego) {
         const total = lineas.reduce((sum, linea) => sum + linea.cantidadPedida, 0);
         if (total <= 0) return lineas.map(linea => ({ ...linea, cantidad: 0 }));
-        if (llego >= total) return lineas.map(linea => ({ ...linea, cantidad: linea.cantidadPedida }));
+        if (llego === total) return lineas.map(linea => ({ ...linea, cantidad: linea.cantidadPedida }));
 
         let usada = 0;
         return lineas.map((linea, index) => {
@@ -6854,7 +6856,7 @@ const Precios = {
             const lineas = Object.values(porCliente);
             const pedidoTotal = lineas.reduce((sum, linea) => sum + linea.cantidadPedida, 0);
             const llego = parseFloat(recepcion.llego) || 0;
-            if (llego < pedidoTotal) {
+            if (llego !== pedidoTotal) {
                 const nombre = lineas[0].producto_nombre || 'Producto';
                 avisosFaltante.push(`${nombre}: pedido ${pedidoTotal}, llegó ${llego}`);
             }
