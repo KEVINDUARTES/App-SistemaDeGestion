@@ -253,6 +253,8 @@ const DiaOperativo = {
     diaSinPedidos(fecha) {
         const info = this.getDiaInfo(fecha || this.workDate || AppState.currentDate);
         if (!info) return false;
+        // Un día cerrado siempre tuvo pedidos (no se puede cerrar sin): hay que ir a buscarlos.
+        if (info.estado === 'cerrado') return false;
         return !(Number(info.pedidos_count) > 0);
     },
 
@@ -264,6 +266,19 @@ const DiaOperativo = {
             select.addEventListener('change', async (e) => {
                 if (this._ignoreSelectChange) return;
                 await this.setWorkDate(e.target.value);
+            });
+        });
+        // Calendario (Pedidos del día): cualquier fecha, pasada o futura, haya pedidos o no.
+        document.querySelectorAll('.dia-operativo-fecha').forEach(input => {
+            if (input.dataset.bound === 'true') return;
+            input.dataset.bound = 'true';
+            input.addEventListener('change', async (e) => {
+                const fecha = e.target.value;
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                    e.target.value = this.workDate || this.today();
+                    return;
+                }
+                await this.setWorkDate(fecha);
             });
         });
         this._initialized = true;
@@ -340,6 +355,9 @@ const DiaOperativo = {
         this.workDate = fecha;
         AppState.currentDate = fecha;
         sessionStorage.setItem('sg_work_date', fecha);
+        // Una fecha elegida en el calendario puede no estar en la lista de días abiertos: si es un
+        // día ya cerrado, se marca como cerrado para que la pantalla no deje cargarle pedidos.
+        if (!this.getDiaInfo(fecha)) await this.marcarHoyCerrado();
         this.renderSelectors();
         this.renderEstadoPanels();
 
@@ -376,6 +394,15 @@ const DiaOperativo = {
             });
 
             select.value = current;
+        });
+        const actual = this.workDate || this.today();
+        const infoActual = this.getDiaInfo(actual);
+        document.querySelectorAll('.dia-operativo-fecha').forEach(input => {
+            if (document.activeElement !== input) input.value = actual;
+        });
+        document.querySelectorAll('.dia-operativo-fecha-texto').forEach(el => {
+            const pedidos = infoActual && infoActual.pedidos_count > 0 ? ` · ${infoActual.pedidos_count} pedidos` : '';
+            el.textContent = this.formatFechaLabel(actual) + pedidos;
         });
         setTimeout(() => { this._ignoreSelectChange = false; }, 0);
     },
@@ -568,6 +595,19 @@ const Utils = {
 
     // La comisión por unidad puede tener centavos (5 % de $350 = $17,50 por kilo). Se redondea
     // recién el total de la línea, igual que en el servidor.
+    // Cantidad que puede tener decimales (kilos): "12,5" o "12.5" → 12.5. Vacío o inválido → NaN.
+    parseCantidad(value) {
+        const texto = String(value ?? '').trim().replace(',', '.');
+        if (texto === '') return NaN;
+        const n = Number(texto);
+        return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN;
+    },
+
+    formatCantidad(n) {
+        const v = Number(n) || 0;
+        return String(Math.round(v * 100) / 100).replace('.', ',');
+    },
+
     parseComision(value) {
         if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
         const raw = String(value ?? '').trim();
@@ -3079,7 +3119,7 @@ const Productos = {
             
             rowsHtml += `
                 <tr>
-                    <td>${Utils.esc(producto.nombre || '')}</td>
+                    <td>${Utils.esc(producto.nombre || '')}${PlanillaPedidos.esPorKilo(producto) ? ' <span class="planilla-kg" title="Se vende por kilo">kg</span>' : ''}</td>
                     <td><span class="status-badge ${tipoBadgeClass}">${producto.tipo || ''}</span></td>
                     <td>${proveedor ? proveedor.nombre : 'Sin proveedor'}</td>
                     <td>${Comisiones.textoCorto(producto)}</td>
@@ -3298,6 +3338,503 @@ const Productos = {
             }
             Utils.showError('Error al eliminar producto: ' + error.message);
         }
+    }
+};
+
+// Planilla de pedidos: como el Excel que usan. Todos los productos de Configuración en filas
+// (verdura, fruta, bebida, mercadería), todos los clientes en columnas y solo se escriben cantidades.
+// Por detrás cada celda es un pedido común (cliente + producto + día), así camiones, recepción,
+// precios y el envío a proveedores siguen igual. Cada celda se guarda sola al salir de ella.
+const PlanillaPedidos = {
+    GRUPOS: [
+        { tipo: 'verdura', nombre: 'Verdura' },
+        { tipo: 'fruta', nombre: 'Fruta' },
+        { tipo: 'bebida', nombre: 'Bebida' },
+        { tipo: 'mercaderia', nombre: 'Mercadería' },
+        { tipo: 'otros', nombre: 'Otros' }
+    ],
+    vista: (() => { try { return localStorage.getItem('pedidos-vista') || 'planilla'; } catch (e) { return 'planilla'; } })(),
+    filtroTipo: 'todos',
+    soloPedidos: false,
+    texto: '',
+    _cola: Promise.resolve(),
+    _pendientes: 0,
+    _proveedorElegido: {},
+    _listo: false,
+
+    esPorKilo(producto) {
+        const v = producto && producto.por_kilo;
+        return v === true || v === 'true' || v === 'TRUE' || v === 1;
+    },
+
+    _tipoDe(producto) {
+        const t = String(producto?.tipo || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+        return ['verdura', 'fruta', 'bebida', 'mercaderia'].includes(t) ? t : 'otros';
+    },
+
+    _clientes() {
+        const conPedido = new Set((AppState.pedidos || []).map(p => String(p.cliente_id)));
+        return (AppState.clientes || [])
+            .filter(c => c.activo !== false && c.activo !== 'false' || conPedido.has(String(c.id)))
+            .slice()
+            .sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+    },
+
+    _pedidosDe(productoId, clienteId) {
+        return (AppState.pedidos || []).filter(p =>
+            String(p.producto_id) === String(productoId) &&
+            (clienteId === undefined || String(p.cliente_id) === String(clienteId)));
+    },
+
+    _cantidad(productoId, clienteId) {
+        return this._pedidosDe(productoId, clienteId).reduce((s, p) => s + (parseFloat(p.cantidad) || 0), 0);
+    },
+
+    // Proveedor de la fila: el de sus pedidos del día; si no tiene, el elegido en la fila o el habitual del producto.
+    _proveedorFila(producto) {
+        const ids = [...new Set(this._pedidosDe(producto.id).map(p => String(p.proveedor_id || producto.proveedor_default || '')))];
+        if (ids.length > 1) return { id: '', varios: true };
+        if (ids.length === 1) return { id: ids[0] || PedidoProveedorService.SIN_PROVEEDOR_ID, varios: false };
+        const elegido = this._proveedorElegido[String(producto.id)];
+        return { id: elegido || producto.proveedor_default || PedidoProveedorService.SIN_PROVEEDOR_ID, varios: false };
+    },
+
+    _estadoHtml(producto) {
+        const pedidos = this._pedidosDe(producto.id);
+        if (!pedidos.length) return '<span class="planilla-vacio">—</span>';
+        if (pedidos.every(p => Pedidos._sinProveedorAProposito(p) || !(p.proveedor_id || producto.proveedor_default))) {
+            return '<span class="status-badge status-inactivo">Sin proveedor</span>';
+        }
+        return pedidos.every(p => PedidoProveedorService.isEnviado(p))
+            ? '<span class="status-badge status-activo">Enviado</span>'
+            : '<span class="status-badge status-pendiente">Pendiente</span>';
+    },
+
+    _bloqueado() {
+        return DiaOperativo.diaCerrado(AppState.currentDate);
+    },
+
+    enganchar() {
+        if (this._listo) return;
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        this._listo = true;
+        tabla.addEventListener('change', e => {
+            if (e.target.classList.contains('planilla-celda')) this._guardarCelda(e.target);
+            if (e.target.classList.contains('planilla-proveedor')) this._cambiarProveedor(e.target);
+        });
+        tabla.addEventListener('input', e => {
+            const el = e.target;
+            if (!el.classList.contains('planilla-celda')) return;
+            el.value = el.dataset.kilo === '1'
+                ? el.value.replace(/[^\d,.]/g, '').replace('.', ',').replace(/,(?=.*,)/g, '')
+                : el.value.replace(/\D/g, '');
+        });
+        tabla.addEventListener('keydown', e => {
+            if (e.key !== 'Enter' || !e.target.classList.contains('planilla-celda')) return;
+            e.preventDefault();
+            const celdas = [...tabla.querySelectorAll('tbody tr:not([hidden]) .planilla-celda')];
+            const sig = celdas[celdas.indexOf(e.target) + this._clientes().length];
+            if (sig) sig.focus(); else e.target.blur();
+        });
+        tabla.addEventListener('click', e => {
+            const ed = e.target.closest('[data-planilla-editar]');
+            const el = e.target.closest('[data-planilla-eliminar]');
+            if (ed) this.editar(ed.dataset.planillaEditar);
+            if (el) this.eliminar(el.dataset.planillaEliminar);
+        });
+        // Si llegaron cambios de otra persona mientras se escribía, se redibuja al soltar la planilla.
+        tabla.addEventListener('focusout', () => {
+            setTimeout(() => {
+                if (this._redibujar && !tabla.contains(document.activeElement)) this.render();
+            }, 0);
+        });
+        document.getElementById('pedidos-vista')?.addEventListener('click', e => {
+            const b = e.target.closest('[data-vista]');
+            if (b) this.cambiarVista(b.dataset.vista);
+        });
+        document.getElementById('planilla-filtro-tipo')?.addEventListener('click', e => {
+            const b = e.target.closest('[data-tipo]');
+            if (!b) return;
+            this.filtroTipo = b.dataset.tipo;
+            this._filtrar();
+        });
+        document.getElementById('planilla-solo-pedidos')?.addEventListener('click', () => {
+            this.soloPedidos = !this.soloPedidos;
+            this._filtrar();
+        });
+        document.getElementById('planilla-buscar')?.addEventListener('input', e => {
+            this.texto = e.target.value.trim().toLowerCase();
+            this._filtrar();
+        });
+    },
+
+    cambiarVista(vista) {
+        this.vista = vista === 'lista' ? 'lista' : 'planilla';
+        try { localStorage.setItem('pedidos-vista', this.vista); } catch (e) { /* sin almacenamiento */ }
+        this.render();
+    },
+
+    _pintarVista() {
+        const enPlanilla = this.vista === 'planilla';
+        const planilla = document.getElementById('pedidos-planilla');
+        const lista = document.getElementById('pedidos-lista');
+        if (planilla) planilla.hidden = !enPlanilla;
+        if (lista) lista.hidden = enPlanilla;
+        const agregar = document.getElementById('btn-agregar-pedido');
+        if (agregar) agregar.hidden = enPlanilla;
+        document.querySelectorAll('#pedidos-vista [data-vista]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.vista === this.vista)));
+        document.querySelectorAll('#planilla-filtro-tipo [data-tipo]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.tipo === this.filtroTipo)));
+        const solo = document.getElementById('planilla-solo-pedidos');
+        if (solo) solo.setAttribute('aria-pressed', String(this.soloPedidos));
+    },
+
+    render() {
+        this.enganchar();
+        this._pintarVista();
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla || this.vista !== 'planilla') return;
+        // No se redibuja debajo de los dedos de quien está escribiendo.
+        if (tabla.contains(document.activeElement)) {
+            this._redibujar = true;
+            this._totales();
+            return;
+        }
+        this._redibujar = false;
+
+        if ((!(AppState.productos || []).length || !(AppState.clientes || []).length) && !this._buscandoCatalogo) {
+            this._buscandoCatalogo = true;
+            Promise.all([
+                (AppState.productos || []).length ? null : API.getProductos().then(d => { AppState.productos = d || []; }),
+                (AppState.clientes || []).length ? null : API.getClientes().then(d => { AppState.clientes = d || []; }),
+                (AppState.proveedores || []).length ? null : API.getProveedores().then(d => { AppState.proveedores = d || []; })
+            ]).catch(() => {}).finally(() => {
+                this._buscandoCatalogo = false;
+                if ((AppState.productos || []).length && (AppState.clientes || []).length) this.render();
+            });
+        }
+
+        const clientes = this._clientes();
+        const productos = (AppState.productos || []).slice()
+            .sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        const bloqueado = this._bloqueado();
+        const aviso = document.getElementById('planilla-aviso');
+        if (aviso) {
+            aviso.hidden = !bloqueado;
+            aviso.textContent = bloqueado ? 'Este día está cerrado: la planilla se puede ver pero no cambiar.' : '';
+        }
+
+        if (!productos.length || !clientes.length) {
+            tabla.innerHTML = `<tbody><tr><td class="planilla-sin-datos">${!productos.length
+                ? 'Todavía no hay productos cargados. Agregalos en Configuración → Productos.'
+                : 'Todavía no hay clientes cargados. Agregalos en Configuración → Clientes.'}</td></tr></tbody>`;
+            return;
+        }
+
+        const esc = Utils.esc;
+        const proveedores = Pedidos.getProveedoresActivos(AppState.proveedores || [])
+            .slice().sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        const dis = bloqueado ? ' disabled' : '';
+        const cabeza = `<thead><tr><th class="planilla-prod" scope="col">Producto</th>${clientes.map(c => `<th scope="col" class="planilla-cli">${esc(c.nombre || 'Cliente')}</th>`).join('')}<th scope="col" class="planilla-total">Total</th><th scope="col">Proveedor</th><th scope="col">Pedido a proveedor</th><th scope="col">Acciones</th></tr></thead>`;
+
+        let cuerpo = '';
+        this.GRUPOS.forEach(grupo => {
+            const lista = productos.filter(p => this._tipoDe(p) === grupo.tipo);
+            if (!lista.length) return;
+            cuerpo += `<tr class="planilla-grupo planilla-grupo-${grupo.tipo}" data-grupo="${grupo.tipo}"><th colspan="${clientes.length + 5}" scope="rowgroup">${grupo.nombre}</th></tr>`;
+            lista.forEach(producto => {
+                const kilo = this.esPorKilo(producto);
+                const celdas = clientes.map(c => {
+                    const cant = this._cantidad(producto.id, c.id);
+                    return `<td><input class="planilla-celda${cant > 0 ? ' con-valor' : ''}" type="text" inputmode="${kilo ? 'decimal' : 'numeric'}" autocomplete="off"
+                        id="planilla-${producto.id}-${c.id}" data-producto="${esc(producto.id)}" data-cliente="${esc(c.id)}" data-kilo="${kilo ? 1 : 0}"
+                        value="${cant > 0 ? Utils.formatCantidad(cant) : ''}" aria-label="${esc(producto.nombre)} para ${esc(c.nombre)}"${dis}></td>`;
+                }).join('');
+                const prov = this._proveedorFila(producto);
+                const opciones = (prov.varios ? '<option value="" selected disabled>Varios proveedores</option>' : '') +
+                    `<option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}"${prov.id === PedidoProveedorService.SIN_PROVEEDOR_ID ? ' selected' : ''}>Sin proveedor</option>` +
+                    proveedores.map(p => `<option value="${esc(p.id)}"${String(p.id) === prov.id ? ' selected' : ''}>${esc(p.nombre)}</option>`).join('');
+                const tiene = this._pedidosDe(producto.id).length > 0;
+                cuerpo += `<tr data-producto-fila="${esc(producto.id)}" data-grupo="${grupo.tipo}" data-nombre="${esc(String(producto.nombre || '').toLowerCase())}">
+                    <th class="planilla-prod" scope="row">${esc(producto.nombre || '')}${kilo ? ' <span class="planilla-kg" title="Se pide en kilos, admite decimales">kg</span>' : ''}</th>
+                    ${celdas}
+                    <td class="planilla-total" data-total="${esc(producto.id)}"></td>
+                    <td class="planilla-prov"><select class="planilla-proveedor form-control" id="planilla-prov-${producto.id}" data-producto="${esc(producto.id)}" aria-label="Proveedor de ${esc(producto.nombre)}"${dis}>${opciones}</select></td>
+                    <td class="planilla-estado" data-estado="${esc(producto.id)}"></td>
+                    <td class="planilla-acciones">
+                        <button type="button" class="btn btn-secondary btn-sm" data-planilla-editar="${esc(producto.id)}"${tiene && !bloqueado ? '' : ' disabled'}>Editar</button>
+                        <button type="button" class="btn btn-danger btn-sm" data-planilla-eliminar="${esc(producto.id)}"${tiene && !bloqueado ? '' : ' disabled'}>Eliminar</button>
+                    </td>
+                </tr>`;
+            });
+        });
+        const pie = `<tfoot><tr><th class="planilla-prod" scope="row">Total cargado</th>${clientes.map(c => `<td data-total-cliente="${esc(c.id)}"></td>`).join('')}<td class="planilla-total" data-total-general></td><td></td><td></td><td></td></tr></tfoot>`;
+        tabla.innerHTML = cabeza + `<tbody>${cuerpo}</tbody>` + pie;
+        this._totales();
+        this._filtrar();
+    },
+
+    // Totales, estados y botones sin rearmar las celdas (para no sacar el cursor de donde está).
+    _totales() {
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        const bloqueado = this._bloqueado();
+        let general = 0;
+        tabla.querySelectorAll('[data-total]').forEach(td => {
+            const total = this._cantidad(td.dataset.total);
+            general += total;
+            td.textContent = total > 0 ? Utils.formatCantidad(total) : '';
+        });
+        tabla.querySelectorAll('[data-total-cliente]').forEach(td => {
+            const total = (AppState.pedidos || []).filter(p => String(p.cliente_id) === td.dataset.totalCliente)
+                .reduce((s, p) => s + (parseFloat(p.cantidad) || 0), 0);
+            td.textContent = total > 0 ? Utils.formatCantidad(total) : '';
+        });
+        const tg = tabla.querySelector('[data-total-general]');
+        if (tg) tg.textContent = Utils.formatCantidad(general);
+        tabla.querySelectorAll('[data-estado]').forEach(td => {
+            const producto = (AppState.productos || []).find(p => String(p.id) === td.dataset.estado);
+            if (producto) td.innerHTML = this._estadoHtml(producto);
+            const tiene = this._pedidosDe(td.dataset.estado).length > 0;
+            td.parentElement.querySelectorAll('.planilla-acciones button').forEach(b => { b.disabled = !tiene || bloqueado; });
+        });
+        tabla.querySelectorAll('.planilla-celda').forEach(inp => {
+            inp.classList.toggle('con-valor', inp.value.trim() !== '');
+        });
+    },
+
+    _filtrar() {
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        tabla.querySelectorAll('tbody tr').forEach(tr => {
+            let ver = this.filtroTipo === 'todos' || tr.dataset.grupo === this.filtroTipo;
+            if (ver && tr.dataset.productoFila) {
+                if (this.texto && !String(tr.dataset.nombre || '').includes(this.texto)) ver = false;
+                if (this.soloPedidos && !this._pedidosDe(tr.dataset.productoFila).length) ver = false;
+            }
+            tr.hidden = !ver;
+        });
+        // Un grupo sin filas visibles no muestra su título.
+        tabla.querySelectorAll('tbody tr[data-grupo]:not([data-producto-fila])').forEach(tit => {
+            if (tit.hidden) return;
+            const hay = [...tabla.querySelectorAll(`tbody tr[data-producto-fila][data-grupo="${tit.dataset.grupo}"]`)].some(tr => !tr.hidden);
+            tit.hidden = !hay;
+        });
+        this._pintarVista();
+    },
+
+    _pintarGuardado() {
+        const el = document.getElementById('planilla-guardado');
+        if (!el) return;
+        el.textContent = this._pendientes > 0 ? `Guardando… (${this._pendientes})` : 'Todo guardado';
+        el.classList.toggle('is-guardando', this._pendientes > 0);
+    },
+
+    // Las escrituras van de a una, en orden: así dos celdas seguidas no compiten por la planilla.
+    _encolar(tarea) {
+        this._pendientes++;
+        this._pintarGuardado();
+        const fecha = AppState.currentDate;
+        const paso = this._cola.then(tarea).catch(error => {
+            console.error('Error guardando la planilla:', error);
+            Utils.showError('No se pudo guardar un cambio de la planilla: ' + (error && error.message || 'revisá la conexión') + '. Se vuelve a leer el día.');
+            if (AppState.currentDate === fecha) {
+                CacheManager.invalidate(`pedidos:${fecha}`);
+                DataLoader.invalidateFlujo(fecha);
+                AppState.fechaCargada = null;
+                Pedidos.load().catch(() => {});
+            }
+        }).finally(() => {
+            this._pendientes = Math.max(0, this._pendientes - 1);
+            this._pintarGuardado();
+            if (this._pendientes === 0) {
+                DiaOperativo.refreshSoon();
+                Pedidos.renderEnvioResumen();
+            }
+        });
+        this._cola = paso;
+        return paso;
+    },
+
+    esperarGuardado() {
+        return this._cola.catch(() => {});
+    },
+
+    _guardarCache(fecha) {
+        CacheManager.set(`pedidos:${fecha}`, AppState.pedidos);
+        CacheManager.invalidate(`flujo:${fecha}`);
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        DataLoader.invalidateFlujo(fecha);
+    },
+
+    _aplicarCelda(fecha, productoId, clienteId, cantidad, proveedorId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === String(clienteId));
+        const actuales = this._pedidosDe(productoId, clienteId);
+        AppState.pedidos = (AppState.pedidos || []).filter(p => !actuales.includes(p));
+        if (cantidad > 0) {
+            const base = actuales[0] || {};
+            AppState.pedidos.push({
+                ...base,
+                id: base.id || ('local-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7)),
+                fecha,
+                cliente_id: clienteId,
+                producto_id: productoId,
+                cliente_nombre: cliente?.nombre || base.cliente_nombre || '',
+                producto_nombre: producto?.nombre || base.producto_nombre || '',
+                tipo: producto?.tipo || base.tipo || '',
+                cantidad,
+                proveedor_id: base.proveedor_id || proveedorId || '',
+                enviado: Number(base.cantidad) === cantidad && actuales.length === 1 ? base.enviado : false
+            });
+        }
+    },
+
+    _guardarCelda(input) {
+        const fecha = AppState.currentDate;
+        const productoId = input.dataset.producto;
+        const clienteId = input.dataset.cliente;
+        const kilo = input.dataset.kilo === '1';
+        let cantidad = input.value.trim() === '' ? 0 : Utils.parseCantidad(input.value);
+        if (!Number.isFinite(cantidad) || cantidad < 0) {
+            Utils.showError('Escribí un número válido.');
+            input.value = this._cantidad(productoId, clienteId) > 0 ? Utils.formatCantidad(this._cantidad(productoId, clienteId)) : '';
+            return;
+        }
+        if (!kilo) cantidad = Math.round(cantidad);
+        const antes = this._cantidad(productoId, clienteId);
+        input.value = cantidad > 0 ? Utils.formatCantidad(cantidad) : '';
+        if (cantidad === antes && this._pedidosDe(productoId, clienteId).length <= 1) return;
+
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        const prov = this._proveedorFila(producto || { id: productoId });
+        const proveedorId = prov.varios ? undefined : prov.id;
+        this._aplicarCelda(fecha, productoId, clienteId, cantidad, proveedorId);
+        this._totales();
+        Pedidos.renderEnvioResumen();
+
+        this._encolar(async () => {
+            const res = await API.request('pedidos/celda', 'POST', {
+                fecha,
+                cliente_id: clienteId,
+                producto_id: productoId,
+                cantidad,
+                tipo: producto?.tipo || '',
+                proveedor_id: proveedorId === PedidoProveedorService.SIN_PROVEEDOR_ID ? proveedorId : (proveedorId || undefined)
+            });
+            if (AppState.currentDate !== fecha) return;
+            // Se reemplaza lo provisorio por lo que quedó guardado.
+            const eliminados = new Set((res?.eliminados || []).map(String));
+            AppState.pedidos = (AppState.pedidos || []).filter(p => {
+                if (eliminados.has(String(p.id))) return false;
+                return !(String(p.producto_id) === String(productoId) && String(p.cliente_id) === String(clienteId));
+            });
+            if (res?.pedido) {
+                AppState.pedidos.push({
+                    ...res.pedido,
+                    cliente_nombre: (AppState.clientes || []).find(c => String(c.id) === String(clienteId))?.nombre || '',
+                    producto_nombre: producto?.nombre || ''
+                });
+            }
+            this._guardarCache(fecha);
+            this._totales();
+        });
+    },
+
+    _cambiarProveedor(select) {
+        const fecha = AppState.currentDate;
+        const productoId = select.dataset.producto;
+        const proveedorId = select.value;
+        this._proveedorElegido[String(productoId)] = proveedorId;
+        const pedidos = this._pedidosDe(productoId);
+        if (!pedidos.length) return; // se usa cuando se cargue la primera cantidad
+        pedidos.forEach(p => {
+            if (String(p.proveedor_id || '') !== proveedorId) {
+                p.proveedor_id = proveedorId;
+                p.enviado = false;
+            }
+        });
+        this._totales();
+        Pedidos.renderEnvioResumen();
+        this._encolar(async () => {
+            await API.request('pedidos/proveedor-producto', 'POST', { fecha, producto_id: productoId, proveedor_id: proveedorId });
+            this._guardarCache(fecha);
+        });
+    },
+
+    // Editar: la cantidad de cada cliente y el proveedor de ese producto para el día.
+    editar(productoId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        if (!producto) return;
+        const esc = Utils.esc;
+        const kilo = this.esPorKilo(producto);
+        const clientes = this._clientes();
+        const prov = this._proveedorFila(producto);
+        const proveedores = Pedidos.getProveedoresActivos(AppState.proveedores || []);
+        const filas = clientes.map(c => {
+            const cant = this._cantidad(productoId, c.id);
+            return `<div class="planilla-editar-fila">
+                <label for="pe-${esc(c.id)}">${esc(c.nombre || 'Cliente')}</label>
+                <input type="text" class="form-control" id="pe-${esc(c.id)}" data-cliente="${esc(c.id)}" inputmode="${kilo ? 'decimal' : 'numeric'}" placeholder="0" value="${cant > 0 ? Utils.formatCantidad(cant) : ''}">
+            </div>`;
+        }).join('');
+        const content = `
+            <p class="modal-hint">Cantidad de cada cliente en ${kilo ? 'kilos (podés usar decimales, por ejemplo 12,5)' : 'bultos'}. Dejá vacío el cliente que no lo pidió.</p>
+            <div class="planilla-editar">${filas}</div>
+            <div class="form-group">
+                <label for="pe-proveedor">Proveedor</label>
+                <select id="pe-proveedor" class="form-control">
+                    ${prov.varios ? '<option value="" selected>Dejar como está (varios)</option>' : ''}
+                    <option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}"${prov.id === PedidoProveedorService.SIN_PROVEEDOR_ID ? ' selected' : ''}>Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${esc(p.id)}"${String(p.id) === prov.id ? ' selected' : ''}>${esc(p.nombre)}</option>`).join('')}
+                </select>
+            </div>`;
+        Utils.showModal(`Editar pedido · ${producto.nombre}`, content, () => {
+            const cambios = [];
+            for (const inp of document.querySelectorAll('.planilla-editar input[data-cliente]')) {
+                let cant = inp.value.trim() === '' ? 0 : Utils.parseCantidad(inp.value);
+                if (!Number.isFinite(cant) || cant < 0) {
+                    Utils.showError('Revisá las cantidades: tienen que ser números.');
+                    return true;
+                }
+                if (!kilo) cant = Math.round(cant);
+                if (cant !== this._cantidad(productoId, inp.dataset.cliente)) cambios.push({ clienteId: inp.dataset.cliente, cant });
+            }
+            const nuevoProv = document.getElementById('pe-proveedor').value;
+            if (nuevoProv && nuevoProv !== prov.id) {
+                const sel = document.getElementById(`planilla-prov-${productoId}`);
+                if (sel) { sel.value = nuevoProv; this._cambiarProveedor(sel); }
+                else this._proveedorElegido[String(productoId)] = nuevoProv;
+            }
+            cambios.forEach(({ clienteId, cant }) => {
+                const inp = document.getElementById(`planilla-${productoId}-${clienteId}`);
+                if (!inp) return;
+                inp.value = cant > 0 ? Utils.formatCantidad(cant) : '';
+                this._guardarCelda(inp);
+            });
+            if (cambios.length || (nuevoProv && nuevoProv !== prov.id)) Utils.avisar(`Pedido de ${producto.nombre} actualizado`);
+        }, 'Guardar');
+    },
+
+    async eliminar(productoId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        const pedidos = this._pedidosDe(productoId);
+        if (!producto || !pedidos.length) return;
+        const total = this._cantidad(productoId);
+        const quienes = [...new Set(pedidos.map(p => Utils.nombreCatalogo(p, 'cliente') || 'Cliente'))];
+        const ok = await Utils.showConfirm(`¿Eliminar el pedido de ${producto.nombre} de este día? Se borran ${Utils.formatCantidad(total)} ${this.esPorKilo(producto) ? 'kg' : 'bultos'} de ${quienes.length} cliente(s): ${quienes.join(', ')}.`);
+        if (!ok) return;
+        const fecha = AppState.currentDate;
+        AppState.pedidos = (AppState.pedidos || []).filter(p => String(p.producto_id) !== String(productoId));
+        this._redibujar = false;
+        this.render();
+        Pedidos.renderEnvioResumen();
+        this._encolar(async () => {
+            await API.request('pedidos/eliminar-producto', 'POST', { fecha, producto_id: productoId });
+            this._guardarCache(fecha);
+            Utils.avisar(`Pedido de ${producto.nombre} eliminado`);
+        });
     }
 };
 
@@ -4478,6 +5015,7 @@ const Pedidos = {
         
         // Ocultar loader local
         Utils.hideTableLoader(tbody);
+        PlanillaPedidos.render();
         
         if (AppState.pedidos.length === 0) {
             tbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">No hay pedidos para el día de hoy</td></tr>';
@@ -4886,6 +5424,8 @@ const Pedidos = {
 
     async enviarPendientes() {
         try {
+            // Lo que se acaba de escribir en la planilla tiene que estar guardado antes de pedírselo al proveedor.
+            await PlanillaPedidos.esperarGuardado();
             await this.ensureDatosProveedor();
             const pendientes = (AppState.pedidos || []).filter(p => !PedidoProveedorService.isEnviado(p) && !this._sinProveedorAProposito(p));
             if (pendientes.length === 0) {
@@ -4905,8 +5445,8 @@ const Pedidos = {
                 const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
                 const nombre = proveedor?.nombre || 'Sin proveedor asignado';
                 const items = this._totalesPorProducto(grupos[proveedorId]).map(linea => `
-                    <li><strong>${Utils.esc(linea.producto)} × ${linea.total}</strong>
-                        <small class="modal-hint">${linea.detalle.map(d => `${Utils.esc(d.cliente)} ${d.cantidad}`).join(' · ')}</small></li>
+                    <li><strong>${Utils.esc(linea.producto)} × ${Utils.formatCantidad(linea.total)}${linea.kilo ? ' kg' : ''}</strong>
+                        <small class="modal-hint">${linea.detalle.map(d => `${Utils.esc(d.cliente)} ${Utils.formatCantidad(d.cantidad)}`).join(' · ')}</small></li>
                 `).join('');
                 const sinTelefono = !proveedor || !proveedor.telefono;
                 return `
@@ -4967,7 +5507,7 @@ const Pedidos = {
             const producto = this._productoDe(pedido);
             return {
                 producto: pedido.producto_nombre || producto?.nombre || 'Producto',
-                cantidad: pedido.cantidad
+                cantidad: PlanillaPedidos.esPorKilo(producto) ? `${Utils.formatCantidad(pedido.cantidad)} kg` : pedido.cantidad
             };
         });
     },
@@ -4981,6 +5521,7 @@ const Pedidos = {
             if (!porProducto[key]) {
                 porProducto[key] = {
                     producto: pedido.producto_nombre || producto?.nombre || 'Producto',
+                    kilo: PlanillaPedidos.esPorKilo(producto),
                     total: 0,
                     detalle: []
                 };
@@ -5712,7 +6253,7 @@ const Recepcion = {
             if (!productoId) return;
             const precioInput = document.querySelector(`#recepcion-tbody .recepcion-precio[data-producto-id="${productoId}"]`);
             map[String(productoId)] = {
-                llego: parseInt(input.value, 10) || 0,
+                llego: Utils.parseCantidad(input.value) || 0,
                 precio: Utils.parsePrice(precioInput?.value || 0)
             };
         });
@@ -5902,7 +6443,7 @@ const Recepcion = {
                 <tr${rowClass}>
                     <td>${Utils.esc(item.producto_nombre || '')}</td>
                     <td>${item.pedido_total || 0}</td>
-                    <td><input type="number" class="recepcion-llego" data-id="${item.id}" data-producto-id="${item.producto_id}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
+                    <td><input type="number" step="any" class="recepcion-llego" data-id="${item.id}" data-producto-id="${item.producto_id}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
                     <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${item.producto_id}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
                     <td>${Utils.esc(item.proveedor_nombre || '')}</td>
                     <td class="recepcion-acciones">${accionCell}</td>
@@ -5920,7 +6461,7 @@ const Recepcion = {
         
         document.querySelectorAll('.recepcion-llego').forEach(input => {
             const productoId = input.getAttribute('data-producto-id');
-            const llego = parseInt(input.value) || 0;
+            const llego = Utils.parseCantidad(input.value) || 0;
             const id = input.getAttribute('data-id');
             const precioInput = document.querySelector(`.recepcion-precio[data-id="${id}"]`);
             const precio = Utils.parsePrice(precioInput ? precioInput.value : 0);
@@ -6031,7 +6572,7 @@ const Recepcion = {
     getValoresProducto(productoId) {
         const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${productoId}"]`);
         const precioInput = document.querySelector(`.recepcion-precio[data-producto-id="${productoId}"]`);
-        const llego = parseInt(llegoInput?.value, 10);
+        const llego = Utils.parseCantidad(llegoInput?.value);
         const precio = Utils.parsePrice(precioInput?.value || 0);
         return { llego: isNaN(llego) ? 0 : Math.max(0, llego), precio };
     },
@@ -6121,7 +6662,7 @@ const Recepcion = {
             </div>
             <div class="form-group">
                 <label>Llegó</label>
-                <input type="number" id="modal-recepcion-llego" class="form-control" min="0" value="${item.llego || 0}">
+                <input type="number" step="any" id="modal-recepcion-llego" class="form-control" min="0" value="${item.llego || 0}">
             </div>
             <div class="form-group">
                 <label>Precio real (costo por unidad)</label>
@@ -6131,7 +6672,7 @@ const Recepcion = {
         `;
 
         Utils.showModal('Editar recepción', content, async () => {
-            const llego = parseInt(document.getElementById('modal-recepcion-llego').value, 10);
+            const llego = Utils.parseCantidad(document.getElementById('modal-recepcion-llego').value);
             const precio = Utils.parsePrice(document.getElementById('modal-recepcion-precio').value);
 
             if (isNaN(llego) || llego < 0) {
@@ -6350,6 +6891,13 @@ const Comisiones = {
         const regla = producto.id ? this.reglaDe(producto.id) : { tipo: '', valor: 0 };
         return `
             <div class="form-group">
+                <label class="checkbox-label" for="modal-producto-por-kilo">
+                    <input type="checkbox" id="modal-producto-por-kilo" ${PlanillaPedidos.esPorKilo(producto) ? 'checked' : ''}>
+                    Se vende por kilo
+                </label>
+                <small>Marcalo si se pide en kilos y puede llevar decimales (por ejemplo Sandía o Zapallo plomo). El resto se pide en bultos enteros.</small>
+            </div>
+            <div class="form-group">
                 <label for="modal-producto-comision-tipo">Comisión de reparto</label>
                 <select id="modal-producto-comision-tipo" class="form-control">
                     ${this.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.tipo ? 'selected' : ''}>${t.texto}</option>`).join('')}
@@ -6388,7 +6936,8 @@ const Comisiones = {
             Utils.showError(tipo === 'porcentaje' ? 'Poné el porcentaje de comisión (por ejemplo 10).' : 'Poné el monto de comisión por unidad.');
             return null;
         }
-        return { comision_tipo: tipo, comision_valor: valor };
+        const porKilo = !!document.getElementById('modal-producto-por-kilo')?.checked;
+        return { comision_tipo: tipo, comision_valor: valor, por_kilo: porKilo };
     }
 };
 

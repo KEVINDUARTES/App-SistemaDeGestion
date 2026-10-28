@@ -420,6 +420,19 @@ function handleRequest(e, method) {
       case 'pedidos/update':
         result = updatePedido(data);
         break;
+
+      // Planilla de pedidos (productos en filas, clientes en columnas)
+      case 'pedidos/celda':
+        result = guardarCeldaPedido(data);
+        break;
+
+      case 'pedidos/proveedor-producto':
+        result = cambiarProveedorProductoDia(data);
+        break;
+
+      case 'pedidos/eliminar-producto':
+        result = eliminarPedidosProductoDia(data);
+        break;
       
       case 'pedidos/marcar-enviados':
         result = marcarPedidosEnviados(data.fecha);
@@ -1051,7 +1064,7 @@ function initializeSheet(sheet, sheetName) {
   const headers = {
     'Clientes': ['id', 'nombre', 'telefono', 'activo'],
     'Proveedores': ['id', 'nombre', 'rubro', 'telefono', 'activo'],
-    'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default', 'comision_tipo', 'comision_valor'],
+    'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default', 'comision_tipo', 'comision_valor', 'por_kilo'],
     'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado', 'proveedor_id'],
     'Camiones': ['id', 'fecha', 'nombre', 'orden', 'clientes'],
     'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
@@ -1904,7 +1917,9 @@ function createProducto(data) {
   const sheet = getSheet(CONFIG.SHEETS.PRODUCTOS);
   ensureColumn(sheet, 'comision_tipo');
   ensureColumn(sheet, 'comision_valor');
+  ensureColumn(sheet, 'por_kilo');
   const id = generateId();
+  const porKilo = data.por_kilo === true || data.por_kilo === 'true';
   const comision = comisionProducto_(data);
 
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -1915,7 +1930,8 @@ function createProducto(data) {
     unidad: limpiarTexto_(data.unidad),
     proveedor_default: data.proveedor_default || '',
     comision_tipo: comision.tipo,
-    comision_valor: comision.valor
+    comision_valor: comision.valor,
+    por_kilo: porKilo
   };
   const newRow = headers.map(function(h) { return valores[h] !== undefined ? valores[h] : ''; });
   
@@ -1929,7 +1945,7 @@ function createProducto(data) {
   invalidateServerCacheForSheet(CONFIG.SHEETS.STOCK_BEBIDAS);
   
   return { id: id, nombre: nombre, tipo: data.tipo, unidad: data.unidad || '', proveedor_default: data.proveedor_default || '',
-    comision_tipo: comision.tipo, comision_valor: comision.valor };
+    comision_tipo: comision.tipo, comision_valor: comision.valor, por_kilo: porKilo };
 }
 
 // Comisión de reparto de cada producto:
@@ -1977,6 +1993,8 @@ function updateProducto(data) {
     ensureColumn(sheet, 'comision_tipo');
     ensureColumn(sheet, 'comision_valor');
   }
+  var traePorKilo = data.por_kilo !== undefined && data.por_kilo !== null && data.por_kilo !== '';
+  if (traePorKilo) ensureColumn(sheet, 'por_kilo');
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   var col = function(nombre, porDefecto) {
     var idx = headers.indexOf(nombre);
@@ -1998,6 +2016,7 @@ function updateProducto(data) {
         sheet.getRange(i + 1, col('comision_tipo', 5)).setValue(comision.tipo);
         sheet.getRange(i + 1, col('comision_valor', 6)).setValue(comision.valor);
       }
+      if (traePorKilo) sheet.getRange(i + 1, col('por_kilo', 7)).setValue(data.por_kilo === true || data.por_kilo === 'true');
       invalidateSheetCache(CONFIG.SHEETS.PRODUCTOS);
       invalidateServerCacheForSheet(CONFIG.SHEETS.PRODUCTOS);
       return { success: true };
@@ -2193,6 +2212,143 @@ function deletePedido(id) {
   invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
   if (fecha) invalidateServerCacheFecha(fecha);
   return { success: true };
+}
+
+// ========== PLANILLA DE PEDIDOS ==========
+// En la planilla cada celda es "cuánto pide este cliente de este producto este día". Por detrás
+// siguen siendo pedidos comunes (una fila por cliente y producto), así el resto del flujo no cambia.
+
+/** Filas del día de un producto (y de un cliente, si se indica), de abajo hacia arriba para poder borrar. */
+function filasPedidosDia_(values, headers, fecha, productoId, clienteId) {
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var productoIdx = headers.indexOf('producto_id'); if (productoIdx < 0) productoIdx = 3;
+  var clienteIdx = headers.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var filas = [];
+  for (var i = 1; i < values.length; i++) {
+    if (normalizeFecha(values[i][fechaIdx]) !== fecha) continue;
+    if (!idsMatch(values[i][productoIdx], productoId)) continue;
+    if (clienteId !== undefined && !idsMatch(values[i][clienteIdx], clienteId)) continue;
+    filas.push(i);
+  }
+  return filas;
+}
+
+function invalidarPedidosDia_(fecha) {
+  invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheFecha(fecha);
+}
+
+/**
+ * Deja la cantidad de un cliente para un producto en el día: crea el pedido, le cambia la
+ * cantidad o lo borra (cantidad vacía o 0). Si había más de un pedido del mismo cliente y
+ * producto, queda uno solo con la cantidad nueva. Si la cantidad cambia, el pedido vuelve a
+ * quedar pendiente de enviar al proveedor.
+ * data: { fecha, cliente_id, producto_id, cantidad, proveedor_id?, tipo? }
+ */
+function guardarCeldaPedido(data) {
+  if (!data || !data.fecha || !data.cliente_id || !data.producto_id) {
+    throw new Error('Faltan datos de la celda (día, cliente y producto)');
+  }
+  var fecha = normalizeFecha(data.fecha);
+  assertDiaAbierto_(fecha);
+  var texto = String(data.cantidad === undefined || data.cantidad === null ? '' : data.cantidad).trim().replace(',', '.');
+  var cantidad = texto === '' ? 0 : Number(texto);
+  if (!isFinite(cantidad) || cantidad < 0) throw new Error('La cantidad tiene que ser un número');
+  cantidad = Math.round(cantidad * 100) / 100;
+
+  var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  ensurePedidosProveedorColumn_(sheet);
+  var values = readUsedValues_(sheet);
+  var headers = values[0] || [];
+  var filas = filasPedidosDia_(values, headers, fecha, data.producto_id, data.cliente_id);
+  var cantIdx = headers.indexOf('cantidad');
+  var enviadoIdx = headers.indexOf('enviado');
+  var provIdx = headers.indexOf('proveedor_id');
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var eliminados = [];
+
+  if (cantidad <= 0) {
+    filas.slice().reverse().forEach(function(i) {
+      eliminados.push(values[i][idIdx]);
+      sheet.deleteRow(i + 1);
+    });
+    invalidarPedidosDia_(fecha);
+    return { pedido: null, eliminados: eliminados };
+  }
+
+  if (!filas.length) {
+    var creado = createPedido({
+      fecha: fecha,
+      cliente_id: data.cliente_id,
+      producto_id: data.producto_id,
+      cantidad: cantidad,
+      tipo: data.tipo || '',
+      proveedor_id: data.proveedor_id || ''
+    });
+    return { pedido: creado, eliminados: [] };
+  }
+
+  var principal = filas[0];
+  var fila = values[principal].slice();
+  var cambio = Number(fila[cantIdx]) !== cantidad || filas.length > 1;
+  fila[cantIdx] = cantidad;
+  if (cambio && enviadoIdx !== -1) fila[enviadoIdx] = false;
+  if (provIdx !== -1 && data.proveedor_id !== undefined && data.proveedor_id !== null) fila[provIdx] = data.proveedor_id;
+  sheet.getRange(principal + 1, 1, 1, fila.length).setValues([fila]);
+  filas.slice(1).reverse().forEach(function(i) {
+    eliminados.push(values[i][idIdx]);
+    sheet.deleteRow(i + 1);
+  });
+  invalidarPedidosDia_(fecha);
+
+  var pedido = {};
+  headers.forEach(function(h, k) { pedido[h] = fila[k]; });
+  pedido.fecha = fecha;
+  return { pedido: pedido, eliminados: eliminados };
+}
+
+/** Cambia el proveedor de todos los pedidos del día de un producto (vuelven a quedar pendientes). */
+function cambiarProveedorProductoDia(data) {
+  if (!data || !data.fecha || !data.producto_id) throw new Error('Faltan el día y el producto');
+  var fecha = normalizeFecha(data.fecha);
+  assertDiaAbierto_(fecha);
+  var proveedorId = String(data.proveedor_id || '');
+  var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  ensurePedidosProveedorColumn_(sheet);
+  var values = readUsedValues_(sheet);
+  var headers = values[0] || [];
+  var provIdx = headers.indexOf('proveedor_id');
+  var enviadoIdx = headers.indexOf('enviado');
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var cambiados = [];
+  filasPedidosDia_(values, headers, fecha, data.producto_id).forEach(function(i) {
+    if (String(values[i][provIdx] || '') === proveedorId) return;
+    values[i][provIdx] = proveedorId;
+    if (enviadoIdx !== -1) values[i][enviadoIdx] = false;
+    sheet.getRange(i + 1, 1, 1, values[i].length).setValues([values[i]]);
+    cambiados.push(values[i][idIdx]);
+  });
+  if (cambiados.length) invalidarPedidosDia_(fecha);
+  return { cambiados: cambiados, proveedor_id: proveedorId };
+}
+
+/** Borra todos los pedidos del día de un producto (la acción "Eliminar" de la fila). */
+function eliminarPedidosProductoDia(data) {
+  if (!data || !data.fecha || !data.producto_id) throw new Error('Faltan el día y el producto');
+  var fecha = normalizeFecha(data.fecha);
+  assertDiaAbierto_(fecha);
+  var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  var values = readUsedValues_(sheet);
+  var headers = values[0] || [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var eliminados = [];
+  filasPedidosDia_(values, headers, fecha, data.producto_id).reverse().forEach(function(i) {
+    eliminados.push(values[i][idIdx]);
+    sheet.deleteRow(i + 1);
+  });
+  if (eliminados.length) invalidarPedidosDia_(fecha);
+  return { eliminados: eliminados };
 }
 
 /**
@@ -2598,7 +2754,8 @@ function confirmarRecepcionItem(data) {
     throw new Error('fecha y producto_id son requeridos');
   }
 
-  var llego = parseInt(data.llego, 10);
+  // Los productos por kilo llegan con decimales (12,5 kg de sandía).
+  var llego = Math.round(parseFloat(String(data.llego === undefined || data.llego === null ? '' : data.llego).replace(',', '.')) * 100) / 100;
   if (isNaN(llego) || llego < 0) {
     throw new Error('Cantidad recibida inválida');
   }

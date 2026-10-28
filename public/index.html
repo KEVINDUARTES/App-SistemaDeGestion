@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261027cierre">
+    <link rel="stylesheet" href="styles.css?v=20261028planilla">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -332,14 +332,42 @@
             </div>
             <div class="dia-operativo-bar" data-dia-page="pedidos">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="pedidos-fecha-select">Pedido del día:</label>
-                    <select id="pedidos-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="pedidos-fecha-input">Pedido del día:</label>
+                    <input type="date" id="pedidos-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="pedidos-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="pedidos-fecha-texto"></span>
                     <span class="dia-operativo-estado" id="pedidos-estado-dia"></span>
                 </div>
-                <p class="dia-operativo-hint">Los pedidos se guardan con la fecha seleccionada. Podés trabajar pedidos de ayer si la mercadería llegó hoy.</p>
+                <p class="dia-operativo-hint">Tocá la fecha para abrir el calendario y elegir cualquier día, pasado o futuro. Los pedidos se guardan con la fecha elegida.</p>
+            </div>
+            <div class="planilla-barra">
+                <div class="planilla-seg" role="group" aria-label="Forma de ver los pedidos" id="pedidos-vista">
+                    <button type="button" data-vista="planilla" aria-pressed="true">Planilla</button>
+                    <button type="button" data-vista="lista" aria-pressed="false">Lista</button>
+                </div>
+                <span class="planilla-guardado" id="planilla-guardado" role="status">Todo guardado</span>
             </div>
             <div id="pedidos-envio-resumen" class="pedidos-envio-resumen" hidden></div>
-            <div class="table-container">
+            <div id="pedidos-planilla" class="pedidos-planilla">
+                <div class="planilla-controles">
+                    <input type="search" id="planilla-buscar" class="form-control" placeholder="Buscar producto…" aria-label="Buscar producto">
+                    <div class="planilla-seg" role="group" aria-label="Filtrar por tipo" id="planilla-filtro-tipo">
+                        <button type="button" data-tipo="todos" aria-pressed="true">Todos</button>
+                        <button type="button" data-tipo="verdura" aria-pressed="false">Verdura</button>
+                        <button type="button" data-tipo="fruta" aria-pressed="false">Fruta</button>
+                        <button type="button" data-tipo="bebida" aria-pressed="false">Bebida</button>
+                        <button type="button" data-tipo="mercaderia" aria-pressed="false">Mercadería</button>
+                    </div>
+                    <div class="planilla-seg" role="group" aria-label="Qué productos mostrar">
+                        <button type="button" id="planilla-solo-pedidos" aria-pressed="false" title="Esconde los productos que nadie pidió ese día">Ver solo lo pedido</button>
+                    </div>
+                </div>
+                <p class="planilla-aviso" id="planilla-aviso" hidden></p>
+                <p class="dia-operativo-hint">Escribí la cantidad de cada cliente y pasá a la siguiente con Tab o Enter: se guarda sola. Todo va en bultos enteros, salvo los productos marcados <span class="planilla-kg">kg</span>, que van en kilos y aceptan decimales.</p>
+                <div class="planilla-scroll">
+                    <table class="planilla-pedidos" id="planilla-pedidos"></table>
+                </div>
+            </div>
+            <div class="table-container" id="pedidos-lista" hidden>
                 <table class="data-table">
                     <thead>
                         <tr>
@@ -854,7 +882,7 @@
     <script src="services/whatsapp.js?v=20261021web"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261027cierre"></script>
+    <script src="app.js?v=20261028planilla"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

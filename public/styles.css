@@ -1216,6 +1216,17 @@ tr.fila-resaltada td {
     max-width: 320px;
 }
 
+.dia-operativo-fecha {
+    width: auto;
+    min-width: 170px;
+    cursor: pointer;
+}
+
+.dia-operativo-fecha-texto {
+    color: var(--color-gray-600);
+    font-size: 0.9rem;
+}
+
 .dia-operativo-estado {
     display: inline-flex;
     align-items: center;
@@ -3870,4 +3881,165 @@ html {
 
 .precio-comision-nada {
     color: var(--color-gray-600);
+}
+
+/* Planilla de pedidos (productos en filas, clientes en columnas) */
+.planilla-barra {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
+.planilla-seg {
+    display: inline-flex;
+    flex-wrap: wrap;
+    border: 1px solid var(--color-gray-300);
+    border-radius: var(--radius-xl);
+    overflow: hidden;
+    background: var(--color-white);
+}
+.planilla-seg button {
+    font: inherit;
+    font-size: 0.85rem;
+    border: 0;
+    background: transparent;
+    color: var(--color-gray-600);
+    padding: 7px 14px;
+    cursor: pointer;
+}
+.planilla-seg button[aria-pressed="true"] {
+    background: var(--color-primary);
+    color: #fff;
+}
+.planilla-seg button:focus-visible { outline: 2px solid var(--color-primary-dark); outline-offset: -2px; }
+.planilla-guardado { font-size: 0.85rem; color: var(--color-success); font-weight: 600; }
+.planilla-guardado.is-guardando { color: var(--color-warning); }
+.planilla-controles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+.planilla-controles input[type="search"] { flex: 1 1 200px; max-width: 280px; min-width: 0; }
+.planilla-aviso {
+    background: var(--color-warning-light);
+    color: #92400e;
+    padding: 8px 12px;
+    border-radius: var(--radius-lg);
+    margin: 0 0 8px;
+}
+.planilla-scroll {
+    overflow: auto;
+    max-height: 70vh;
+    background: var(--color-white);
+    border: 1px solid var(--color-gray-200);
+    border-radius: var(--radius-xl);
+}
+.planilla-pedidos {
+    border-collapse: separate;
+    border-spacing: 0;
+    width: max-content;
+    min-width: 100%;
+    font-size: 0.88rem;
+}
+.planilla-pedidos th,
+.planilla-pedidos td {
+    border-bottom: 1px solid var(--color-gray-200);
+    border-right: 1px solid var(--color-gray-200);
+    padding: 0;
+}
+.planilla-pedidos thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--color-info-light);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 8px 6px;
+    white-space: nowrap;
+}
+.planilla-pedidos .planilla-prod {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--color-white);
+    text-align: left;
+    padding: 6px 12px;
+    min-width: 180px;
+    font-weight: 500;
+}
+.planilla-pedidos thead .planilla-prod { z-index: 3; background: var(--color-info-light); }
+.planilla-cli { min-width: 80px; max-width: 120px; white-space: normal !important; }
+.planilla-celda {
+    width: 80px;
+    height: 32px;
+    border: 0;
+    background: transparent;
+    text-align: center;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+}
+.planilla-celda.con-valor { background: var(--color-warning-light); font-weight: 700; }
+.planilla-celda:focus { outline: 2px solid var(--color-primary); outline-offset: -2px; background: var(--color-white); }
+.planilla-celda:disabled { color: var(--color-gray-600); cursor: not-allowed; }
+.planilla-pedidos .planilla-total {
+    background: var(--color-info-light);
+    text-align: center;
+    font-weight: 700;
+    min-width: 70px;
+    padding: 6px;
+    font-variant-numeric: tabular-nums;
+}
+.planilla-prov { padding: 2px 6px !important; min-width: 160px; }
+.planilla-prov select { padding: 4px 6px; font-size: 0.85rem; }
+.planilla-estado, .planilla-acciones { padding: 4px 8px !important; text-align: center; white-space: nowrap; }
+.planilla-acciones .btn + .btn { margin-left: 4px; }
+.planilla-vacio { color: var(--color-gray-400); }
+.planilla-pedidos tr.planilla-grupo th {
+    text-align: left;
+    padding: 6px 12px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.planilla-grupo-verdura th { background: #e6f4ea; color: #1f6b3a; }
+.planilla-grupo-fruta th { background: #fdeee2; color: #9a4a12; }
+.planilla-grupo-bebida th { background: #e3f1fb; color: #1b5d8a; }
+.planilla-grupo-mercaderia th { background: #efeaf7; color: #5b3f8c; }
+.planilla-grupo-otros th { background: var(--color-gray-100); color: var(--color-gray-700); }
+.planilla-pedidos tfoot th,
+.planilla-pedidos tfoot td {
+    position: sticky;
+    bottom: 0;
+    background: var(--color-info-light);
+    font-weight: 700;
+    text-align: center;
+    padding: 8px 6px;
+    font-variant-numeric: tabular-nums;
+}
+.planilla-pedidos tfoot .planilla-prod { text-align: left; z-index: 3; }
+.planilla-kg {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 6px;
+    border-radius: var(--radius-full);
+    font-size: 0.7rem;
+    font-weight: 700;
+    background: var(--color-info-light);
+    color: var(--color-primary-dark);
+}
+.planilla-sin-datos { padding: 24px !important; color: var(--color-gray-600); }
+.planilla-editar { display: grid; gap: 6px; max-height: 50vh; overflow: auto; margin-bottom: 12px; }
+.planilla-editar-fila { display: grid; grid-template-columns: 1fr 110px; gap: 8px; align-items: center; }
+.checkbox-label { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.pedidos-planilla[hidden],
+#pedidos-lista[hidden],
+.planilla-aviso[hidden],
+.planilla-pedidos tr[hidden] {
+    display: none;
 }
