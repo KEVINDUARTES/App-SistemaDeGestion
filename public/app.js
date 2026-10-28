@@ -8501,13 +8501,6 @@ const Cierre = {
             estadoCobranzasHoy = `<span class="cierre-pendiente">${cobradosHoy} cobrados, ${parcialHoy} parciales, ${totalClientesHoy - cobradosHoy - parcialHoy} sin cobrar (de ${totalClientesHoy})</span>`;
         }
 
-        // "Pendientes" son las deudas de días anteriores: lo de hoy ya se ve en "Cobranzas del día".
-        const cobranzasPendientes = (cobranzas || []).filter(c =>
-            Utils.isCobranzaPendiente(c) && Utils.fechaIso(c.fecha) !== AppState.currentDate);
-        const estadoCobranzasPendientes = cobranzasPendientes.length > 0
-            ? `<span class="cierre-pendiente">Pendientes (${cobranzasPendientes.length})</span>`
-            : '<span class="cierre-ok">Sin pendientes</span>';
-
         const proveedoresPendientes = (proveedores || []).filter(p => (parseFloat(p.saldo) || 0) > 0);
         const estadoProveedores = proveedoresPendientes.length > 0
             ? `<span class="cierre-pendiente">Pendientes (${proveedoresPendientes.length})</span>`
@@ -8524,9 +8517,6 @@ const Cierre = {
             this._itemResumen('Cobranzas del día', estadoCobranzasHoy, totalClientesHoy === 0
                 ? 'Se habilita cuando hay precios al cliente cargados.'
                 : ''),
-            this._itemResumen('Cobranzas pendientes', estadoCobranzasPendientes, cobranzasPendientes.length
-                ? 'Paso anterior: clientes con saldo de días anteriores todavía sin cobrar.'
-                : 'Paso anterior: no hay deudas de días anteriores. Lo que quedó debiendo hoy pasa a pendientes al cerrar.'),
             this._itemResumen('Proveedores', estadoProveedores, proveedoresPendientes.length
                 ? `Paso anterior: ${proveedoresPendientes.length} proveedor${proveedoresPendientes.length === 1 ? '' : 'es'} con saldo a pagar.`
                 : 'Paso anterior: ningún proveedor tiene saldo pendiente.'),
@@ -8593,7 +8583,6 @@ const Cierre = {
                     <li>Recepción: <span class="cierre-error">Error al cargar</span></li>
                     <li>Precios: <span class="cierre-error">Error al cargar</span></li>
                     <li>Cobranzas del día: <span class="cierre-error">Error al cargar</span></li>
-                    <li>Cobranzas pendientes: <span class="cierre-error">Error al cargar</span></li>
                     <li>Proveedores: <span class="cierre-error">Error al cargar</span></li>
                     <li>Stock: <span class="cierre-error">Error al cargar</span></li>
                 `;

@@ -4113,7 +4113,7 @@ function conDrive_(fn) {
     return fn();
   } catch (error) {
     if (/permission|permiso|autoriz|authoriz/i.test(String(error && error.message))) {
-      throw new Error('Google Drive todavía no está autorizado. En el editor del script hay que ejecutar una vez la función "autorizarDrive".');
+      throw new Error('Google Drive todavía no está autorizado. En el editor del script hay que ejecutar una vez la función "autorizarDrive". (Detalle de Google: ' + error.message + ')');
     }
     throw error;
   }
@@ -4226,9 +4226,11 @@ function quitarAccesoCarpetaCierres(email) {
  * Drive (donde se guardan los PDF de los cierres). Sin esto la app no puede guardar los reportes.
  */
 function autorizarDrive() {
-  var raiz = DriveApp.getRootFolder();
-  Logger.log('✅ Drive autorizado. Los reportes de cierre se guardan en el Drive de: ' + Session.getEffectiveUser().getEmail()
-    + ' (carpeta "Cierres - …" dentro de ' + raiz.getName() + ')');
+  // Crea y borra una carpeta de prueba: así Google pide el permiso completo de Drive (el mismo que
+  // se usa para guardar los PDF), no solo el de lectura.
+  var prueba = DriveApp.createFolder('Prueba de permisos - se borra sola');
+  prueba.setTrashed(true);
+  Logger.log('✅ Drive autorizado. Los reportes de cierre se guardan en tu Drive, en la carpeta "Cierres - …".');
 }
 
 // ========== FUNCIONES DE PRUEBA ==========
