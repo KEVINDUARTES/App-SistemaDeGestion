@@ -595,6 +595,19 @@ const Utils = {
 
     // La comisión por unidad puede tener centavos (5 % de $350 = $17,50 por kilo). Se redondea
     // recién el total de la línea, igual que en el servidor.
+    // Ayer (Argentina) en formato AAAA-MM-DD.
+    ayerAR() {
+        const d = new Date(fechaHoyAR() + 'T12:00:00');
+        d.setDate(d.getDate() - 1);
+        return d.toLocaleDateString('en-CA');
+    },
+
+    // Saca todas las filas del tbody menos la de "agregar" (así no pierde el foco ni lo que se escribió).
+    limpiarFilasConservando(tbody, filaNueva) {
+        Array.from(tbody.children).forEach(el => { if (el !== filaNueva) el.remove(); });
+        if (filaNueva && filaNueva.parentNode !== tbody) tbody.prepend(filaNueva);
+    },
+
     // Cantidad que puede tener decimales (kilos): "12,5" o "12.5" → 12.5. Vacío o inválido → NaN.
     parseCantidad(value) {
         const texto = String(value ?? '').trim().replace(',', '.');
@@ -2107,6 +2120,15 @@ const API = {
         return result;
     },
 
+    // Lo que un cliente ya debía antes de usar la app: queda como una cobranza pendiente más.
+    async agregarCobranzaPendiente(data) {
+        const result = await this.request('cobranzas/agregar-pendiente', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
     async cobrarClienteHoy(data) {
         const result = await this.request('cobranzas/cobrar-cliente', 'POST', data);
         CacheManager.invalidatePattern('cobranzas');
@@ -2131,6 +2153,16 @@ const API = {
         return result;
     },
     
+    // Lo que se le debía a un proveedor antes de usar la app: se suma a su saldo.
+    async agregarDeudaProveedor(data) {
+        const result = await this.request('deudas-proveedores', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
     async registrarPago(data) {
         const result = await this.request('pagos-proveedores', 'POST', data);
         CacheManager.invalidatePattern('pagos-proveedores');
@@ -7948,7 +7980,7 @@ const Precios = {
                 pagado = parseFloat(prev.pagado) || 0;
             } else {
                 const cob = cobranzasGuardadas.find(c =>
-                    String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha
+                    String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha && c.origen !== 'manual'
                 );
                 if (cob) pagado = parseFloat(cob.pagado) || 0;
                 else if (prev) pagado = parseFloat(prev.pagado) || 0;
@@ -7962,7 +7994,7 @@ const Precios = {
             if (pagado > 0 && saldo <= 0) estado = 'pagado';
             else if (pagado > 0) estado = 'parcial';
             const cob = cobranzasGuardadas.find(c =>
-                String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha
+                String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha && c.origen !== 'manual'
             );
             let depositos = Array.isArray(prev?.depositos) ? prev.depositos : [];
             if (!depositos.length && Array.isArray(cob?.depositos)) depositos = cob.depositos;
@@ -8563,8 +8595,14 @@ const CuentaCorriente = {
         return partes.length > 1 ? partes[partes.length - 1].trim() : '';
     },
 
-    _movimientosProveedor(id, recepcion, pagos) {
+    _movimientosProveedor(id, recepcion, pagos, deudas) {
         const movs = [];
+        (deudas || []).forEach(d => {
+            if (String(d.proveedor_id) !== id) return;
+            const monto = Utils.parsePrice(d.monto) || 0;
+            if (!monto) return;
+            movs.push({ fecha: Utils.fechaIso(d.fecha), orden: 0, producto: d.nota ? `Deuda anterior · ${d.nota}` : 'Deuda anterior', cantidad: '', precio: '', total: monto, pago: 0, medio: '' });
+        });
         (recepcion || []).forEach(r => {
             const confirmado = r.confirmado === true || r.confirmado === 'true';
             const cantidad = parseFloat(r.llego) || 0;
@@ -8586,7 +8624,8 @@ const CuentaCorriente = {
         const movs = [];
         (cobranzas || []).filter(c => String(c.cliente_id) === id).forEach(c => {
             const fecha = Utils.fechaIso(c.fecha);
-            const lineas = (precios || []).filter(p => String(p.cliente_id) === id && Utils.fechaIso(p.fecha) === fecha && (parseFloat(p.cantidad) || 0) > 0);
+            const manual = c.origen === 'manual';
+            const lineas = manual ? [] : (precios || []).filter(p => String(p.cliente_id) === id && Utils.fechaIso(p.fecha) === fecha && (parseFloat(p.cantidad) || 0) > 0);
             let suma = 0;
             let comision = 0;
             lineas.forEach(p => {
@@ -8605,7 +8644,8 @@ const CuentaCorriente = {
             }
             const totalCobranza = Utils.parsePrice(c.total) || 0;
             if (totalCobranza !== suma) {
-                movs.push({ fecha, orden: 0, producto: lineas.length ? 'Ajuste del día' : 'Carga del día', cantidad: '', precio: '', total: totalCobranza - suma, pago: 0, medio: '' });
+                const rotulo = manual ? (c.nota ? `Deuda anterior · ${c.nota}` : 'Deuda anterior') : (lineas.length ? 'Ajuste del día' : 'Carga del día');
+                movs.push({ fecha, orden: 0, producto: rotulo, cantidad: '', precio: '', total: totalCobranza - suma, pago: 0, medio: '' });
             }
             // Pagos: los movimientos de caja de esta cobranza (con su fecha y medio).
             let pagadoCaja = 0;
@@ -8649,11 +8689,12 @@ const CuentaCorriente = {
                 ]);
                 movs = this._movimientosCliente(id, cobranzas, precios, caja);
             } else {
-                const [recepcion, pagos] = await Promise.all([
+                const [recepcion, pagos, deudas] = await Promise.all([
                     API.request('recepcion', 'GET'),
-                    API.request('pagos-proveedores', 'GET')
+                    API.request('pagos-proveedores', 'GET'),
+                    API.request('deudas-proveedores', 'GET').catch(() => [])
                 ]);
-                movs = this._movimientosProveedor(id, recepcion, pagos);
+                movs = this._movimientosProveedor(id, recepcion, pagos, deudas);
             }
             const filas = this._conSaldo(movs);
             this._ultima = { tipo, id, nombre, filas };
@@ -9683,7 +9724,8 @@ const SaldoCliente = {
             if (!fecha) return;
             const total = Utils.parsePrice(cobranza.total) || saldo;
             const pagado = Utils.parsePrice(cobranza.pagado) || Math.max(0, total - saldo);
-            porFecha.set(fecha, {
+            // Una deuda cargada a mano no reemplaza a la cobranza de ese mismo día (y viceversa).
+            porFecha.set(cobranza.origen === 'manual' ? `${fecha}|${cobranza.id}` : fecha, {
                 fecha,
                 total,
                 pagado,
@@ -9915,6 +9957,11 @@ const SaldoCliente = {
 };
 
 const Cobranzas = {
+    _agregando: false,
+    _guardando: false,
+    _filaEl: null,
+    _borrador: { cliente_id: '', total: '', fecha: '', nota: '' },
+
     async load() {
         const tbody = document.getElementById('cobranzas-tbody');
         if (!tbody) return;
@@ -9949,12 +9996,16 @@ const Cobranzas = {
         // Ocultar loader local
         Utils.hideTableLoader(tbody);
         
-        tbody.innerHTML = '';
+        const fila = this._agregando ? this._filaNueva() : null;
+        if (!fila) this._filaEl = null;
+        Utils.limpiarFilasConservando(tbody, fila);
         
         if (AppState.cobranzas.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 30px; color: #666;">' +
+            const vacia = document.createElement('tr');
+            vacia.innerHTML = '<td colspan="6" style="text-align: center; padding: 30px; color: #666;">' +
                 'No hay cobranzas pendientes.' +
-                '</td></tr>';
+                '</td>';
+            tbody.appendChild(vacia);
             return;
         }
         
@@ -9963,8 +10014,12 @@ const Cobranzas = {
             const saldo = Utils.getCobranzaSaldo(cobranza);
             const cliente = this._clienteDe(cobranza);
             tr.dataset.clienteId = String(cobranza.cliente_id || '');
+            tr.dataset.cobranzaId = String(cobranza.id || '');
+            const rotuloManual = cobranza.origen === 'manual'
+                ? `<small class="fila-nota">Deuda anterior${cobranza.nota ? ' · ' + Utils.esc(cobranza.nota) : ''}</small>`
+                : '';
             tr.innerHTML = `
-                <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}</td>
+                <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}${rotuloManual}</td>
                 <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
                 <td data-label="Cómo pagó" class="medios-texto">${MediosPago.texto(cobranza.medios)}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</td>
                 <td data-label="Fecha">${Utils.formatDate(cobranza.fecha)}</td>
@@ -9979,6 +10034,115 @@ const Cobranzas = {
             tbody.appendChild(tr);
         });
         Dashboard.resaltarFila('cliente');
+    },
+
+    // Fila de la tabla para agregar lo que un cliente ya debía (antes de usar la app o una deuda vieja).
+    _filaNueva() {
+        if (this._filaEl) return this._filaEl;
+        const b = this._borrador;
+        if (!b.fecha) b.fecha = Utils.ayerAR();
+        const clientes = (AppState.clientes || [])
+            .filter(c => c.activo !== false && c.activo !== 'false')
+            .slice().sort((a, c) => String(a.nombre || '').localeCompare(String(c.nombre || ''), 'es'));
+        const tr = document.createElement('tr');
+        tr.className = 'fila-nueva';
+        tr.innerHTML = `
+            <td data-label="Cliente">
+                <select id="nueva-cobranza-cliente" class="form-control" aria-label="Cliente">
+                    <option value="">Elegí el cliente…</option>
+                    ${clientes.map(c => `<option value="${Utils.esc(c.id)}"${String(c.id) === String(b.cliente_id) ? ' selected' : ''}>${Utils.esc(c.nombre)}</option>`).join('')}
+                </select>
+                <input type="text" id="nueva-cobranza-nota" class="form-control fila-nueva-nota" placeholder="Nota (opcional)" maxlength="120" value="${Utils.esc(b.nota)}" aria-label="Nota">
+            </td>
+            <td data-label="Te debe"><input type="text" id="nueva-cobranza-total" class="form-control" data-price-input="true" inputmode="numeric" placeholder="$ 0" value="${Utils.esc(b.total)}" aria-label="Cuánto te debe"></td>
+            <td data-label="Cómo pagó" class="medios-texto"><span class="fila-nueva-hint">Se registra con Cobrar</span></td>
+            <td data-label="Fecha"><input type="date" id="nueva-cobranza-fecha" class="form-control" max="${Utils.ayerAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha te debe"></td>
+            <td data-label="Estado"><span class="status-badge status-pendiente">Nueva</span></td>
+            <td data-label="Acciones">
+                <div class="pagos-acciones">
+                    <button type="button" class="btn btn-primary btn-sm" id="nueva-cobranza-guardar">Guardar</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="nueva-cobranza-cancelar">Cancelar</button>
+                </div>
+            </td>`;
+        const leer = () => {
+            this._borrador = {
+                cliente_id: tr.querySelector('#nueva-cobranza-cliente').value,
+                total: tr.querySelector('#nueva-cobranza-total').value,
+                fecha: tr.querySelector('#nueva-cobranza-fecha').value,
+                nota: tr.querySelector('#nueva-cobranza-nota').value
+            };
+        };
+        tr.addEventListener('input', leer);
+        tr.addEventListener('change', leer);
+        tr.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); this.guardarNueva(); }
+            if (e.key === 'Escape') this.cancelarNueva();
+        });
+        tr.querySelector('#nueva-cobranza-guardar').addEventListener('click', () => this.guardarNueva());
+        tr.querySelector('#nueva-cobranza-cancelar').addEventListener('click', () => this.cancelarNueva());
+        Utils.enablePriceInputs(tr);
+        this._filaEl = tr;
+        return tr;
+    },
+
+    async agregar() {
+        if (!(AppState.clientes || []).length) {
+            try { AppState.clientes = await API.getClientes(); } catch (error) { /* se avisa abajo */ }
+        }
+        if (!(AppState.clientes || []).length) {
+            Utils.showError('Todavía no hay clientes cargados. Agregalos en Configuración → Clientes.');
+            return;
+        }
+        this._agregando = true;
+        this.render();
+        const fila = this._filaEl;
+        fila?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        fila?.querySelector(this._borrador.cliente_id ? '#nueva-cobranza-total' : '#nueva-cobranza-cliente')?.focus();
+    },
+
+    cancelarNueva() {
+        if (this._guardando) return;
+        this._agregando = false;
+        this._filaEl = null;
+        this._borrador = { cliente_id: '', total: '', fecha: '', nota: '' };
+        this.render();
+    },
+
+    async guardarNueva() {
+        if (this._guardando || !this._filaEl) return;
+        const fila = this._filaEl;
+        const cliente_id = fila.querySelector('#nueva-cobranza-cliente').value;
+        const total = Utils.parsePrice(fila.querySelector('#nueva-cobranza-total').value) || 0;
+        const fecha = fila.querySelector('#nueva-cobranza-fecha').value;
+        const nota = fila.querySelector('#nueva-cobranza-nota').value.trim();
+        if (!cliente_id) { Utils.showError('Elegí el cliente.'); return; }
+        if (total <= 0) { Utils.showError('Poné cuánto te debe.'); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) { Utils.showError('Poné desde qué fecha te debe.'); return; }
+        if (fecha >= fechaHoyAR()) { Utils.showError('La fecha tiene que ser anterior a hoy. Lo de hoy se carga con los pedidos y los precios.'); return; }
+
+        this._guardando = true;
+        fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = true; });
+        try {
+            const creada = await API.agregarCobranzaPendiente({ cliente_id, fecha, total, nota });
+            AppState.cobranzas = [creada, ...(AppState.cobranzas || []).filter(c => String(c.id) !== String(creada.id))];
+            CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+            this._agregando = false;
+            this._filaEl = null;
+            this._borrador = { cliente_id: '', total: '', fecha: '', nota: '' };
+            this.render();
+            const tr = document.querySelector(`#cobranzas-tbody tr[data-cobranza-id="${creada.id}"]`);
+            if (tr) {
+                tr.classList.add('fila-recien-agregada');
+                tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            Utils.avisar(`Se agregó la deuda de ${creada.cliente_nombre || 'el cliente'}: ${Utils.formatCurrency(creada.total)}`);
+        } catch (error) {
+            console.error('Error agregando la cobranza:', error);
+            Utils.showError('No se pudo agregar la cobranza: ' + (error && error.message ? String(error.message).replace(/^Error:\s*/, '') : 'revisá la conexión'));
+            fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = false; });
+        } finally {
+            this._guardando = false;
+        }
     },
 
     _clienteDe(cobranza) {
@@ -10062,7 +10226,8 @@ const Cobranzas = {
             Utils.enSegundoPlano(() => API.registrarCobro({
                 cobranza_id: cobranza.id,
                 medios: leido.lista,
-                fecha: cobranza.fecha || AppState.currentDate,
+                // El cobro de una deuda cargada a mano entra a la caja de hoy, no del día de la deuda.
+                fecha: cobranza.origen === 'manual' ? fechaHoyAR() : (cobranza.fecha || AppState.currentDate),
                 depositos: deposito.lineas
             }), () => {
                 cobranza.saldo = saldoAnterior;
@@ -10800,6 +10965,10 @@ const CobranzasHoy = {
 
 // Pagos
 const Pagos = {
+    _agregando: false,
+    _guardando: false,
+    _filaEl: null,
+    _borrador: { proveedor_id: '', monto: '', fecha: '', nota: '' },
     _pagados: new Set(),
     _montosHoy: {},
     _ultimoPago: null,
@@ -10912,9 +11081,14 @@ const Pagos = {
         if (!tbody) return;
 
         Utils.hideTableLoader(tbody);
-        tbody.innerHTML = '';
 
         const soloPendientes = this.vista === 'pendientes';
+        const btnAgregar = document.getElementById('btn-agregar-pago-pendiente');
+        if (btnAgregar) btnAgregar.hidden = !soloPendientes;
+        if (!soloPendientes) { this._agregando = false; this._filaEl = null; }
+        const fila = this._agregando ? this._filaNueva() : null;
+        if (!fila) this._filaEl = null;
+        Utils.limpiarFilasConservando(tbody, fila);
         const diaCerrado = DiaOperativo.diaCerrado(AppState.currentDate);
         const titulo = document.getElementById('pagos-titulo');
         const hint = document.getElementById('pagos-hint');
@@ -10923,7 +11097,7 @@ const Pagos = {
         if (titulo) titulo.textContent = soloPendientes ? 'Pagos a proveedores (pendientes)' : 'Pagar al proveedor';
         if (hint) {
             hint.textContent = soloPendientes
-                ? 'Acá queda lo que todavía le debés. Podés pagar una parte en efectivo y otra en transferencia, y dejar el resto adeudado.'
+                ? 'Acá queda lo que todavía le debés. Podés pagar una parte en efectivo y otra en transferencia, y dejar el resto adeudado. Si ya le debías de antes, agregalo con "Agregar pago a proveedor pendiente".'
                 : (diaCerrado
                     ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
                     : 'Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).');
@@ -10982,7 +11156,9 @@ const Pagos = {
                 : (diaCerrado
                     ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
                     : 'No hay mercadería confirmada para pagar en este día.');
-            tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">${vacio}</td></tr>`;
+            const vaciaTr = document.createElement('tr');
+            vaciaTr.innerHTML = `<td colspan="6" style="text-align:center;padding:30px;color:#666;">${vacio}</td>`;
+            tbody.appendChild(vaciaTr);
             if (resumen) resumen.hidden = true;
             Depositos.pintarEnPagos();
             return;
@@ -11020,6 +11196,118 @@ const Pagos = {
         });
         Depositos.pintarEnPagos();
         Dashboard.resaltarFila('proveedor');
+    },
+
+    // Fila de la tabla para agregar lo que ya se le debía a un proveedor (antes de usar la app).
+    _filaNueva() {
+        if (this._filaEl) return this._filaEl;
+        const b = this._borrador;
+        if (!b.fecha) b.fecha = Utils.ayerAR();
+        const proveedores = (AppState.proveedores || [])
+            .filter(p => p.activo !== false && p.activo !== 'false')
+            .slice().sort((a, c) => String(a.nombre || '').localeCompare(String(c.nombre || ''), 'es'));
+        const tr = document.createElement('tr');
+        tr.className = 'fila-nueva';
+        tr.innerHTML = `
+            <td data-label="Proveedor">
+                <select id="nueva-deuda-proveedor" class="form-control" aria-label="Proveedor">
+                    <option value="">Elegí el proveedor…</option>
+                    ${proveedores.map(p => `<option value="${Utils.esc(p.id)}"${String(p.id) === String(b.proveedor_id) ? ' selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+                <input type="text" id="nueva-deuda-nota" class="form-control fila-nueva-nota" placeholder="Nota (opcional)" maxlength="120" value="${Utils.esc(b.nota)}" aria-label="Nota">
+            </td>
+            <td data-label="Le debés"><input type="text" id="nueva-deuda-monto" class="form-control" data-price-input="true" inputmode="numeric" placeholder="$ 0" value="${Utils.esc(b.monto)}" aria-label="Cuánto le debés"></td>
+            <td data-label="Cómo pagaste" class="medios-texto"><span class="fila-nueva-hint">Se registra con Pagar</span></td>
+            <td data-label="Deuda desde"><small class="fila-nueva-etiqueta">Deuda desde</small><input type="date" id="nueva-deuda-fecha" class="form-control" max="${fechaHoyAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha le debés"></td>
+            <td data-label="Estado"><span class="status-badge status-pendiente">Nueva</span></td>
+            <td data-label="Acciones">
+                <div class="pagos-acciones">
+                    <button type="button" class="btn btn-primary btn-sm" id="nueva-deuda-guardar">Guardar</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="nueva-deuda-cancelar">Cancelar</button>
+                </div>
+            </td>`;
+        const leer = () => {
+            this._borrador = {
+                proveedor_id: tr.querySelector('#nueva-deuda-proveedor').value,
+                monto: tr.querySelector('#nueva-deuda-monto').value,
+                fecha: tr.querySelector('#nueva-deuda-fecha').value,
+                nota: tr.querySelector('#nueva-deuda-nota').value
+            };
+        };
+        tr.addEventListener('input', leer);
+        tr.addEventListener('change', leer);
+        tr.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); this.guardarNueva(); }
+            if (e.key === 'Escape') this.cancelarNueva();
+        });
+        tr.querySelector('#nueva-deuda-guardar').addEventListener('click', () => this.guardarNueva());
+        tr.querySelector('#nueva-deuda-cancelar').addEventListener('click', () => this.cancelarNueva());
+        Utils.enablePriceInputs(tr);
+        this._filaEl = tr;
+        return tr;
+    },
+
+    async agregar() {
+        if (!(AppState.proveedores || []).length) {
+            try { AppState.proveedores = await API.getProveedores(); } catch (error) { /* se avisa abajo */ }
+        }
+        if (!(AppState.proveedores || []).length) {
+            Utils.showError('Todavía no hay proveedores cargados. Agregalos en Configuración → Proveedores.');
+            return;
+        }
+        this._agregando = true;
+        this.render(AppState.proveedores);
+        const fila = this._filaEl;
+        fila?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        fila?.querySelector(this._borrador.proveedor_id ? '#nueva-deuda-monto' : '#nueva-deuda-proveedor')?.focus();
+    },
+
+    cancelarNueva() {
+        if (this._guardando) return;
+        this._agregando = false;
+        this._filaEl = null;
+        this._borrador = { proveedor_id: '', monto: '', fecha: '', nota: '' };
+        this.render(AppState.proveedores);
+    },
+
+    async guardarNueva() {
+        if (this._guardando || !this._filaEl) return;
+        const fila = this._filaEl;
+        const proveedor_id = fila.querySelector('#nueva-deuda-proveedor').value;
+        const monto = Utils.parsePrice(fila.querySelector('#nueva-deuda-monto').value) || 0;
+        const fecha = fila.querySelector('#nueva-deuda-fecha').value;
+        const nota = fila.querySelector('#nueva-deuda-nota').value.trim();
+        if (!proveedor_id) { Utils.showError('Elegí el proveedor.'); return; }
+        if (monto <= 0) { Utils.showError('Poné cuánto le debés.'); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) { Utils.showError('Poné desde qué fecha le debés.'); return; }
+        if (fecha > fechaHoyAR()) { Utils.showError('La fecha no puede ser futura.'); return; }
+
+        this._guardando = true;
+        fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = true; });
+        try {
+            const creada = await API.agregarDeudaProveedor({ proveedor_id, fecha, monto, nota });
+            // El saldo lo calcula el servidor: se vuelve a leer para mostrar el número real.
+            CacheManager.invalidate('proveedores');
+            const proveedores = await API.getProveedores();
+            AppState.proveedores = this._fusionar(proveedores);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this._agregando = false;
+            this._filaEl = null;
+            this._borrador = { proveedor_id: '', monto: '', fecha: '', nota: '' };
+            this.render(AppState.proveedores);
+            const tr = document.querySelector(`#pagos-tbody tr[data-proveedor-id="${creada.proveedor_id}"]`);
+            if (tr) {
+                tr.classList.add('fila-recien-agregada');
+                tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            Utils.avisar(`Se agregó la deuda con ${creada.proveedor_nombre || 'el proveedor'}: ${Utils.formatCurrency(creada.monto)}`);
+        } catch (error) {
+            console.error('Error agregando la deuda al proveedor:', error);
+            Utils.showError('No se pudo agregar el pago pendiente: ' + (error && error.message ? String(error.message).replace(/^Error:\s*/, '') : 'revisá la conexión'));
+            fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = false; });
+        } finally {
+            this._guardando = false;
+        }
     },
 
     _aplicarRecepcionHoy(recepcion) {
@@ -12816,6 +13104,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-seguir-cobros', () => Navigation.navigateTo('cobros-hoy'), 'Abriendo...');
     addButtonListener('btn-seguir-cobranzas', () => Navigation.navigateTo('pagos'), 'Abriendo...');
     addButtonListener('btn-seguir-pagos', () => Navigation.navigateTo('pagos-pendientes'), 'Abriendo...');
+    addButtonListener('btn-agregar-cobranza', () => Cobranzas.agregar(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-agregar-pago-pendiente', () => Pagos.agregar(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-seguir-cierre', () => Navigation.navigateTo('cierre'), 'Abriendo...');
     addButtonListener('btn-volver-cierre', () => Navigation.navigateTo('pagos'), 'Volviendo...');
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });
@@ -12824,6 +13114,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-saldos-pdf', () => Dashboard.descargarPdfSaldos('ambos'), 'Armando PDF...');
     addButtonListener('btn-precios-planilla-excel', () => Precios.descargarPlanillaExcel(), 'Armando Excel...');
     addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
+    // Repartir efectivo está desactivado por ahora (sus botones y su pantalla están comentados en index.html).
+    // Para reactivarlo: descomentar esos bloques; el resto del código (Reparto, API y servidor) sigue acá.
     addButtonListener('btn-ir-reparto', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-caja-repartir', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-ver-dia', () => {

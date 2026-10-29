@@ -17,6 +17,7 @@ const CONFIG = {
     CIERRE_DIA: 'CierreDia',
     COBRANZAS: 'Cobranzas',
     PAGOS_PROVEEDORES: 'PagosProveedores',
+    DEUDAS_PROVEEDORES: 'DeudasProveedores',
     CAJA_MOVIMIENTOS: 'CajaMovimientos',
     STOCK_BEBIDAS: 'StockBebidas',
     CONFIGURACION: 'Configuracion'
@@ -512,6 +513,10 @@ function handleRequest(e, method) {
         }
         break;
 
+      case 'cobranzas/agregar-pendiente':
+        result = agregarCobranzaPendiente(data);
+        break;
+
       case 'cobranzas/cobrar-cliente':
         result = cobrarClienteHoy(data);
         break;
@@ -565,6 +570,15 @@ function handleRequest(e, method) {
         }
         break;
       
+      // Deudas a proveedores cargadas a mano (lo que se les debía antes de usar la app)
+      case 'deudas-proveedores':
+        if (actualMethod === 'GET') {
+          result = getDeudasProveedores();
+        } else if (actualMethod === 'POST') {
+          result = agregarDeudaProveedor(data);
+        }
+        break;
+
       // Stock
       case 'stock':
         if (actualMethod === 'GET') {
@@ -786,6 +800,12 @@ function readSheetValues(sheetName) {
   return _sheetValuesCache[sheetName];
 }
 
+/** Como readSheetValues, pero si la hoja todavía no existe devuelve vacío en vez de crearla (las lecturas no escriben). */
+function readSheetValuesSiExiste_(sheetName) {
+  if (!getSpreadsheet().getSheetByName(sheetName)) return { headers: [], rows: [] };
+  return readSheetValues(sheetName);
+}
+
 function readUsedValues_(sheet) {
   var lastRow = sheet.getLastRow();
   var lastCol = sheet.getLastColumn();
@@ -881,6 +901,7 @@ function invalidateServerCacheForSheet(sheetName) {
     keys.push('sc:saldos');
     keys.push('sc:medios_prov');
   }
+  if (sheetName === CONFIG.SHEETS.DEUDAS_PROVEEDORES) keys.push('sc:saldos');
   if (sheetName === CONFIG.SHEETS.CIERRE_DIA) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.PRECIOS_CLIENTE) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.COBRANZAS) keys.push('sc:cobranzas');
@@ -1002,6 +1023,7 @@ function resetAllDatos(confirmacion) {
     CONFIG.SHEETS.CIERRE_DIA,
     CONFIG.SHEETS.COBRANZAS,
     CONFIG.SHEETS.PAGOS_PROVEEDORES,
+    CONFIG.SHEETS.DEUDAS_PROVEEDORES,
     CONFIG.SHEETS.CAJA_MOVIMIENTOS,
     CONFIG.SHEETS.STOCK_BEBIDAS
   ];
@@ -1070,8 +1092,9 @@ function initializeSheet(sheet, sheetName) {
     'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
     'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria', 'precio_real', 'comision_pct'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
-    'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos'],
+    'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos', 'origen', 'nota'],
     'PagosProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'metodo', 'nota'],
+    'DeudasProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'nota'],
     'CajaMovimientos': ['id', 'fecha', 'tipo', 'monto', 'nota', 'referencia'],
     'StockBebidas': ['producto_id', 'stock_actual', 'minimo'],
     'Configuracion': ['clave', 'valor']
@@ -1639,6 +1662,7 @@ function deleteProveedor(id) {
     { cantidad: contarReferencias_(CONFIG.SHEETS.PEDIDOS, 'proveedor_id', id), etiqueta: 'pedido(s)' },
     { cantidad: contarReferencias_(CONFIG.SHEETS.RECEPCION, 'proveedor_id', id), etiqueta: 'recepción(es)' },
     { cantidad: contarReferencias_(CONFIG.SHEETS.PAGOS_PROVEEDORES, 'proveedor_id', id), etiqueta: 'pago(s)' },
+    { cantidad: contarReferencias_(CONFIG.SHEETS.DEUDAS_PROVEEDORES, 'proveedor_id', id), etiqueta: 'deuda(s) cargada(s)' },
     { cantidad: contarReferencias_(CONFIG.SHEETS.PRODUCTOS, 'proveedor_default', id), etiqueta: 'producto(s) que lo usan como habitual' }
   ]);
   const sheet = getSheet(CONFIG.SHEETS.PROVEEDORES);
@@ -1685,6 +1709,19 @@ function calcularTodosSaldosProveedores() {
       saldos[proveedorId] += total;
     }
   });
+
+  // Lo que se les debía antes de usar la app y se cargó a mano.
+  var deudas = readSheetValuesSiExiste_(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  var idxProvD = deudas.headers.indexOf('proveedor_id');
+  var idxMontoD = deudas.headers.indexOf('monto');
+  if (idxProvD !== -1 && idxMontoD !== -1) {
+    deudas.rows.forEach(function(row) {
+      var proveedorId = row[idxProvD];
+      if (!proveedorId) return;
+      if (!saldos[proveedorId]) saldos[proveedorId] = 0;
+      saldos[proveedorId] += normalizeAmount(row[idxMontoD]);
+    });
+  }
 
   var pagos = readSheetValues(CONFIG.SHEETS.PAGOS_PROVEEDORES);
   var headersP = pagos.headers;
@@ -3369,9 +3406,15 @@ function getCobranzas(fecha = null, clienteId = null) {
   clientes.forEach(function(c) { clientesMap[c.id] = c; });
 
   var cobranzas = [];
+  var origenIdx = headers.indexOf('origen');
 
   cached.rows.forEach(function(row) {
     if (fechaBusqueda && normalizeFecha(row[1]) !== fechaBusqueda) {
+      return;
+    }
+    // Una deuda cargada a mano es de antes de la app: no es la cobranza que se arma con los precios
+    // de un día, así que las consultas "de un día" no la incluyen.
+    if (fechaBusqueda && origenIdx !== -1 && String(row[origenIdx] || '') === 'manual') {
       return;
     }
     if (clienteId && row[2] !== clienteId) {
@@ -3533,10 +3576,12 @@ function sincronizarCobranzasConPrecios(fecha) {
   var pagadoCol = headers.indexOf('pagado') !== -1 ? headers.indexOf('pagado') : 4;
   var saldoCol = headers.indexOf('saldo') !== -1 ? headers.indexOf('saldo') : 5;
   var estadoCol = headers.indexOf('estado') !== -1 ? headers.indexOf('estado') : 6;
+  var origenCol = headers.indexOf('origen');
   var changed = false;
 
   for (var i = 1; i < data.length; i++) {
     if (normalizeFecha(data[i][fechaCol]) !== fechaNorm) continue;
+    if (origenCol !== -1 && String(data[i][origenCol] || '') === 'manual') continue;
     var cid = String(data[i][clienteCol]);
     if (totales[cid] === undefined) continue;
     var total = totales[cid];
@@ -3626,6 +3671,48 @@ function cobrarClienteHoy(data) {
 }
 
 /**
+ * Agrega a mano lo que un cliente ya debía antes de usar la app (o una deuda vieja). Queda como una
+ * cobranza pendiente más (se cobra con "Cobrar", aparece en la cuenta corriente y en los saldos),
+ * marcada como "manual" para que no se confunda con la cobranza que se arma con los precios del día.
+ * data: { cliente_id, fecha (anterior a hoy), total, nota? }
+ */
+function agregarCobranzaPendiente(data) {
+  if (!data || !data.cliente_id) throw new Error('Elegí el cliente');
+  var cliente = findInIdMap(getClientesMap(), data.cliente_id);
+  if (!cliente) throw new Error('Ese cliente no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  var total = normalizeAmount(data.total);
+  if (total <= 0) throw new Error('Poné cuánto te debe (un monto mayor a cero)');
+  var fecha = normalizeFecha(data.fecha);
+  if (!fecha) throw new Error('Poné desde qué fecha te debe');
+  if (fecha >= todayArgentina()) {
+    throw new Error('La fecha tiene que ser anterior a hoy. Lo de hoy se carga con los pedidos y los precios.');
+  }
+  var nota = limpiarTexto_(data.nota);
+
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  ensureCobranzasMediosColumn_(sheet);
+  ensureCobranzasColumna_(sheet, 'depositos');
+  ensureCobranzasColumna_(sheet, 'origen');
+  ensureCobranzasColumna_(sheet, 'nota');
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var id = generateId();
+  var valores = {
+    id: id, fecha: fecha, cliente_id: data.cliente_id, total: total, pagado: 0, saldo: total,
+    estado: 'pendiente', origen: 'manual', nota: nota
+  };
+  var fila = headers.map(function(h) { return valores[h] !== undefined ? valores[h] : ''; });
+  sheet.appendRow(fila);
+  invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+
+  return {
+    id: id, fecha: fecha, cliente_id: data.cliente_id, cliente_nombre: cliente.nombre,
+    total: total, pagado: 0, saldo: total, estado: 'pendiente',
+    medios: mediosVacios_(), depositos: [], origen: 'manual', nota: nota
+  };
+}
+
+/**
  * Deja el cobro del cliente en un monto exacto (no suma).
  * data: { fecha, cliente_id, pagado }
  */
@@ -3657,8 +3744,10 @@ function ajustarCobroClienteHoy(data) {
   var saldoIdx = headers.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
   var estadoIdx = headers.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
 
+  var origenIdxAjuste = headers.indexOf('origen');
   var rowIdx = -1;
   for (var i = 1; i < values.length; i++) {
+    if (origenIdxAjuste !== -1 && String(values[i][origenIdxAjuste] || '') === 'manual') continue;
     if (normalizeFecha(values[i][fechaIdx]) === fechaNorm && idsMatch(values[i][clienteIdx], data.cliente_id)) {
       rowIdx = i;
       break;
@@ -3735,6 +3824,40 @@ function getPagosProveedores() {
   }
   
   return pagos;
+}
+
+/** Deudas a proveedores cargadas a mano (lo que se les debía antes de usar la app). */
+function getDeudasProveedores() {
+  var cached = readSheetValuesSiExiste_(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  return rowsToObjects(cached.headers, cached.rows).map(function(deuda) {
+    deuda.fecha = normalizeFecha(deuda.fecha) || deuda.fecha;
+    deuda.monto = normalizeAmount(deuda.monto);
+    return deuda;
+  });
+}
+
+/**
+ * Suma al saldo de un proveedor lo que ya se le debía. Después se paga con "Pagar", como cualquier saldo.
+ * data: { proveedor_id, fecha (hoy o antes), monto, nota? }
+ */
+function agregarDeudaProveedor(data) {
+  if (!data || !data.proveedor_id) throw new Error('Elegí el proveedor');
+  var proveedor = getProveedoresList().filter(function(p) { return idsMatch(p.id, data.proveedor_id); })[0];
+  if (!proveedor) throw new Error('Ese proveedor no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  var monto = normalizeAmount(data.monto);
+  if (monto <= 0) throw new Error('Poné cuánto le debés (un monto mayor a cero)');
+  var fecha = normalizeFecha(data.fecha);
+  if (!fecha) throw new Error('Poné desde qué fecha le debés');
+  if (fecha > todayArgentina()) throw new Error('La fecha no puede ser futura');
+  var nota = limpiarTexto_(data.nota);
+
+  var sheet = getSheet(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  var id = generateId();
+  sheet.appendRow([id, fecha, data.proveedor_id, monto, nota]);
+  invalidateSheetCache(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+
+  return { id: id, fecha: fecha, proveedor_id: data.proveedor_id, proveedor_nombre: proveedor.nombre, monto: monto, nota: nota };
 }
 
 function registrarPago(data) {
@@ -3914,7 +4037,7 @@ function planCobroCliente_(clienteId, fechaCaja, monto) {
     return String(a.fecha || '').localeCompare(String(b.fecha || ''));
   });
 
-  var cubiertaHoy = cobranzas.some(function(c) { return c.fecha === fechaCaja; });
+  var cubiertaHoy = cobranzas.some(function(c) { return c.fecha === fechaCaja && c.origen !== 'manual'; });
   var hoyExtra = 0;
   if (!cubiertaHoy) {
     getPreciosCliente(fechaCaja).forEach(function(p) {

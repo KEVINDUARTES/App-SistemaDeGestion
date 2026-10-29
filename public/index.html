@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261028planilla">
+    <link rel="stylesheet" href="styles.css?v=20261029calendarios">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -165,7 +165,9 @@
                 </a>
                 <ul class="nav-submenu">
                     <li><a href="#" data-page="historial" class="nav-link">Historial de Días</a></li>
+                    <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo, junto con los otros 3 bloques marcados igual.
                     <li><a href="#" data-page="reparto" class="nav-link">Repartir efectivo</a></li>
+                    -->
                     <li><a href="#" data-page="caja" class="nav-link">Caja</a></li>
                 </ul>
             </li>
@@ -191,10 +193,12 @@
         <!-- Dashboard -->
         <div id="dashboard" class="page active">
             <div id="dashboard-pendientes-banner" class="pendientes-banner" hidden></div>
+            <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo.
             <div class="reparto-acceso">
                 <button type="button" class="btn btn-primary" id="btn-ir-reparto">Repartir efectivo</button>
                 <p>Anotá el efectivo que entró de un cliente y descontalo a los proveedores.</p>
             </div>
+            -->
             <!-- Saldos por cliente y por proveedor (solo para algunos usuarios: ver Dashboard.USUARIOS_CON_SALDOS) -->
             <div id="dashboard-saldos" class="saldos-inicio" hidden>
                 <div class="saldos-inicio-acciones">
@@ -403,8 +407,9 @@
             </div>
             <div class="dia-operativo-bar" data-dia-page="camiones">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="camiones-fecha-select">Pedido del día:</label>
-                    <select id="camiones-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="camiones-fecha-input">Pedido del día:</label>
+                    <input type="date" id="camiones-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="camiones-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="camiones-fecha-texto"></span>
                 </div>
                 <p class="dia-operativo-hint" id="camiones-hint">Repartí los clientes del día en camiones. Cada cliente va en uno solo. La hoja muestra cuánto va a cada uno, el total del camión y el puesto.</p>
             </div>
@@ -421,8 +426,9 @@
             </div>
             <div class="dia-operativo-bar" data-dia-page="recepcion">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="recepcion-fecha-select">Pedido del día:</label>
-                    <select id="recepcion-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="recepcion-fecha-input">Pedido del día:</label>
+                    <input type="date" id="recepcion-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="recepcion-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="recepcion-fecha-texto"></span>
                     <span class="dia-operativo-estado" id="recepcion-estado-dia"></span>
                 </div>
                 <p class="dia-operativo-hint">Confirmá <strong>cada producto</strong> cuando llegue. Al confirmar se arma la lista de precios al cliente con lo que llegó. Los que falten podés confirmarlos otro día (poné 0 en "Llegó" si no vino).</p>
@@ -465,8 +471,9 @@
             </div>
             <div class="dia-operativo-bar" data-dia-page="precios">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="precios-fecha-select">Pedido del día:</label>
-                    <select id="precios-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="precios-fecha-input">Pedido del día:</label>
+                    <input type="date" id="precios-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="precios-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="precios-fecha-texto"></span>
                     <span class="dia-operativo-estado" id="precios-estado-dia"></span>
                 </div>
                 <p class="dia-operativo-hint">Asigná precios al cliente para el día del pedido, después de confirmar la recepción.</p>
@@ -573,8 +580,9 @@
             </div>
             <div class="dia-operativo-bar" data-dia-page="cobros-hoy">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="cobros-hoy-fecha-select">Pedido del día:</label>
-                    <select id="cobros-hoy-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="cobros-hoy-fecha-input">Pedido del día:</label>
+                    <input type="date" id="cobros-hoy-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="cobros-hoy-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="cobros-hoy-fecha-texto"></span>
                 </div>
                 <p class="dia-operativo-hint" id="cobros-hoy-hint">Cobrás en efectivo, transferencia, cheque o tarjeta. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).</p>
             </div>
@@ -608,8 +616,9 @@
             </div>
             <div class="dia-operativo-bar" data-dia-page="cierre">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="cierre-fecha-select">Pedido del día:</label>
-                    <select id="cierre-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="cierre-fecha-input">Pedido del día:</label>
+                    <input type="date" id="cierre-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="cierre-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="cierre-fecha-texto"></span>
                     <span class="dia-operativo-estado" id="cierre-estado-dia"></span>
                 </div>
                     <p class="dia-operativo-hint">Último paso del día. Acá ves el resumen de lo que ya hiciste (recepción, precios, cobros y pagos) y recién ahí cerrás.</p>
@@ -639,7 +648,7 @@
             <div class="page-header">
                 <h2>Cobranzas a clientes (pendientes)</h2>
             </div>
-            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. En Cuenta ves cada carga y cada pago, y lo podés enviar en PDF por WhatsApp.</p>
+            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. En Cuenta ves cada carga y cada pago, y lo podés enviar en PDF por WhatsApp. Si un cliente ya te debía de antes, agregalo con "Agregar cobranza a cliente".</p>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -658,6 +667,7 @@
                 </table>
             </div>
             <div class="page-actions">
+                <button class="btn btn-primary" id="btn-agregar-cobranza" type="button">Agregar cobranza a cliente</button>
                 <button class="btn btn-secondary" id="btn-seguir-pagos" type="button">Seguir a pagos pendientes</button>
             </div>
         </div>
@@ -669,8 +679,9 @@
             </div>
             <div class="dia-operativo-bar" id="pagos-dia-bar" data-dia-page="pagos">
                 <div class="dia-operativo-bar-main">
-                    <label class="dia-operativo-label" for="pagos-fecha-select">Pedido del día:</label>
-                    <select id="pagos-fecha-select" class="form-control dia-operativo-select"></select>
+                    <label class="dia-operativo-label" for="pagos-fecha-input">Pedido del día:</label>
+                    <input type="date" id="pagos-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="pagos-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="pagos-fecha-texto"></span>
                 </div>
             </div>
             <p class="dia-operativo-hint" id="pagos-hint">Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).</p>
@@ -694,6 +705,7 @@
                 </table>
             </div>
             <div class="page-actions">
+                <button class="btn btn-primary" id="btn-agregar-pago-pendiente" type="button" hidden>Agregar pago a proveedor pendiente</button>
                 <button class="btn btn-secondary" id="btn-seguir-cierre" type="button">Seguir a cerrar el día</button>
             </div>
         </div>
@@ -776,6 +788,7 @@
             </div>
         </div>
 
+        <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo.
         <div id="reparto" class="page">
             <div class="page-header">
                 <h2>Repartir efectivo</h2>
@@ -783,11 +796,14 @@
             <p class="dia-operativo-hint">Entrá el efectivo de un cliente. Si de eso le das a un proveedor, se descuenta el saldo de cada uno. Lo que no repartís queda en la caja.</p>
             <div id="reparto-root"></div>
         </div>
+        -->
 
         <div id="caja" class="page">
             <div class="page-header">
                 <h2>Caja</h2>
+                <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo.
                 <button type="button" class="btn btn-primary" id="btn-caja-repartir">Repartir efectivo</button>
+                -->
             </div>
             <div class="dia-operativo-bar">
                 <div class="dia-operativo-bar-main">
@@ -882,7 +898,7 @@
     <script src="services/whatsapp.js?v=20261021web"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261028planilla"></script>
+    <script src="app.js?v=20261029calendarios"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

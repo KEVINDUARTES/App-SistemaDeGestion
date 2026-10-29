@@ -4043,3 +4043,29 @@ html {
 .planilla-pedidos tr[hidden] {
     display: none;
 }
+/* La columna Total va en blanco en las filas de productos; el azul queda en el encabezado y en el pie. */
+.planilla-pedidos tbody td.planilla-total {
+    background: var(--color-white);
+}
+/* La fila de totales de abajo también va en blanco. */
+.planilla-pedidos tfoot th,
+.planilla-pedidos tfoot td,
+.planilla-pedidos tfoot td.planilla-total {
+    background: var(--color-white);
+    border-top: 2px solid var(--color-gray-300);
+}
+
+/* Fila para agregar una cobranza / un pago pendiente a mano */
+.data-table tr.fila-nueva td {
+    background: var(--color-info-light);
+    vertical-align: top;
+}
+.data-table tr.fila-nueva .form-control { width: 100%; min-width: 0; }
+.fila-nueva-nota { margin-top: 6px; font-size: 0.85rem; }
+.fila-nueva-hint { font-size: 0.8rem; color: var(--color-gray-600); }
+.fila-nota { display: block; font-size: 0.78rem; color: var(--color-gray-600); margin-top: 2px; }
+@keyframes fila-resaltar { from { background: var(--color-warning-light); } to { background: transparent; } }
+.data-table tr.fila-recien-agregada td { animation: fila-resaltar 3.5s ease-out; }
+@media (prefers-reduced-motion: reduce) { .data-table tr.fila-recien-agregada td { animation: none; background: var(--color-warning-light); } }
+.fila-nueva-etiqueta { display: block; font-size: 0.75rem; font-weight: 600; color: var(--color-gray-600); margin-bottom: 4px; }
+@media (max-width: 768px) { .fila-nueva-etiqueta { display: none; } }
