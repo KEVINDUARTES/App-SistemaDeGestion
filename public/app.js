@@ -6294,11 +6294,23 @@ const Recepcion = {
         return hayAlgo ? Math.round(suma * 100) / 100 : '';
     },
 
+    // Un producto que todavía nadie tocó viene con lo pedido (se da por llegado todo): solo se cambia
+    // lo que no coincide. Si alguien ya cargó algo (aunque sea un 0), se respeta lo cargado.
+    _sinCargar(item) {
+        const confirmada = item.confirmado === true || item.confirmado === 'true';
+        if (confirmada || Number(item.llego) > 0) return false;
+        if (this._leerBorrador(AppState.currentDate)[String(item.producto_id)]) return false;
+        return Number(item.pedido_total) > 0;
+    },
+
     _htmlReparto(item, confirmada) {
         const clientes = this._clientesDe(item.producto_id);
         if (!clientes.length) return '';
-        const reparto = this._repartoDe(item);
-        const mostrar = confirmada || Number(item.llego) > 0;
+        const sinCargar = this._sinCargar(item);
+        const reparto = sinCargar
+            ? Object.fromEntries(clientes.map(c => [c.cliente_id, c.cantidadPedida]))
+            : this._repartoDe(item);
+        const mostrar = confirmada || sinCargar || Number(item.llego) > 0;
         const filas = clientes.map(c => `
             <label class="recepcion-cli">
                 <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
@@ -6747,7 +6759,9 @@ const Recepcion = {
 
             // Sin confirmar y sin cargar, los campos quedan vacíos (el 0 es solo de ayuda): así se escribe
             // directo, sin borrar un 0 en cada producto. Vacío vale lo mismo que 0 al confirmar.
-            const llegoValor = confirmada || Number(item.llego) > 0 ? (item.llego || 0) : '';
+            const llegoValor = confirmada || Number(item.llego) > 0
+                ? (item.llego || 0)
+                : (this._sinCargar(item) ? Utils.formatCantidadInput(item.pedido_total) : '');
             const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
             rowsHtml += `
                 <tr${rowClass}>
