@@ -621,6 +621,11 @@ const Utils = {
         return String(Math.round(v * 100) / 100).replace('.', ',');
     },
 
+    // Para campos numéricos: lleva punto decimal (un <input type="number"> no entiende la coma).
+    formatCantidadInput(n) {
+        return String(Math.round((Number(n) || 0) * 100) / 100);
+    },
+
     parseComision(value) {
         if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
         const raw = String(value ?? '').trim();
@@ -4169,6 +4174,7 @@ const Camiones = {
             if (btn.dataset.accion === 'quitar-cliente') this.quitarCliente(id, btn.dataset.cliente);
             if (btn.dataset.accion === 'quitar-camion') this.quitar(id);
             if (btn.dataset.accion === 'imprimir') this.imprimir(id);
+            if (btn.dataset.accion === 'excel') this.descargarExcel(id);
             if (btn.dataset.accion === 'enviar') this.enviar(id);
         });
         root.addEventListener('change', (event) => {
@@ -4409,6 +4415,7 @@ const Camiones = {
                     ${this._tabla(camion)}
                     <div class="camion-acciones">
                         <button class="btn btn-secondary btn-sm" type="button" data-accion="imprimir" data-camion="${camion.id}">Imprimir</button>
+                        <button class="btn btn-secondary btn-sm" type="button" data-accion="excel" data-camion="${camion.id}">Excel</button>
                         <button class="btn btn-whatsapp btn-sm" type="button" data-accion="enviar" data-camion="${camion.id}">WhatsApp</button>
                     </div>
                 </article>
@@ -4564,6 +4571,146 @@ const Camiones = {
 
     imprimirTodos() {
         this.imprimir(null);
+    },
+
+    // Excel de la hoja de carga: un libro con una hoja por camión, con el mismo diseño que el PDF
+    // (encabezado azul, filas alternadas, totales resaltados) y listo para imprimir en A4 apaisado.
+    async _cargarExcelJS() {
+        if (window.ExcelJS) return window.ExcelJS;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo cargar el generador de Excel'));
+            document.head.appendChild(script);
+        });
+        if (!window.ExcelJS) throw new Error('No se pudo cargar el generador de Excel');
+        return window.ExcelJS;
+    },
+
+    async descargarExcel(camionId) {
+        const lista = camionId
+            ? this.lista.filter(c => String(c.id) === String(camionId))
+            : this.lista;
+        if (!lista.length) {
+            Utils.showError('Agregá un camión primero.');
+            return;
+        }
+        try {
+            const ExcelJS = await this._cargarExcelJS();
+            const libro = new ExcelJS.Workbook();
+            libro.creator = 'Luciano Cargas';
+            const AZUL = 'FF1A73E8', AZUL_CLARO = 'FFE8F1FD', GRIS = 'FFF1F5F9', BORDE = 'FFCBD5E1', BLANCO = 'FFFFFFFF';
+            const relleno = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+            const borde = { bottom: { style: 'thin', color: { argb: BORDE } } };
+            const usados = new Set();
+
+            lista.forEach((camion, i) => {
+                const { clientes, productos, total } = this._matriz(camion);
+                const nombre = String(camion.nombre || `Camión ${i + 1}`).replace(/[\\/?*\[\]:]/g, ' ').trim().slice(0, 28) || `Camión ${i + 1}`;
+                let unico = nombre;
+                for (let n = 2; usados.has(unico.toLowerCase()); n++) unico = `${nombre} ${n}`;
+                usados.add(unico.toLowerCase());
+
+                const hoja = libro.addWorksheet(unico, {
+                    views: [{ state: 'frozen', ySplit: 4, showGridLines: false }],
+                    pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 } }
+                });
+                const colTotal = clientes.length + 2;
+                const colProv = clientes.length + 3;
+                const ultima = colProv;
+                hoja.getColumn(1).width = 32;
+                clientes.forEach((_, k) => { hoja.getColumn(k + 2).width = 13; });
+                hoja.getColumn(colTotal).width = 11;
+                hoja.getColumn(colProv).width = 24;
+
+                // Título
+                hoja.mergeCells(1, 1, 1, ultima);
+                const titulo = hoja.getCell(1, 1);
+                titulo.value = `Luciano Cargas · Hoja de carga · ${camion.nombre}`;
+                titulo.font = { name: 'Calibri', size: 18, bold: true, color: { argb: BLANCO } };
+                titulo.fill = relleno(AZUL);
+                titulo.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+                hoja.getRow(1).height = 32;
+
+                hoja.mergeCells(2, 1, 2, ultima);
+                const fechaCelda = hoja.getCell(2, 1);
+                fechaCelda.value = `Fecha de carga: ${this._fechaHoja()}`;
+                fechaCelda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF475569' } };
+                fechaCelda.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+                hoja.getRow(2).height = 22;
+                hoja.getRow(3).height = 6;
+
+                // Encabezado de la tabla
+                const cabecera = hoja.getRow(4);
+                cabecera.values = ['Producto', ...clientes.map(c => c.nombre), 'Total', 'Proveedor'];
+                cabecera.height = 34;
+                cabecera.eachCell((celda, col) => {
+                    celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: BLANCO } };
+                    celda.fill = relleno(AZUL);
+                    celda.alignment = { vertical: 'middle', horizontal: col === 1 || col === colProv ? 'left' : 'center', wrapText: true, indent: col === 1 || col === colProv ? 1 : 0 };
+                });
+
+                // Filas de productos
+                if (!productos.length) {
+                    hoja.mergeCells(5, 1, 5, ultima);
+                    const vacia = hoja.getCell(5, 1);
+                    vacia.value = 'Este camión no tiene pedidos.';
+                    vacia.font = { name: 'Calibri', size: 12, italic: true, color: { argb: 'FF64748B' } };
+                    vacia.alignment = { horizontal: 'center', vertical: 'middle' };
+                    hoja.getRow(5).height = 28;
+                }
+                productos.forEach((row, k) => {
+                    const fila = hoja.getRow(5 + k);
+                    fila.values = [row.producto, ...clientes.map(c => row.cants[c.id] || null), row.total, row.puesto];
+                    fila.height = 24;
+                    fila.eachCell({ includeEmpty: true }, (celda, col) => {
+                        if (col > ultima) return;
+                        celda.fill = relleno(k % 2 ? GRIS : BLANCO);
+                        celda.border = borde;
+                        celda.font = { name: 'Calibri', size: 13, bold: col === 1 || col === colTotal || (col > 1 && col < colTotal), color: { argb: col === colTotal ? AZUL : 'FF0F172A' } };
+                        celda.alignment = { vertical: 'middle', horizontal: col === 1 || col === colProv ? 'left' : 'center', indent: col === 1 || col === colProv ? 1 : 0 };
+                        if (col > 1 && col <= colTotal) celda.numFmt = '#,##0.##';
+                        if (col === colTotal) { celda.fill = relleno(AZUL_CLARO); celda.font = { name: 'Calibri', size: 13, bold: true, color: { argb: AZUL } }; }
+                        if (col === colProv) celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF334155' } };
+                    });
+                });
+
+                // Total a cargar
+                const filaTotal = hoja.getRow(5 + Math.max(productos.length, 1) + 1);
+                filaTotal.height = 28;
+                hoja.mergeCells(filaTotal.number, 1, filaTotal.number, colTotal - 1);
+                const etiqueta = hoja.getCell(filaTotal.number, 1);
+                etiqueta.value = 'Total a cargar';
+                etiqueta.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+                etiqueta.fill = relleno(AZUL);
+                etiqueta.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+                const valor = hoja.getCell(filaTotal.number, colTotal);
+                valor.value = total;
+                valor.numFmt = '#,##0.##';
+                valor.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+                valor.fill = relleno(AZUL);
+                valor.alignment = { vertical: 'middle', horizontal: 'center' };
+
+                // Al imprimir, el encabezado se repite en cada hoja.
+                hoja.pageSetup.printTitlesRow = '4:4';
+                hoja.headerFooter.oddFooter = '&CLuciano Cargas · &P de &N';
+            });
+
+            const buffer = await libro.xlsx.writeBuffer();
+            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const enlace = document.createElement('a');
+            enlace.href = url;
+            enlace.download = `hoja-de-carga-${AppState.currentDate || 'dia'}.xlsx`;
+            document.body.appendChild(enlace);
+            enlace.click();
+            enlace.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        } catch (error) {
+            console.error('Error armando el Excel de carga:', error);
+            Utils.showError('No se pudo armar el Excel: ' + error.message);
+        }
     },
 
     enviar(camionId) {
@@ -6053,6 +6200,114 @@ const Recepcion = {
         return lista.filter(item => this._proveedorDe(item) === this._filtroProveedor);
     },
 
+    // ---- Cuánto de lo que llegó le toca a cada cliente ----
+    // Por defecto se reparte en proporción a lo pedido; se puede ajustar a mano cliente por cliente
+    // (por ejemplo, "este vino de menos: se lo descuento a uno solo").
+    _pedidosDia: [],
+    _pedidosDiaFecha: '',
+
+    _clientesDe(productoId) {
+        if (this._pedidosDiaFecha !== AppState.currentDate) return [];
+        const porCliente = new Map();
+        (this._pedidosDia || []).forEach(pedido => {
+            if (String(pedido.producto_id) !== String(productoId)) return;
+            const id = String(pedido.cliente_id);
+            if (!porCliente.has(id)) {
+                porCliente.set(id, { cliente_id: id, nombre: pedido.cliente_nombre || '', cantidadPedida: 0 });
+            }
+            porCliente.get(id).cantidadPedida += parseFloat(pedido.cantidad) || 0;
+        });
+        const clientes = [...porCliente.values()];
+        clientes.forEach(c => {
+            if (!c.nombre) {
+                const cli = (AppState.clientes || []).find(x => String(x.id) === c.cliente_id);
+                c.nombre = cli?.nombre || 'Cliente';
+            }
+        });
+        return clientes.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    // Reparto en proporción a lo pedido: { cliente_id: cantidad }.
+    _repartoAuto(clientes, llego) {
+        const lineas = clientes.map(c => ({ cliente_id: c.cliente_id, cantidadPedida: c.cantidadPedida }));
+        const mapa = {};
+        Precios.repartirRecibido(lineas, Number(llego) || 0).forEach(l => { mapa[String(l.cliente_id)] = l.cantidad; });
+        return mapa;
+    },
+
+    // El reparto guardado solo vale si cubre a todos los clientes y suma exactamente lo que llegó.
+    _repartoValido(reparto, clientes, llego) {
+        if (!reparto || typeof reparto !== 'object') return false;
+        if (!clientes.length || !clientes.every(c => reparto[c.cliente_id] !== undefined)) return false;
+        const suma = clientes.reduce((t, c) => t + (Number(reparto[c.cliente_id]) || 0), 0);
+        return Math.abs(suma - (Number(llego) || 0)) <= 0.05;
+    },
+
+    _repartoDe(item) {
+        const clientes = this._clientesDe(item.producto_id);
+        if (this._repartoValido(item.reparto, clientes, item.llego)) return item.reparto;
+        return this._repartoAuto(clientes, item.llego);
+    },
+
+    _inputsReparto(productoId, raiz) {
+        // En el cuadro de "Editar" los campos son otros (modal-reparto) para no mezclarse con los de la tabla.
+        const base = raiz || document;
+        const clase = raiz ? '.modal-reparto' : '.recepcion-reparto';
+        return [...base.querySelectorAll(`${clase}[data-producto-id="${productoId}"]`)];
+    },
+
+    // Lo que se ve en pantalla como reparto, o null si es el automático (no hace falta guardarlo).
+    _repartoDeLaPantalla(productoId, llego, raiz) {
+        const inputs = this._inputsReparto(productoId, raiz);
+        if (!inputs.length) return null;
+        const clientes = this._clientesDe(productoId);
+        const auto = this._repartoAuto(clientes, llego);
+        const mapa = {};
+        let distinto = false;
+        inputs.forEach(input => {
+            const id = input.getAttribute('data-cliente-id');
+            const n = Utils.parseCantidad(input.value);
+            mapa[id] = isNaN(n) ? 0 : Math.max(0, n);
+            if (Math.abs(mapa[id] - (auto[id] || 0)) > 0.005) distinto = true;
+        });
+        return distinto ? mapa : null;
+    },
+
+    // Al cambiar el total, cada cliente vuelve a su parte proporcional.
+    _rellenarReparto(productoId, llego, raiz) {
+        const clientes = this._clientesDe(productoId);
+        const auto = this._repartoAuto(clientes, llego);
+        this._inputsReparto(productoId, raiz).forEach(input => {
+            const id = input.getAttribute('data-cliente-id');
+            input.value = llego > 0 ? Utils.formatCantidadInput(auto[id] || 0) : '';
+        });
+    },
+
+    // Al tocar la parte de un cliente, el total pasa a ser la suma de todos.
+    _sumarReparto(productoId, raiz) {
+        let suma = 0;
+        let hayAlgo = false;
+        this._inputsReparto(productoId, raiz).forEach(input => {
+            const n = Utils.parseCantidad(input.value);
+            if (!isNaN(n)) { suma += n; hayAlgo = true; }
+        });
+        return hayAlgo ? Math.round(suma * 100) / 100 : '';
+    },
+
+    _htmlReparto(item, confirmada) {
+        const clientes = this._clientesDe(item.producto_id);
+        if (!clientes.length) return '';
+        const reparto = this._repartoDe(item);
+        const mostrar = confirmada || Number(item.llego) > 0;
+        const filas = clientes.map(c => `
+            <label class="recepcion-cli">
+                <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
+                <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
+                <input type="number" step="any" min="0" class="recepcion-reparto" data-producto-id="${item.producto_id}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${mostrar ? Utils.formatCantidadInput(reparto[c.cliente_id] || 0) : ''}" placeholder="0"${confirmada ? ' disabled' : ''} title="Cuánto le toca de lo que llegó">
+            </label>`).join('');
+        return `<tr class="recepcion-detalle${confirmada ? ' recepcion-row-confirmada' : ''}"><td colspan="6"><div class="recepcion-cli-lista"><span class="recepcion-cli-titulo">Para cada cliente:</span>${filas}</div></td></tr>`;
+    },
+
     findById(list, id) {
         if (!list || id === null || id === undefined) return null;
         return list.find(item => String(item.id) === String(id)) || null;
@@ -6144,12 +6399,20 @@ const Recepcion = {
         });
 
         const guardarCampo = (e) => {
-            const input = e.target.closest('.recepcion-llego, .recepcion-precio');
+            const input = e.target.closest('.recepcion-llego, .recepcion-precio, .recepcion-reparto');
             if (!input || input.disabled) return;
             const productoId = input.getAttribute('data-producto-id');
             if (!productoId) return;
-            const { llego, precio } = this.getValoresProducto(productoId);
-            this._aplicarCambio(productoId, llego, precio);
+            if (input.classList.contains('recepcion-reparto')) {
+                // El total pasa a ser la suma de lo que le toca a cada cliente.
+                const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${productoId}"]`);
+                if (llegoInput) llegoInput.value = this._sumarReparto(productoId);
+            } else if (input.classList.contains('recepcion-llego')) {
+                const n = Utils.parseCantidad(input.value);
+                this._rellenarReparto(productoId, isNaN(n) ? 0 : Math.max(0, n));
+            }
+            const { llego, precio, reparto } = this.getValoresProducto(productoId);
+            this._aplicarCambio(productoId, llego, precio, reparto);
         };
         tbody.addEventListener('input', guardarCampo);
         tbody.addEventListener('change', guardarCampo);
@@ -6182,9 +6445,9 @@ const Recepcion = {
         localStorage.setItem(this._claveBorrador(fecha), JSON.stringify(map || {}));
     },
 
-    _ponerBorrador(fecha, productoId, llego, precio) {
+    _ponerBorrador(fecha, productoId, llego, precio, reparto) {
         const map = this._leerBorrador(fecha);
-        map[String(productoId)] = { llego, precio };
+        map[String(productoId)] = { llego, precio, reparto: reparto || null };
         this._guardarBorrador(fecha, map);
     },
 
@@ -6201,7 +6464,7 @@ const Recepcion = {
             const confirmado = item.confirmado === true || item.confirmado === 'true';
             const borrador = map[String(item.producto_id)];
             if (!borrador || confirmado) return item;
-            return { ...item, llego: borrador.llego, precio_real: borrador.precio };
+            return { ...item, llego: borrador.llego, precio_real: borrador.precio, reparto: borrador.reparto || null };
         });
     },
 
@@ -6220,15 +6483,16 @@ const Recepcion = {
         if (Array.isArray(flujo.precios)) CacheManager.set(`precios:${fecha}`, flujo.precios);
     },
 
-    _aplicarCambio(productoId, llego, precio) {
+    _aplicarCambio(productoId, llego, precio, reparto) {
         const fecha = AppState.currentDate;
-        this._ponerBorrador(fecha, productoId, llego, precio);
+        this._ponerBorrador(fecha, productoId, llego, precio, reparto);
         const idx = (AppState.recepcion || []).findIndex(r => String(r.producto_id) === String(productoId));
         if (idx !== -1) {
             AppState.recepcion[idx] = {
                 ...AppState.recepcion[idx],
                 llego,
-                precio_real: precio
+                precio_real: precio,
+                reparto: reparto || null
             };
         }
         this._reflejarEnCache(fecha);
@@ -6258,6 +6522,7 @@ const Recepcion = {
                 producto_id: productoId,
                 llego: map[productoId].llego,
                 precio_real: map[productoId].precio,
+                reparto: map[productoId].reparto || null,
                 pedido_total: item?.pedido_total || 0,
                 proveedor_id: item?.proveedor_id || ''
             };
@@ -6284,9 +6549,11 @@ const Recepcion = {
             const productoId = input.getAttribute('data-producto-id');
             if (!productoId) return;
             const precioInput = document.querySelector(`#recepcion-tbody .recepcion-precio[data-producto-id="${productoId}"]`);
+            const llegoEdicion = Utils.parseCantidad(input.value) || 0;
             map[String(productoId)] = {
-                llego: Utils.parseCantidad(input.value) || 0,
-                precio: Utils.parsePrice(precioInput?.value || 0)
+                llego: llegoEdicion,
+                precio: Utils.parsePrice(precioInput?.value || 0),
+                reparto: this._repartoDeLaPantalla(productoId, llegoEdicion)
             };
         });
         return map;
@@ -6329,7 +6596,11 @@ const Recepcion = {
         const flujoRecordado = flujoLocal || CacheManager.peek(`flujo:${fecha}`);
         if (flujoRecordado && !flujoLocal) {
             AppState.recepcion = this._fusionarBorrador(flujoRecordado.recepcion || [], fecha);
-            if (Array.isArray(flujoRecordado.pedidos)) AppState.pedidos = flujoRecordado.pedidos;
+            if (Array.isArray(flujoRecordado.pedidos)) {
+                AppState.pedidos = flujoRecordado.pedidos;
+                this._pedidosDia = flujoRecordado.pedidos;
+                this._pedidosDiaFecha = fecha;
+            }
             this.render();
         } else if (AppState.fechaCargada === fecha && (AppState.recepcion || []).length) {
             AppState.recepcion = this._fusionarBorrador(AppState.recepcion, fecha);
@@ -6348,6 +6619,8 @@ const Recepcion = {
             const ediciones = this._capturarEdiciones();
             const recepciones = flujo.recepcion || [];
             const pedidos = flujo.pedidos || [];
+            this._pedidosDia = pedidos;
+            this._pedidosDiaFecha = fecha;
             const productos = AppState.productos?.length
                 ? AppState.productos
                 : await API.getProductos();
@@ -6391,6 +6664,7 @@ const Recepcion = {
                 const conservarLocal = local && (local.confirmado === true || local.confirmado === 'true') && !confirmado;
                 let llego = rec?.llego ?? 0;
                 let precioReal = rec?.precio_real ?? 0;
+                let reparto = rec?.reparto || null;
                 if (confirmado) {
                     this._quitarBorrador(fecha, productoId);
                 } else if (borrador) {
@@ -6399,12 +6673,15 @@ const Recepcion = {
                     if (Number(borrador.llego) !== Number(llego) || precioBorrador !== precioServidor) pendiente = true;
                     llego = borrador.llego;
                     precioReal = borrador.precio;
+                    reparto = borrador.reparto || null;
                 } else if (conservarLocal) {
                     llego = local.llego ?? llego;
                     precioReal = local.precio_real ?? precioReal;
+                    reparto = local.reparto || reparto;
                 } else if (edicion) {
                     llego = edicion.llego;
                     precioReal = edicion.precio;
+                    reparto = edicion.reparto || null;
                 }
 
                 recepcionesFinales.push({
@@ -6414,6 +6691,7 @@ const Recepcion = {
                     pedido_total: pedidoInfo.pedido_total,
                     llego,
                     precio_real: precioReal,
+                    reparto,
                     proveedor_nombre: rec?.proveedor_nombre || proveedor?.nombre || local?.proveedor_nombre || '',
                     proveedor_id: (confirmado && rec?.proveedor_id) || proveedorPedidoId || rec?.proveedor_id || producto?.proveedor_default || local?.proveedor_id || '',
                     confirmado: confirmado || conservarLocal
@@ -6480,6 +6758,7 @@ const Recepcion = {
                     <td>${Utils.esc(item.proveedor_nombre || '')}</td>
                     <td class="recepcion-acciones">${accionCell}</td>
                 </tr>
+                ${this._htmlReparto(item, confirmada)}
             `;
         });
         
@@ -6501,7 +6780,8 @@ const Recepcion = {
             items.push({
                 producto_id: productoId,
                 llego: llego,
-                precio_real: precio
+                precio_real: precio,
+                reparto: this._repartoDeLaPantalla(productoId, llego)
             });
         });
         
@@ -6539,11 +6819,11 @@ const Recepcion = {
         const incompletos = [];
         const sinCargar = [];
         pendientes.forEach(item => {
-            const { llego, precio } = this.getValoresProducto(item.producto_id);
+            const { llego, precio, reparto } = this.getValoresProducto(item.producto_id);
             const nombre = item.producto_nombre || 'producto';
             if (!(llego > 0)) sinCargar.push(nombre);
             else if (precio <= 0) incompletos.push(nombre);
-            else listos.push({ item, llego, precio });
+            else listos.push({ item, llego, precio, reparto });
         });
 
         if (listos.length === 0) {
@@ -6564,6 +6844,7 @@ const Recepcion = {
                     ...AppState.recepcion[idx],
                     llego: entrada.llego,
                     precio_real: entrada.precio,
+                    reparto: entrada.reparto || null,
                     confirmado: true
                 };
             }
@@ -6582,6 +6863,7 @@ const Recepcion = {
                     producto_id: entrada.item.producto_id,
                     llego: entrada.llego,
                     precio_real: entrada.precio,
+                    reparto: entrada.reparto || null,
                     proveedor_id: entrada.item.proveedor_id,
                     pedido_total: entrada.item.pedido_total
                 });
@@ -6606,7 +6888,8 @@ const Recepcion = {
         const precioInput = document.querySelector(`.recepcion-precio[data-producto-id="${productoId}"]`);
         const llego = Utils.parseCantidad(llegoInput?.value);
         const precio = Utils.parsePrice(precioInput?.value || 0);
-        return { llego: isNaN(llego) ? 0 : Math.max(0, llego), precio };
+        const llegoFinal = isNaN(llego) ? 0 : Math.max(0, llego);
+        return { llego: llegoFinal, precio, reparto: this._repartoDeLaPantalla(productoId, llegoFinal) };
     },
 
     async confirmarProducto(productoId) {
@@ -6620,7 +6903,7 @@ const Recepcion = {
             return;
         }
 
-        const { llego, precio } = this.getValoresProducto(productoId);
+        const { llego, precio, reparto } = this.getValoresProducto(productoId);
         if (llego > 0 && precio <= 0) {
             Utils.showError('Ingresá el precio real antes de confirmar');
             return;
@@ -6644,6 +6927,7 @@ const Recepcion = {
                 ...AppState.recepcion[idx],
                 llego,
                 precio_real: precio,
+                reparto: reparto || null,
                 confirmado: true
             };
         }
@@ -6660,6 +6944,7 @@ const Recepcion = {
                 producto_id: productoId,
                 llego,
                 precio_real: precio,
+                reparto: reparto || null,
                 proveedor_id: item.proveedor_id,
                 pedido_total: item.pedido_total
             });
@@ -6683,6 +6968,8 @@ const Recepcion = {
 
         const nombre = item.producto_nombre || 'producto';
         const nombreSafe = nombre.replace(/"/g, '&quot;');
+        const clientesModal = this._clientesDe(productoId);
+        const repartoModal = this._repartoDe(item);
         const content = `
             <div class="form-group">
                 <label>Producto</label>
@@ -6693,9 +6980,22 @@ const Recepcion = {
                 <input type="text" class="form-control" value="${item.pedido_total || 0}" disabled>
             </div>
             <div class="form-group">
-                <label>Llegó</label>
+                <label>Llegó (total)</label>
                 <input type="number" step="any" id="modal-recepcion-llego" class="form-control" min="0" value="${item.llego || 0}">
             </div>
+            ${clientesModal.length ? `
+            <div class="form-group">
+                <label>Para cada cliente</label>
+                <div id="modal-recepcion-reparto" class="recepcion-cli-modal">
+                    ${clientesModal.map(c => `
+                    <label class="recepcion-cli">
+                        <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
+                        <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
+                        <input type="number" step="any" min="0" class="modal-reparto" data-producto-id="${item.producto_id}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${Utils.formatCantidadInput(repartoModal[c.cliente_id] || 0)}">
+                    </label>`).join('')}
+                </div>
+                <small class="modal-hint">Si cambiás el total, se reparte en proporción a lo pedido. Si cambiás lo de un cliente, el total se ajusta solo.</small>
+            </div>` : ''}
             <div class="form-group">
                 <label>Precio real (costo por unidad)</label>
                 <input type="text" id="modal-recepcion-precio" class="form-control" data-price-input="true" value="${Utils.formatPrice(item.precio_real || 0)}" placeholder="Costo del proveedor" title="Lo que te cobró el proveedor por unidad">
@@ -6711,24 +7011,27 @@ const Recepcion = {
                 Utils.showError('Ingresá una cantidad válida en "Llegó"');
                 throw new Error('Cantidad inválida');
             }
+            const modalBody = document.getElementById('modal-body');
+            const reparto = this._repartoDeLaPantalla(productoId, llego, modalBody);
             if (llego > 0 && precio <= 0) {
                 Utils.showError('Ingresá el precio real cuando llegó mercadería');
                 throw new Error('Precio real requerido');
             }
 
             const yaConfirmado = item.confirmado === true || item.confirmado === 'true';
-            const anterior = { llego: item.llego, precio_real: item.precio_real };
+            const anterior = { llego: item.llego, precio_real: item.precio_real, reparto: item.reparto || null };
             const delta = (yaConfirmado ? this._subtotal(llego, precio) : 0) - (yaConfirmado ? this._subtotal(item.llego, item.precio_real) : 0);
             const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
             if (idx !== -1) {
                 AppState.recepcion[idx] = {
                     ...AppState.recepcion[idx],
                     llego,
-                    precio_real: precio
+                    precio_real: precio,
+                    reparto: reparto || null
                 };
             }
             this._ajustarSaldoProveedor(item.proveedor_id, delta);
-            this._ponerBorrador(AppState.currentDate, productoId, llego, precio);
+            this._ponerBorrador(AppState.currentDate, productoId, llego, precio, reparto);
             CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
             CacheManager.invalidate(`flujo:${AppState.currentDate}`);
             this.render();
@@ -6741,6 +7044,7 @@ const Recepcion = {
                         producto_id: productoId,
                         llego,
                         precio_real: precio,
+                        reparto: reparto || null,
                         pedido_total: item.pedido_total,
                         proveedor_id: item.proveedor_id
                     }]
@@ -6752,16 +7056,35 @@ const Recepcion = {
                     AppState.recepcion[actual] = {
                         ...AppState.recepcion[actual],
                         llego: anterior.llego,
-                        precio_real: anterior.precio_real
+                        precio_real: anterior.precio_real,
+                        reparto: anterior.reparto
                     };
                 }
                 this._ajustarSaldoProveedor(item.proveedor_id, -delta);
-                this._ponerBorrador(AppState.currentDate, productoId, anterior.llego, anterior.precio_real);
+                this._ponerBorrador(AppState.currentDate, productoId, anterior.llego, anterior.precio_real, anterior.reparto);
                 CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
                 this.render();
                 Utils.showError('No se pudo guardar la recepción.');
             });
         });
+
+        // Dentro del cuadro: el total y lo de cada cliente se mantienen de acuerdo entre sí.
+        // (Los listeners van en elementos del cuadro, que se crean de nuevo cada vez que se abre.)
+        const cuerpo = document.getElementById('modal-body');
+        const totalModal = document.getElementById('modal-recepcion-llego');
+        const listaModal = document.getElementById('modal-recepcion-reparto');
+        if (cuerpo && totalModal && listaModal) {
+            totalModal.addEventListener('input', () => {
+                const n = Utils.parseCantidad(totalModal.value);
+                const auto = this._repartoAuto(clientesModal, isNaN(n) ? 0 : n);
+                this._inputsReparto(productoId, cuerpo).forEach(input => {
+                    input.value = Utils.formatCantidadInput(auto[input.getAttribute('data-cliente-id')] || 0);
+                });
+            });
+            listaModal.addEventListener('input', () => {
+                totalModal.value = this._sumarReparto(productoId, cuerpo);
+            });
+        }
     },
 
     async eliminarProducto(productoId) {
@@ -7801,7 +8124,15 @@ const Precios = {
                 avisosFaltante.push(`${nombre}: pedido ${pedidoTotal}, llegó ${llego}`);
             }
 
-            this.repartirRecibido(lineas, llego).forEach(linea => {
+            // Si se repartió a mano (a quién le toca de más o de menos), se respeta; si no, es proporcional.
+            const repartoManual = recepcion.reparto && typeof recepcion.reparto === 'object' ? recepcion.reparto : null;
+            const manualValido = repartoManual
+                && lineas.every(l => repartoManual[String(l.cliente_id)] !== undefined)
+                && Math.abs(lineas.reduce((t, l) => t + (Number(repartoManual[String(l.cliente_id)]) || 0), 0) - llego) <= 0.05;
+            const repartidas = manualValido
+                ? lineas.map(l => ({ ...l, cantidad: Math.round((Number(repartoManual[String(l.cliente_id)]) || 0) * 100) / 100 }))
+                : this.repartirRecibido(lineas, llego);
+            repartidas.forEach(linea => {
                 const existentes = (AppState.precios || []).filter(p =>
                     String(p.cliente_id) === String(linea.cliente_id) &&
                     String(p.producto_id) === String(linea.producto_id)
@@ -13097,6 +13428,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-seguir-recepcion', () => Navigation.navigateTo('camiones'), 'Abriendo...');
     addButtonListener('btn-camiones-agregar', () => Camiones.agregar(), 'Agregando...', { useButtonLoader: false });
     addButtonListener('btn-camiones-imprimir', () => Camiones.imprimirTodos(), 'Imprimiendo...', { useButtonLoader: false });
+    addButtonListener('btn-camiones-excel', () => Camiones.descargarExcel(null), 'Armando Excel...', { useButtonLoader: false });
     addButtonListener('btn-camiones-enviar', () => Camiones.enviarTodos(), 'Preparando...', { useButtonLoader: false });
     addButtonListener('btn-seguir-desde-camiones', () => Navigation.navigateTo('recepcion'), 'Abriendo...');
     Camiones.enganchar();

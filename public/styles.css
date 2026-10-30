@@ -4069,3 +4069,18 @@ html {
 @media (prefers-reduced-motion: reduce) { .data-table tr.fila-recien-agregada td { animation: none; background: var(--color-warning-light); } }
 .fila-nueva-etiqueta { display: block; font-size: 0.75rem; font-weight: 600; color: var(--color-gray-600); margin-bottom: 4px; }
 @media (max-width: 768px) { .fila-nueva-etiqueta { display: none; } }
+
+/* Recepción: lo que le toca a cada cliente de lo que llegó */
+/* El detalle por cliente forma parte de la fila del producto: misma grilla, sin línea ni color que los separe. */
+#recepcion-tbody tr:has(+ .recepcion-detalle) td { border-bottom: none; padding-bottom: 6px; }
+#recepcion-tbody tr:has(+ .recepcion-detalle):hover,
+#recepcion-tbody tr.recepcion-detalle:hover { transform: none; box-shadow: none; }
+.recepcion-detalle td { padding: 0 16px 14px; background: transparent; }
+.recepcion-cli-lista { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
+.recepcion-cli-titulo { font-size: 12px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: .04em; }
+.recepcion-cli { display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 4px 8px; font-size: 13px; }
+.recepcion-cli-nombre { font-weight: 600; color: #1e293b; }
+.recepcion-cli-pidio { color: #64748b; font-size: 12px; }
+.recepcion-cli input { width: 72px; padding: 4px 6px; text-align: center; }
+.recepcion-cli-modal { display: flex; flex-direction: column; gap: 6px; }
+.recepcion-cli-modal .recepcion-cli { justify-content: space-between; }

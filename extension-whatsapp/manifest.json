@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Luciano Cargas - WhatsApp",
+  "version": "1.3",
+  "description": "Abre los chats de WhatsApp Web en la pestaña que ya tenés abierta, sin abrir pestañas nuevas.",
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://web.whatsapp.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.netlify.app/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://web.whatsapp.com/*"
+      ],
+      "js": [
+        "whatsapp-pagina.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

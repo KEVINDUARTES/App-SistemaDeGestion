@@ -1089,7 +1089,7 @@ function initializeSheet(sheet, sheetName) {
     'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default', 'comision_tipo', 'comision_valor', 'por_kilo'],
     'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado', 'proveedor_id'],
     'Camiones': ['id', 'fecha', 'nombre', 'orden', 'clientes'],
-    'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado'],
+    'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado', 'reparto'],
     'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria', 'precio_real', 'comision_pct'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
     'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos', 'origen', 'nota'],
@@ -2605,6 +2605,46 @@ function guardarCamiones(data) {
 
 // ========== RECEPCIÓN ==========
 
+/**
+ * Cuánto de lo que llegó de un producto le toca a cada cliente: { cliente_id: cantidad }.
+ * Se guarda como texto JSON en la columna "reparto". Vacío = se reparte en proporción a lo pedido.
+ * Si viene, tiene que sumar exactamente lo que llegó (con una tolerancia de centavos).
+ */
+function normalizarReparto_(reparto, llego, estricto) {
+  var raw = reparto;
+  if (typeof raw === 'string') {
+    var texto = raw.trim();
+    if (!texto) return '';
+    try { raw = JSON.parse(texto); } catch (error) { return ''; }
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
+  var limpio = {};
+  var suma = 0;
+  Object.keys(raw).forEach(function(clienteId) {
+    var n = Number(String(raw[clienteId] === undefined || raw[clienteId] === null ? '' : raw[clienteId]).replace(',', '.'));
+    if (!isFinite(n) || n < 0) throw new Error('Una cantidad por cliente no es válida');
+    n = Math.round(n * 100) / 100;
+    limpio[String(clienteId)] = n;
+    suma += n;
+  });
+  if (!Object.keys(limpio).length) return '';
+  suma = Math.round(suma * 100) / 100;
+  if (estricto && Math.abs(suma - Number(llego)) > 0.05) {
+    throw new Error('Lo repartido entre los clientes (' + suma + ') no coincide con lo que llegó (' + llego + ')');
+  }
+  return JSON.stringify(limpio);
+}
+
+function parseReparto_(valor) {
+  if (!valor) return null;
+  try {
+    var data = typeof valor === 'string' ? JSON.parse(valor) : valor;
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function getRecepcion(fecha = null) {
   var fechaBusqueda = fecha ? normalizeFecha(fecha) : null;
   if (fechaBusqueda) {
@@ -2637,6 +2677,7 @@ function getRecepcion(fecha = null) {
       recepcion.fecha = normalizeFecha(recepcion.fecha);
     }
     recepcion.precio_real = normalizeAmount(recepcion.precio_real);
+    recepcion.reparto = parseReparto_(recepcion.reparto);
 
     var producto = findInIdMap(productosMap, recepcion.producto_id);
     recepcion.producto_nombre = producto ? producto.nombre : (recepcion.producto_nombre || '');
@@ -2669,6 +2710,10 @@ function saveRecepcion(data) {
   const productoCol  = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 2;
   const llegoCol     = headers.indexOf('llego')       !== -1 ? headers.indexOf('llego')       : 5;
   const precioCol    = headers.indexOf('precio_real') !== -1 ? headers.indexOf('precio_real') : 6;
+  var traeReparto = (data.items || []).some(function(item) { return item.reparto !== undefined; });
+  if (traeReparto) ensureColumn(sheet, 'reparto');
+  var headersRep = traeReparto ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] : headers;
+  var repartoCol = headersRep.indexOf('reparto');
 
   const recepcionIndex = {};
   for (let i = 1; i < values.length; i++) {
@@ -2695,11 +2740,16 @@ function saveRecepcion(data) {
 
       var key = fechaNormalizada + '|' + item.producto_id;
       var rowIdx = recepcionIndex[key];
+      var repartoItem = item.reparto !== undefined ? normalizarReparto_(item.reparto, item.llego || 0, false) : undefined;
       if (rowIdx !== undefined) {
         values[rowIdx][llegoCol]  = item.llego || 0;
         values[rowIdx][precioCol] = normalizeAmount(item.precio_real);
+        if (repartoItem !== undefined && repartoCol !== -1) {
+          while (values[rowIdx].length <= repartoCol) values[rowIdx].push('');
+          values[rowIdx][repartoCol] = repartoItem;
+        }
       } else {
-        rowsToAppend.push([
+        var filaNueva = [
           generateId(),
           data.fecha,
           item.producto_id,
@@ -2708,14 +2758,24 @@ function saveRecepcion(data) {
           item.llego || 0,
           normalizeAmount(item.precio_real),
           false
-        ]);
+        ];
+        if (repartoItem !== undefined && repartoCol !== -1) {
+          while (filaNueva.length <= repartoCol) filaNueva.push('');
+          filaNueva[repartoCol] = repartoItem;
+        }
+        rowsToAppend.push(filaNueva);
       }
     });
 
-    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    // Todas las filas tienen que tener el mismo ancho (la hoja pudo ganar la columna "reparto" recién).
+    var ancho = Math.max(headersRep.length, values[0].length);
+    values[0] = headersRep.slice();
+    values.forEach(function(fila) { while (fila.length < ancho) fila.push(''); });
+    rowsToAppend.forEach(function(fila) { while (fila.length < ancho) fila.push(''); });
+    sheet.getRange(1, 1, values.length, ancho).setValues(values);
     if (rowsToAppend.length > 0) {
       var startRow = sheet.getLastRow() + 1;
-      sheet.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+      sheet.getRange(startRow, 1, rowsToAppend.length, ancho).setValues(rowsToAppend);
     }
   }
 
@@ -2802,10 +2862,13 @@ function confirmarRecepcionItem(data) {
     throw new Error('Ingresá el precio real cuando llegó mercadería');
   }
   assertDiaAbierto_(data.fecha);
+  var repartoTexto = data.reparto !== undefined ? normalizarReparto_(data.reparto, llego, true) : undefined;
 
   var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
+  if (repartoTexto !== undefined) ensureColumn(sheet, 'reparto');
   var values = readUsedValues_(sheet);
   var headers = values.length ? values[0] : [];
+  var repartoCol = headers.indexOf('reparto');
   var fechaCol = headers.indexOf('fecha');
   var productoCol = headers.indexOf('producto_id');
   var llegoCol = headers.indexOf('llego');
@@ -2842,6 +2905,7 @@ function confirmarRecepcionItem(data) {
     nueva[llegoCol] = llego;
     nueva[precioCol] = precioReal;
     nueva[confirmadoCol] = true;
+    if (repartoTexto !== undefined && repartoCol !== -1) nueva[repartoCol] = repartoTexto;
     for (var c = 0; c < nueva.length; c++) {
       if (nueva[c] === undefined) nueva[c] = '';
     }
@@ -2850,6 +2914,10 @@ function confirmarRecepcionItem(data) {
     values[rowIdx][llegoCol] = llego;
     values[rowIdx][precioCol] = precioReal;
     values[rowIdx][confirmadoCol] = true;
+    if (repartoTexto !== undefined && repartoCol !== -1) {
+      while (values[rowIdx].length <= repartoCol) values[rowIdx].push('');
+      values[rowIdx][repartoCol] = repartoTexto;
+    }
     sheet.getRange(rowIdx + 1, 1, 1, values[rowIdx].length).setValues([values[rowIdx]]);
   }
 

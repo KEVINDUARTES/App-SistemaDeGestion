@@ -12,6 +12,8 @@ class WhatsAppError extends Error {
 }
 
 const WhatsAppService = {
+    _extensionLista: false,
+
     DEFAULT_COUNTRY_CODE: '54',
     WINDOW_NAME: 'whatsapp_window',
 
@@ -76,6 +78,29 @@ const WhatsAppService = {
         // en vez de abrir una nueva cada vez que se envía un mensaje
         if (this.isMobile()) {
             window.location.href = url;
+        } else if (this._extensionLista) {
+            // La extensión usa la pestaña de WhatsApp Web que ya está abierta.
+            const id = String(Date.now());
+            let respondio = false;
+            const alResponder = (event) => {
+                if (event.source !== window || !event.data || event.data.id !== id) return;
+                if (event.data.tipo === 'LC_WHATSAPP_LISTO') {
+                    respondio = true;
+                    window.removeEventListener('message', alResponder);
+                } else if (event.data.tipo === 'LC_WHATSAPP_EXTENSION_CAIDA') {
+                    // Extensión recargada con esta pestaña abierta: se abre como siempre.
+                    respondio = true;
+                    this._extensionLista = false;
+                    window.removeEventListener('message', alResponder);
+                    this._wspWindow = window.open(url, this.WINDOW_NAME);
+                }
+            };
+            window.addEventListener('message', alResponder);
+            window.postMessage({ tipo: 'LC_WHATSAPP_ABRIR', id: id, url: url }, '*');
+            setTimeout(() => {
+                window.removeEventListener('message', alResponder);
+                if (!respondio) this._wspWindow = window.open(url, this.WINDOW_NAME);
+            }, 1500);
         } else {
             this._wspWindow = window.open(url, this.WINDOW_NAME);
         }
@@ -114,3 +139,11 @@ const WhatsAppService = {
         return 'manual';
     }
 };
+
+// La extensión de Chrome avisa que está instalada.
+window.addEventListener('message', (event) => {
+    if (event.source === window && event.data && event.data.tipo === 'LC_WHATSAPP_EXTENSION') {
+        WhatsAppService._extensionLista = true;
+    }
+});
+window.postMessage({ tipo: 'LC_WHATSAPP_PING' }, '*');

@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261029calendarios">
+    <link rel="stylesheet" href="styles.css?v=20261030reparto2">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -401,6 +401,7 @@
                 <h2>Armar camiones</h2>
                 <div class="page-header-actions">
                     <button class="btn btn-secondary" id="btn-camiones-imprimir" type="button">Imprimir todos</button>
+                    <button class="btn btn-secondary" id="btn-camiones-excel" type="button">Descargar Excel</button>
                     <button class="btn btn-whatsapp" id="btn-camiones-enviar" type="button">Enviar todos</button>
                     <button class="btn btn-primary" id="btn-camiones-agregar" type="button">Agregar camión</button>
                 </div>
@@ -895,10 +896,10 @@
         <a href="#" data-page="cierre" class="nav-link"><span>7</span>Cierre</a>
     </nav>
     <script src="auth.js?v=20261013hoja"></script>
-    <script src="services/whatsapp.js?v=20261021web"></script>
+    <script src="services/whatsapp.js?v=20261030ext2"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261029calendarios"></script>
+    <script src="app.js?v=20261030reparto"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {
