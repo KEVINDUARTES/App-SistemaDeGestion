@@ -4670,7 +4670,6 @@ const Camiones = {
                         celda.border = borde;
                         celda.font = { name: 'Calibri', size: 13, bold: col === 1 || col === colTotal || (col > 1 && col < colTotal), color: { argb: col === colTotal ? AZUL : 'FF0F172A' } };
                         celda.alignment = { vertical: 'middle', horizontal: col === 1 || col === colProv ? 'left' : 'center', indent: col === 1 || col === colProv ? 1 : 0 };
-                        if (col > 1 && col <= colTotal) celda.numFmt = '#,##0.##';
                         if (col === colTotal) { celda.fill = relleno(AZUL_CLARO); celda.font = { name: 'Calibri', size: 13, bold: true, color: { argb: AZUL } }; }
                         if (col === colProv) celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF334155' } };
                     });
@@ -4687,7 +4686,6 @@ const Camiones = {
                 etiqueta.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
                 const valor = hoja.getCell(filaTotal.number, colTotal);
                 valor.value = total;
-                valor.numFmt = '#,##0.##';
                 valor.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
                 valor.fill = relleno(AZUL);
                 valor.alignment = { vertical: 'middle', horizontal: 'center' };
