@@ -477,6 +477,9 @@ function handleRequest(e, method) {
         break;
       
       // Precios Cliente
+      case 'precios-cliente/limpiar':
+        result = limpiarPreciosHuerfanos(data);
+        break;
       case 'precios-cliente':
         if (actualMethod === 'GET') {
           result = getPreciosCliente(data.fecha);
@@ -3370,7 +3373,53 @@ function savePreciosCliente(data) {
   invalidateServerCacheForSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
   invalidateServerCacheFecha(fechaNormalizada);
   sincronizarCobranzasConPrecios(fechaNormalizada);
-  return { success: true };
+  // Al armar la lista se quitan las líneas cuyo pedido ya no existe (se borró o se pasó a otro producto).
+  var quitadas = (data.limpiar_sin_pedido === true || data.limpiar_sin_pedido === 'true') ? limpiarPreciosSinPedido_(fechaNormalizada) : 0;
+  return { success: true, quitadas: quitadas };
+}
+
+/**
+ * Borra de la lista de precios del día las líneas (cliente + producto) que ya no tienen ningún pedido:
+ * pasa cuando un pedido se borra o se pasa a otro producto después de armar la lista.
+ * No toca días cerrados ni días sin pedidos. Devuelve cuántas líneas quitó.
+ */
+function limpiarPreciosSinPedido_(fecha) {
+  var fechaNorm = normalizeFecha(fecha);
+  if (!fechaNorm) return 0;
+  var cierre = findCierreRow(fechaNorm);
+  if (cierre.row && cierre.estado === 'cerrado') return 0;
+
+  var pedidos = getPedidos(fechaNorm);
+  if (!pedidos.length) return 0;
+  var conPedido = {};
+  pedidos.forEach(function(p) { conPedido[String(p.cliente_id) + '|' + String(p.producto_id)] = true; });
+
+  var sheet = getSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
+  var values = sheet.getDataRange().getValues();
+  var headers = values[0] || [];
+  var fechaIdx = headers.indexOf('fecha') !== -1 ? headers.indexOf('fecha') : 1;
+  var clienteIdx = headers.indexOf('cliente_id') !== -1 ? headers.indexOf('cliente_id') : 2;
+  var productoIdx = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 3;
+
+  var quitadas = 0;
+  for (var i = values.length - 1; i >= 1; i--) {
+    if (normalizeFecha(values[i][fechaIdx]) !== fechaNorm) continue;
+    if (conPedido[String(values[i][clienteIdx]) + '|' + String(values[i][productoIdx])]) continue;
+    sheet.deleteRow(i + 1);
+    quitadas++;
+  }
+  if (quitadas > 0) {
+    invalidateSheetCache(CONFIG.SHEETS.PRECIOS_CLIENTE);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PRECIOS_CLIENTE);
+    invalidateServerCacheFecha(fechaNorm);
+    sincronizarCobranzasConPrecios(fechaNorm);
+  }
+  return quitadas;
+}
+
+function limpiarPreciosHuerfanos(data) {
+  if (!data || !data.fecha) throw new Error('Falta el día');
+  return { success: true, quitadas: limpiarPreciosSinPedido_(data.fecha) };
 }
 
 function findPrecioCliente(fecha, clienteId, productoId) {

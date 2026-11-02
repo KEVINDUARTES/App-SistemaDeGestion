@@ -2074,6 +2074,16 @@ const API = {
         return result;
     },
     
+    async limpiarPreciosHuerfanos(fecha) {
+        const result = await this.request('precios-cliente/limpiar', 'POST', { fecha });
+        if (result && result.quitadas > 0) {
+            DataLoader.invalidateFlujo(fecha);
+            CacheManager.invalidatePattern('cobranzas');
+            this._invalidateFlujo();
+        }
+        return result;
+    },
+
     async savePreciosCliente(data) {
         const result = await this._enTandas('precios-cliente', data);
         DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
@@ -7629,6 +7639,24 @@ const Precios = {
         }
     },
     
+    // Una vez por día y por sesión: quita de la lista las líneas cuyo pedido ya no existe.
+    _limpiadas: new Set(),
+    _limpiarSinPedido(fecha) {
+        if (this._limpiadas.has(fecha) || DiaOperativo.diaCerrado(fecha)) return;
+        this._limpiadas.add(fecha);
+        API.limpiarPreciosHuerfanos(fecha).then(res => {
+            if (res && res.quitadas > 0 && AppState.currentDate === fecha) {
+                AppState.fechaCargada = null;
+                AppState.precios = [];
+                CacheManager.invalidate(`precios:${fecha}`);
+                if (AppState.currentPage === 'precios') this.load();
+            }
+        }).catch(error => {
+            this._limpiadas.delete(fecha);
+            console.warn('No se pudieron limpiar líneas sin pedido:', error);
+        });
+    },
+
     async load() {
         const tbody = document.getElementById('precios-tbody');
         if (!tbody) return;
@@ -7641,6 +7669,7 @@ const Precios = {
             this.render();
             return;
         }
+        this._limpiarSinPedido(fecha);
 
         const preciosFrescos = CacheManager.get(`precios:${fecha}`);
         const cachedPrecios = preciosFrescos || CacheManager.peek(`precios:${fecha}`);
@@ -8460,7 +8489,8 @@ const Precios = {
         await API.savePreciosCliente({
             fecha: AppState.currentDate,
             comision_por_unidad: this.comisionPorUnidad,
-            items: preciosItems
+            items: preciosItems,
+            limpiar_sin_pedido: true
         });
         // load() devuelve lo que ya tiene si cree que el día está cargado: hay que forzar la lectura.
         AppState.fechaCargada = null;
