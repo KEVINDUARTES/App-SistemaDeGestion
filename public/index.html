@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261030reparto2">
+    <link rel="stylesheet" href="styles.css?v=20261102preciosperm">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -372,7 +372,8 @@
                 </div>
             </div>
             <div class="table-container" id="pedidos-lista" hidden>
-                <table class="data-table">
+                <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar cliente o producto…" aria-label="Buscar cliente o producto…" autocomplete="off" data-filtro-tabla="#pedidos-tbody"></div>
+                            <table class="data-table">
                     <thead>
                         <tr>
                             <th>Cliente</th>
@@ -414,6 +415,7 @@
                 </div>
                 <p class="dia-operativo-hint" id="camiones-hint">Repartí los clientes del día en camiones. Cada cliente va en uno solo. La hoja muestra cuánto va a cada uno, el total del camión y el puesto.</p>
             </div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar producto o cliente…" aria-label="Buscar producto o cliente…" autocomplete="off" data-filtro-tabla="#camiones-root"></div>
             <div id="camiones-root"></div>
             <div class="page-actions">
                 <button class="btn btn-secondary" id="btn-seguir-desde-camiones" type="button">Seguir a recepción</button>
@@ -440,6 +442,8 @@
                 <select id="recepcion-filtro-proveedor" class="form-control" onchange="Recepcion.filtrarProveedor(this.value)">
                     <option value="">Todos los proveedores</option>
                 </select>
+                <label for="recepcion-filtro-producto">Producto:</label>
+                <input type="search" id="recepcion-filtro-producto" class="form-control" placeholder="Buscar producto…" autocomplete="off" oninput="Recepcion.filtrarProducto(this.value)">
                 <span id="recepcion-filtro-cuenta" class="modal-hint"></span>
             </div>
             <div class="table-container">
@@ -492,6 +496,12 @@
                     <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión general por unidad</label>
                     <input type="text" id="precios-comision" class="form-control" value="350" data-price-input="true" inputmode="numeric" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
                 </div>
+                <div class="form-group">
+                    <label class="checkbox-label" for="precios-mismo-precio" title="Al cambiar el precio de un producto, los demás clientes de ese producto quedan con el mismo precio. Apagalo para dar un precio especial a un cliente.">
+                        <input type="checkbox" id="precios-mismo-precio" checked>
+                        Mismo precio para todos los clientes
+                    </label>
+                </div>
                 <div class="form-group" style="display: flex; gap: 10px;">
                     <button class="btn btn-secondary" id="btn-limpiar-filtro" style="white-space: nowrap;">Limpiar filtro</button>
                 </div>
@@ -543,6 +553,7 @@
                 </div>
             </div>
             
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar producto o cliente…" aria-label="Buscar producto o cliente…" autocomplete="off" data-filtro-tabla="#precios-tbody"></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -587,6 +598,7 @@
                 </div>
                 <p class="dia-operativo-hint" id="cobros-hoy-hint">Cobrás en efectivo, transferencia, cheque o tarjeta. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).</p>
             </div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar cliente…" aria-label="Buscar cliente…" autocomplete="off" data-filtro-tabla="#cobros-hoy-tbody"></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -649,17 +661,16 @@
             <div class="page-header">
                 <h2>Cobranzas a clientes (pendientes)</h2>
             </div>
-            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. En Cuenta ves cada carga y cada pago, y lo podés enviar en PDF por WhatsApp. Si un cliente ya te debía de antes, agregalo con "Agregar cobranza a cliente".</p>
+            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. Si un cliente ya te debía de antes, agregalo con "Agregar cobranza a cliente".</p>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar cliente…" aria-label="Buscar cliente…" autocomplete="off" data-filtro-tabla="#cobranzas-tbody"></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
                         <tr>
                             <th>Cliente</th>
                             <th>Te debe</th>
-                            <th>Cómo pagó</th>
                             <th>Fecha</th>
                             <th>Estado</th>
-                            <th>Acciones</th>
                         </tr>
                     </thead>
                     <tbody id="cobranzas-tbody">
@@ -688,16 +699,15 @@
             <p class="dia-operativo-hint" id="pagos-hint">Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).</p>
             <div id="pagos-depositos" class="deposito-lista" hidden></div>
             <div id="pagos-resumen" class="pagos-resumen" hidden></div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar proveedor…" aria-label="Buscar proveedor…" autocomplete="off" data-filtro-tabla="#pagos-tbody"></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
                         <tr>
                             <th>Proveedor</th>
                             <th>Le debés</th>
-                            <th>Cómo pagaste</th>
                             <th>Mercadería de hoy</th>
                             <th>Estado</th>
-                            <th>Acciones</th>
                         </tr>
                     </thead>
                     <tbody id="pagos-tbody">
@@ -899,7 +909,7 @@
     <script src="services/whatsapp.js?v=20261030ext2"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261030excel32"></script>
+    <script src="app.js?v=20261102preciosperm"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

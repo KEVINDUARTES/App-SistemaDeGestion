@@ -893,15 +893,15 @@ function invalidateServerCacheForSheet(sheetName) {
   if (sheetName === CONFIG.SHEETS.PRODUCTOS) keys.push('sc:productos');
   if (sheetName === CONFIG.SHEETS.PROVEEDORES) {
     keys.push('sc:proveedores_list');
-    keys.push('sc:saldos');
+    keys.push('sc:saldos', 'sc:deudas_fecha');
   }
   if (sheetName === CONFIG.SHEETS.PEDIDOS) keys.push('sc:dias');
-  if (sheetName === CONFIG.SHEETS.RECEPCION) keys.push('sc:saldos');
+  if (sheetName === CONFIG.SHEETS.RECEPCION) keys.push('sc:saldos', 'sc:deudas_fecha');
   if (sheetName === CONFIG.SHEETS.PAGOS_PROVEEDORES) {
-    keys.push('sc:saldos');
+    keys.push('sc:saldos', 'sc:deudas_fecha');
     keys.push('sc:medios_prov');
   }
-  if (sheetName === CONFIG.SHEETS.DEUDAS_PROVEEDORES) keys.push('sc:saldos');
+  if (sheetName === CONFIG.SHEETS.DEUDAS_PROVEEDORES) keys.push('sc:saldos', 'sc:deudas_fecha');
   if (sheetName === CONFIG.SHEETS.CIERRE_DIA) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.PRECIOS_CLIENTE) keys.push('sc:dias');
   if (sheetName === CONFIG.SHEETS.COBRANZAS) keys.push('sc:cobranzas');
@@ -925,7 +925,7 @@ function invalidateServerCacheFecha(fecha) {
 
 function invalidateAllServerCache() {
   serverCacheRemoveMany([
-    'sc:clientes', 'sc:productos', 'sc:proveedores_list', 'sc:saldos',
+    'sc:clientes', 'sc:productos', 'sc:proveedores_list', 'sc:saldos', 'sc:deudas_fecha',
     'sc:cobranzas', 'sc:stock', 'sc:dias'
   ]);
 }
@@ -978,7 +978,7 @@ function fechasDeHoja_(sheetName) {
 
 function invalidateServerCacheTrasReset_(fechas) {
   var keys = [
-    'sc:clientes', 'sc:productos', 'sc:proveedores_list', 'sc:saldos',
+    'sc:clientes', 'sc:productos', 'sc:proveedores_list', 'sc:saldos', 'sc:deudas_fecha',
     'sc:cobranzas', 'sc:stock', 'sc:dias', 'sc:medios_prov'
   ];
   var todas = {};
@@ -1093,7 +1093,7 @@ function initializeSheet(sheet, sheetName) {
     'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria', 'precio_real', 'comision_pct'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
     'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos', 'origen', 'nota'],
-    'PagosProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'metodo', 'nota'],
+    'PagosProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'metodo', 'nota', 'aplica_fecha'],
     'DeudasProveedores': ['id', 'fecha', 'proveedor_id', 'monto', 'nota'],
     'CajaMovimientos': ['id', 'fecha', 'tipo', 'monto', 'nota', 'referencia'],
     'StockBebidas': ['producto_id', 'stock_actual', 'minimo'],
@@ -1586,9 +1586,13 @@ function getProveedores() {
   var list = getProveedoresList();
   var saldos = calcularTodosSaldosProveedores();
   var medios = resumirMediosProveedores();
+  var porFecha = calcularDeudasPorFechaProveedores();
   return list.map(function(proveedor) {
+    var detalle = porFecha[proveedor.id] || { deudas: [], a_favor: 0 };
     return Object.assign({}, proveedor, {
       saldo: saldos[proveedor.id] || 0,
+      deudas: detalle.deudas,
+      a_favor: detalle.a_favor,
       medios: medios[proveedor.id] || null
     });
   });
@@ -1739,6 +1743,109 @@ function calcularTodosSaldosProveedores() {
 
   serverCacheSet('sc:saldos', saldos, SERVER_CACHE_TTL.saldos);
   return saldos;
+}
+
+/**
+ * Lo que se le debe a cada proveedor, separado por la fecha en que quedó la deuda.
+ * Cada fecha suma la mercadería confirmada de ese día y la deuda cargada a mano con esa fecha.
+ * Un pago con aplica_fecha descuenta de esa fecha; los demás (de antes, o los del reparto de caja)
+ * van contra las fechas más viejas primero. Lo que sobra queda como saldo a favor.
+ * Devuelve { proveedor_id: { deudas: [{ fecha, debe, pagado, saldo }], a_favor } }.
+ */
+function calcularDeudasPorFechaProveedores() {
+  var sc = serverCacheGet('sc:deudas_fecha');
+  if (sc) return sc;
+
+  var mapa = {};
+  function de(proveedorId) {
+    if (!mapa[proveedorId]) mapa[proveedorId] = { fechas: {}, libre: 0 };
+    return mapa[proveedorId];
+  }
+  function fila(proveedorId, fecha) {
+    var p = de(proveedorId);
+    if (!p.fechas[fecha]) p.fechas[fecha] = { fecha: fecha, debe: 0, pagado: 0 };
+    return p.fechas[fecha];
+  }
+
+  var recepcion = readSheetValues(CONFIG.SHEETS.RECEPCION);
+  var hr = recepcion.headers;
+  var iFecha = hr.indexOf('fecha');
+  var iProv = hr.indexOf('proveedor_id');
+  var iLlego = hr.indexOf('llego');
+  var iPrecio = hr.indexOf('precio_real');
+  var iConf = hr.indexOf('confirmado');
+  if (iFecha === -1) iFecha = 1;
+  if (iProv === -1) iProv = 3;
+  if (iLlego === -1) iLlego = 5;
+  if (iPrecio === -1) iPrecio = 6;
+  if (iConf === -1) iConf = 7;
+  recepcion.rows.forEach(function(row) {
+    if (row[iConf] !== true || !row[iProv]) return;
+    var total = (row[iLlego] || 0) * normalizeAmount(row[iPrecio]);
+    if (!total) return;
+    fila(row[iProv], normalizeFecha(row[iFecha]) || '').debe += total;
+  });
+
+  var deudas = readSheetValuesSiExiste_(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  var iFD = deudas.headers.indexOf('fecha');
+  var iPD = deudas.headers.indexOf('proveedor_id');
+  var iMD = deudas.headers.indexOf('monto');
+  if (iPD !== -1 && iMD !== -1) {
+    deudas.rows.forEach(function(row) {
+      if (!row[iPD]) return;
+      fila(row[iPD], (iFD !== -1 && normalizeFecha(row[iFD])) || '').debe += normalizeAmount(row[iMD]);
+    });
+  }
+
+  var pagos = readSheetValues(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  var hp = pagos.headers;
+  var iPP = hp.indexOf('proveedor_id');
+  var iMP = hp.indexOf('monto');
+  var iAplica = hp.indexOf('aplica_fecha');
+  if (iPP === -1) iPP = 2;
+  if (iMP === -1) iMP = 3;
+  pagos.rows.forEach(function(row) {
+    var proveedorId = row[iPP];
+    if (!proveedorId) return;
+    var monto = normalizeAmount(row[iMP]);
+    var aplica = iAplica !== -1 ? normalizeFecha(row[iAplica]) : null;
+    if (aplica) fila(proveedorId, aplica).pagado += monto;
+    else de(proveedorId).libre += monto;
+  });
+
+  var resultado = {};
+  Object.keys(mapa).forEach(function(proveedorId) {
+    var p = mapa[proveedorId];
+    var lista = Object.keys(p.fechas).map(function(f) { return p.fechas[f]; })
+      .sort(function(a, b) { return a.fecha.localeCompare(b.fecha); });
+    var aFavor = 0;
+    var libre = p.libre;
+    lista.forEach(function(item) {
+      var saldo = item.debe - item.pagado;
+      if (saldo < 0) {
+        aFavor += -saldo;
+        item.pagado = item.debe;
+        saldo = 0;
+      }
+      if (libre > 0 && saldo > 0) {
+        var aplicado = Math.min(libre, saldo);
+        libre -= aplicado;
+        item.pagado += aplicado;
+        saldo -= aplicado;
+      }
+      item.saldo = Math.round(saldo * 100) / 100;
+      item.debe = Math.round(item.debe * 100) / 100;
+      item.pagado = Math.round(item.pagado * 100) / 100;
+    });
+    aFavor += libre;
+    resultado[proveedorId] = {
+      deudas: lista.filter(function(item) { return item.saldo > 0.009; }),
+      a_favor: Math.round(aFavor * 100) / 100
+    };
+  });
+
+  serverCacheSet('sc:deudas_fecha', resultado, SERVER_CACHE_TTL.saldos);
+  return resultado;
 }
 
 // Función legacy - mantener por compatibilidad
@@ -2002,7 +2109,6 @@ function porcentajeComision_(valor) {
 function comisionProducto_(data) {
   var tipo = String(data.comision_tipo === undefined || data.comision_tipo === null ? '' : data.comision_tipo).trim().toLowerCase();
   if (TIPOS_COMISION_.indexOf(tipo) === -1) throw new Error('Tipo de comisión inválido: ' + tipo);
-  if (tipo === 'general') tipo = '';
   var valor = '';
   if (tipo === 'monto') valor = normalizeAmount(data.comision_valor);
   if (tipo === 'porcentaje') valor = porcentajeComision_(data.comision_valor);
@@ -2366,8 +2472,34 @@ function cambiarProveedorProductoDia(data) {
     sheet.getRange(i + 1, 1, 1, values[i].length).setValues([values[i]]);
     cambiados.push(values[i][idIdx]);
   });
-  if (cambiados.length) invalidarPedidosDia_(fecha);
+  if (cambiados.length) {
+    invalidarPedidosDia_(fecha);
+    if (proveedorId) actualizarProveedorRecepcion_(fecha, data.producto_id, proveedorId);
+  }
   return { cambiados: cambiados, proveedor_id: proveedorId };
+}
+
+/**
+ * Cuando todos los pedidos del día de un producto pasan a un solo proveedor, la recepción de ese
+ * producto lo sigue: si ya hay una fila de ese proveedor no se toca; si no, la primera fila toma su lugar.
+ */
+function actualizarProveedorRecepcion_(fecha, productoId, proveedorId) {
+  var fechaNorm = normalizeFecha(fecha);
+  var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
+  var values = readUsedValues_(sheet);
+  if (values.length < 2) return;
+  var cols = columnasRecepcion_(values[0]);
+  var primera = -1;
+  for (var i = 1; i < values.length; i++) {
+    if (normalizeFecha(values[i][cols.fecha]) !== fechaNorm || !idsMatch(values[i][cols.producto], productoId)) continue;
+    if (String(values[i][cols.prov] || '') === String(proveedorId)) return;
+    if (primera === -1) primera = i;
+  }
+  if (primera === -1) return;
+  sheet.getRange(primera + 1, cols.prov + 1).setValue(proveedorId);
+  invalidateSheetCache(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.RECEPCION);
+  invalidateServerCacheFecha(fechaNorm);
 }
 
 /** Borra todos los pedidos del día de un producto (la acción "Eliminar" de la fila). */
@@ -2697,6 +2829,110 @@ function getRecepcion(fecha = null) {
   return recepciones;
 }
 
+// ---- Un mismo producto puede venir de más de un proveedor el mismo día ----
+// La recepción lleva una fila por producto Y proveedor. Los proveedores de un producto salen de los
+// pedidos del día (el del pedido o, si no tiene, el habitual del producto).
+
+/** { producto_id: [proveedor_id, ...] } con los proveedores de los pedidos dados. */
+function proveedoresPorProducto_(pedidos) {
+  var productosMap = getProductosMap();
+  var mapa = {};
+  (pedidos || []).forEach(function(p) {
+    var producto = findInIdMap(productosMap, p.producto_id);
+    var id = String(p.proveedor_id || (producto && producto.proveedor_default) || '');
+    var key = String(p.producto_id);
+    if (!mapa[key]) mapa[key] = [];
+    if (mapa[key].indexOf(id) === -1) mapa[key].push(id);
+  });
+  return mapa;
+}
+
+/**
+ * Fila (índice en values) de la recepción de un producto con un proveedor, o -1.
+ * Si el producto tiene un solo proveedor en el día y la fila quedó guardada con otro (se cambió en
+ * Pedidos después), esa fila se toma como la suya y se le corrige el proveedor.
+ */
+function buscarFilaRecepcion_(values, cols, fecha, productoId, proveedorId, requeridos) {
+  var buscado = String(proveedorId || '');
+  var posibles = (requeridos || []).map(String);
+  if (buscado && posibles.indexOf(buscado) === -1) posibles.push(buscado);
+  var huerfana = -1;
+  for (var i = 1; i < values.length; i++) {
+    if (normalizeFecha(values[i][cols.fecha]) !== fecha || !idsMatch(values[i][cols.producto], productoId)) continue;
+    var prov = String(values[i][cols.prov] || '');
+    if (prov === buscado) return i;
+    if (huerfana === -1 && posibles.indexOf(prov) === -1) huerfana = i;
+  }
+  return posibles.length <= 1 ? huerfana : -1;
+}
+
+function columnasRecepcion_(headers) {
+  function col(nombre, porDefecto) {
+    var i = headers.indexOf(nombre);
+    return i !== -1 ? i : porDefecto;
+  }
+  return { fecha: col('fecha', 1), producto: col('producto_id', 2), prov: col('proveedor_id', 3) };
+}
+
+/**
+ * Junta las filas de recepción de un producto (una por proveedor) en una sola, para las cuentas que
+ * miran el producto entero: está confirmado solo si lo está la de cada proveedor del día.
+ */
+function agregarRecepcionProducto_(filas, requeridos) {
+  var req = (requeridos || []).map(String);
+  var asignadas = [];
+  var usadas = [];
+  var faltan = false;
+  if (!req.length) {
+    asignadas = (filas || []).slice();
+  } else {
+    req.forEach(function(prov) {
+      var idx = -1;
+      (filas || []).forEach(function(f, i) {
+        if (idx === -1 && usadas.indexOf(i) === -1 && String(f.proveedor_id || '') === prov) idx = i;
+      });
+      if (idx === -1 && req.length === 1) {
+        (filas || []).forEach(function(f, i) {
+          if (idx === -1 && usadas.indexOf(i) === -1 && req.indexOf(String(f.proveedor_id || '')) === -1) idx = i;
+        });
+      }
+      if (idx === -1) { faltan = true; return; }
+      usadas.push(idx);
+      asignadas.push(filas[idx]);
+    });
+  }
+  var llego = 0;
+  var costo = 0;
+  asignadas.forEach(function(f) {
+    var l = Number(f.llego) || 0;
+    llego += l;
+    costo += l * normalizeAmount(f.precio_real);
+  });
+  var base = asignadas[0] || (filas || [])[0] || {};
+  var todasConfirmadas = !faltan && asignadas.length > 0 && asignadas.every(recepcionProductoConfirmada);
+  return Object.assign({}, base, {
+    llego: llego,
+    precio_real: llego > 0 ? Math.max(1, Math.round(costo / llego)) : normalizeAmount(base.precio_real),
+    confirmado: todasConfirmadas
+  });
+}
+
+/** { producto_id: recepción del producto entero } a partir de las filas del día y sus pedidos. */
+function agruparRecepcionPorProducto_(recepciones, pedidos) {
+  var requeridos = proveedoresPorProducto_(pedidos);
+  var porProducto = {};
+  (recepciones || []).forEach(function(r) {
+    var k = String(r.producto_id);
+    if (!porProducto[k]) porProducto[k] = [];
+    porProducto[k].push(r);
+  });
+  var mapa = {};
+  Object.keys(porProducto).forEach(function(k) {
+    mapa[k] = agregarRecepcionProducto_(porProducto[k], requeridos[k] || []);
+  });
+  return mapa;
+}
+
 function saveRecepcion(data) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
 
@@ -2710,23 +2946,19 @@ function saveRecepcion(data) {
   const productoCol  = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 2;
   const llegoCol     = headers.indexOf('llego')       !== -1 ? headers.indexOf('llego')       : 5;
   const precioCol    = headers.indexOf('precio_real') !== -1 ? headers.indexOf('precio_real') : 6;
+  const provCol      = headers.indexOf('proveedor_id') !== -1 ? headers.indexOf('proveedor_id') : 3;
   var traeReparto = (data.items || []).some(function(item) { return item.reparto !== undefined; });
   if (traeReparto) ensureColumn(sheet, 'reparto');
   var headersRep = traeReparto ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] : headers;
   var repartoCol = headersRep.indexOf('reparto');
 
-  const recepcionIndex = {};
-  for (let i = 1; i < values.length; i++) {
-    const fechaRecepcion = normalizeFecha(values[i][fechaCol]);
-    const productoId = values[i][productoCol];
-    if (fechaRecepcion === fechaNormalizada) {
-      recepcionIndex[fechaNormalizada + '|' + String(productoId)] = i;
-    }
-  }
+  const colsRec = columnasRecepcion_(headers);
+  var requeridosDia = null;
 
   var rowsToAppend = [];
   if (data.items && data.items.length > 0) {
     var productosMap = getProductosMap();
+    requeridosDia = proveedoresPorProducto_(getPedidos(fechaNormalizada));
     var faltantes = data.items.filter(function(item) {
       return !findInIdMap(productosMap, item.producto_id);
     });
@@ -2738,8 +2970,13 @@ function saveRecepcion(data) {
       var producto = findInIdMap(productosMap, item.producto_id);
       if (!producto) return;
 
-      var key = fechaNormalizada + '|' + item.producto_id;
-      var rowIdx = recepcionIndex[key];
+      var proveedorItem = String(item.proveedor_id || producto.proveedor_default || '');
+      var rowIdx = buscarFilaRecepcion_(values, colsRec, fechaNormalizada, item.producto_id, proveedorItem, requeridosDia[String(item.producto_id)]);
+      if (rowIdx === -1) rowIdx = undefined;
+      var soloProveedor = item.solo_proveedor === true || item.solo_proveedor === 'true';
+      // El proveedor de la recepción es el de los pedidos del día: si cambió, la fila guardada se corrige.
+      if (rowIdx !== undefined && proveedorItem && provCol !== -1) values[rowIdx][provCol] = proveedorItem;
+      if (soloProveedor) return;
       var repartoItem = item.reparto !== undefined ? normalizarReparto_(item.reparto, item.llego || 0, false) : undefined;
       if (rowIdx !== undefined) {
         values[rowIdx][llegoCol]  = item.llego || 0;
@@ -2753,7 +2990,7 @@ function saveRecepcion(data) {
           generateId(),
           data.fecha,
           item.producto_id,
-          item.proveedor_id || producto.proveedor_default || '',
+          proveedorItem,
           item.pedido_total || 0,
           item.llego || 0,
           normalizeAmount(item.precio_real),
@@ -2785,22 +3022,27 @@ function saveRecepcion(data) {
   return { success: true };
 }
 
-function findRecepcion(fecha, productoId) {
+function findRecepcion(fecha, productoId, proveedorId) {
   const sheet = getSheet(CONFIG.SHEETS.RECEPCION);
   const data = readUsedValues_(sheet);
   if (data.length < 2) return null;
 
   const headers = data[0];
-  const fechaCol    = headers.indexOf('fecha')      !== -1 ? headers.indexOf('fecha')      : 1;
-  const productoCol = headers.indexOf('producto_id') !== -1 ? headers.indexOf('producto_id') : 2;
   const confirmadoCol = headers.indexOf('confirmado') !== -1 ? headers.indexOf('confirmado') : headers.length - 1;
-
+  const cols = columnasRecepcion_(headers);
   const fechaBusqueda = normalizeFecha(fecha);
 
+  // Con proveedor: la fila de ese proveedor. Sin proveedor (pedidos viejos de la app): la primera del producto.
+  if (proveedorId) {
+    var requeridos = proveedoresPorProducto_(getPedidos(fechaBusqueda))[String(productoId)];
+    var idx = buscarFilaRecepcion_(data, cols, fechaBusqueda, productoId, proveedorId, requeridos);
+    return idx === -1 ? null : { rowIndex: idx + 1, data: data[idx], confirmadoCol: confirmadoCol, provCol: cols.prov };
+  }
+
   for (let i = 1; i < data.length; i++) {
-    const fechaRecepcion = normalizeFecha(data[i][fechaCol]);
-    if (fechaRecepcion === fechaBusqueda && idsMatch(data[i][productoCol], productoId)) {
-      return { rowIndex: i + 1, data: data[i], confirmadoCol: confirmadoCol };
+    const fechaRecepcion = normalizeFecha(data[i][cols.fecha]);
+    if (fechaRecepcion === fechaBusqueda && idsMatch(data[i][cols.producto], productoId)) {
+      return { rowIndex: i + 1, data: data[i], confirmadoCol: confirmadoCol, provCol: cols.prov };
     }
   }
 
@@ -2881,13 +3123,10 @@ function confirmarRecepcionItem(data) {
   if (confirmadoCol < 0) confirmadoCol = Math.max(headers.length - 1, 0);
 
   var fechaNormalizada = normalizeFecha(data.fecha);
-  var rowIdx = -1;
-  for (var i = 1; i < values.length; i++) {
-    if (normalizeFecha(values[i][fechaCol]) === fechaNormalizada && idsMatch(values[i][productoCol], data.producto_id)) {
-      rowIdx = i;
-      break;
-    }
-  }
+  var productoConfirmar = findInIdMap(getProductosMap(), data.producto_id);
+  var proveedorConfirmar = String(data.proveedor_id || (productoConfirmar && productoConfirmar.proveedor_default) || '');
+  var requeridosConfirmar = proveedoresPorProducto_(getPedidos(fechaNormalizada))[String(data.producto_id)];
+  var rowIdx = buscarFilaRecepcion_(values, columnasRecepcion_(headers), fechaNormalizada, data.producto_id, proveedorConfirmar, requeridosConfirmar);
 
   if (rowIdx === -1) {
     var producto = findInIdMap(getProductosMap(), data.producto_id);
@@ -2899,7 +3138,7 @@ function confirmarRecepcionItem(data) {
     nueva[fechaCol] = data.fecha;
     nueva[productoCol] = data.producto_id;
     var provCol = headers.indexOf('proveedor_id');
-    if (provCol !== -1) nueva[provCol] = data.proveedor_id || producto.proveedor_default || '';
+    if (provCol !== -1) nueva[provCol] = proveedorConfirmar;
     var totalCol = headers.indexOf('pedido_total');
     if (totalCol !== -1) nueva[totalCol] = data.pedido_total || 0;
     nueva[llegoCol] = llego;
@@ -2914,6 +3153,8 @@ function confirmarRecepcionItem(data) {
     values[rowIdx][llegoCol] = llego;
     values[rowIdx][precioCol] = precioReal;
     values[rowIdx][confirmadoCol] = true;
+    var provColExistente = headers.indexOf('proveedor_id');
+    if (proveedorConfirmar && provColExistente !== -1) values[rowIdx][provColExistente] = proveedorConfirmar;
     if (repartoTexto !== undefined && repartoCol !== -1) {
       while (values[rowIdx].length <= repartoCol) values[rowIdx].push('');
       values[rowIdx][repartoCol] = repartoTexto;
@@ -2933,7 +3174,7 @@ function desconfirmarRecepcionItem(data) {
   }
 
   assertDiaAbierto_(data.fecha);
-  var found = findRecepcion(data.fecha, data.producto_id);
+  var found = findRecepcion(data.fecha, data.producto_id, data.proveedor_id);
   if (!found) {
     throw new Error('No se encontró la recepción del producto');
   }
@@ -2953,7 +3194,7 @@ function deleteRecepcionItem(data) {
   }
 
   assertDiaAbierto_(data.fecha);
-  var found = findRecepcion(data.fecha, data.producto_id);
+  var found = findRecepcion(data.fecha, data.producto_id, data.proveedor_id);
   if (!found) {
     throw new Error('No se encontró la recepción del producto');
   }
@@ -3186,10 +3427,8 @@ function cerrarDia(fecha) {
       productosPedidosIds[p.producto_id] = true;
     });
 
-    var recepcionMapCierre = {};
-    recepciones.forEach(function(r) {
-      recepcionMapCierre[r.producto_id] = r;
-    });
+    // Una fila por producto y proveedor: el producto está confirmado si lo está la de cada proveedor.
+    var recepcionMapCierre = agruparRecepcionPorProducto_(recepciones, pedidosParaRecepcion);
 
     var productosSinConfirmar = Object.keys(productosPedidosIds).filter(function(productoId) {
       return !recepcionProductoConfirmada(recepcionMapCierre[productoId]);
@@ -3204,10 +3443,7 @@ function cerrarDia(fecha) {
     // Validar precios cliente
     Logger.log('🔍 [CIERRE] Validando precios cliente...');
     const pedidos = getPedidos(fecha);
-    var recepcionMapCierrePrecio = {};
-    recepciones.forEach(function(r) {
-      recepcionMapCierrePrecio[String(r.producto_id)] = r;
-    });
+    var recepcionMapCierrePrecio = recepcionMapCierre;
     const preciosFaltantes = pedidos.filter(function(p) {
       var rec = recepcionDeProducto(recepcionMapCierrePrecio, p.producto_id);
       return !pedidoTienePrecioCliente(p, precios, rec);
@@ -3932,13 +4168,21 @@ function registrarPago(data) {
   var parsed = normalizarMedios_(data, METODOS_PROVEEDOR_);
   var monto = parsed.total;
   if (monto <= 0) throw new Error('Poné cuánto le pagás');
-  var saldoPendiente = calcularSaldoProveedor(data.proveedor_id);
   var anticipo = data.anticipo === true || data.anticipo === 'true';
+  // Si viene la fecha de la deuda, el pago descuenta de esa fecha; si no, de las más viejas primero.
+  var aplicaFecha = data.aplica_fecha ? normalizeFecha(data.aplica_fecha) : '';
+  var saldoPendiente = calcularSaldoProveedor(data.proveedor_id);
+  if (aplicaFecha) {
+    var detalle = calcularDeudasPorFechaProveedores()[data.proveedor_id];
+    var deudaFecha = detalle ? detalle.deudas.filter(function(d) { return d.fecha === aplicaFecha; })[0] : null;
+    saldoPendiente = deudaFecha ? deudaFecha.saldo : 0;
+  }
   if (!anticipo && monto > saldoPendiente + 0.01) {
-    throw new Error('El monto supera el saldo pendiente');
+    throw new Error(aplicaFecha ? 'El monto supera lo que se debe de esa fecha' : 'El monto supera el saldo pendiente');
   }
 
   var sheet = getSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  ensureColumn(sheet, 'aplica_fecha');
   var fecha = data.fecha || todayArgentina();
   var nota = data.nota || (anticipo ? 'Pago al hacer el pedido' : '');
   var primerId = null;
@@ -3947,7 +4191,7 @@ function registrarPago(data) {
     if (parte <= 0.009) return;
     var id = generateId();
     if (!primerId) primerId = id;
-    sheet.appendRow([id, fecha, data.proveedor_id, parte, metodo, nota]);
+    sheet.appendRow([id, fecha, data.proveedor_id, parte, metodo, nota, aplicaFecha]);
   });
   invalidateSheetCache(CONFIG.SHEETS.PAGOS_PROVEEDORES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
@@ -4200,6 +4444,7 @@ function getDiasPendientes() {
   if (clienteIdx === -1) clienteIdx = 2;
   if (productoIdx === -1) productoIdx = 3;
 
+  var proveedorIdxPed = headersP.indexOf('proveedor_id');
   var pedidosPorFecha = {};
   pedidosCached.rows.forEach(function(row) {
     var f = normalizeFecha(row[fechaIdx]);
@@ -4207,7 +4452,8 @@ function getDiasPendientes() {
     if (!pedidosPorFecha[f]) pedidosPorFecha[f] = [];
     pedidosPorFecha[f].push({
       cliente_id: row[clienteIdx],
-      producto_id: row[productoIdx]
+      producto_id: row[productoIdx],
+      proveedor_id: proveedorIdxPed !== -1 ? row[proveedorIdxPed] : ''
     });
   });
 
@@ -4228,6 +4474,7 @@ function getDiasPendientes() {
   var recLlegoIdx = recHeaders.indexOf('llego');
   var recPrecioIdx = recHeaders.indexOf('precio_real');
   var recConfirmIdx = recHeaders.indexOf('confirmado');
+  var recProvIdx = recHeaders.indexOf('proveedor_id');
   if (recProdIdx === -1) recProdIdx = 2;
 
   var recepcionPorFecha = {};
@@ -4235,12 +4482,15 @@ function getDiasPendientes() {
     var f = normalizeFecha(row[recFechaIdx]);
     if (!f) return;
     if (!recepcionPorFecha[f]) recepcionPorFecha[f] = {};
-    recepcionPorFecha[f][String(row[recProdIdx])] = {
+    var claveProducto = String(row[recProdIdx]);
+    if (!recepcionPorFecha[f][claveProducto]) recepcionPorFecha[f][claveProducto] = [];
+    recepcionPorFecha[f][claveProducto].push({
       producto_id: row[recProdIdx],
+      proveedor_id: recProvIdx !== -1 ? row[recProvIdx] : '',
       llego: recLlegoIdx !== -1 ? row[recLlegoIdx] : null,
       precio_real: recPrecioIdx !== -1 ? row[recPrecioIdx] : 0,
       confirmado: recConfirmIdx !== -1 ? row[recConfirmIdx] : false
-    };
+    });
   });
 
   var precHeaders = preciosCached.headers;
@@ -4292,9 +4542,15 @@ function getDiasPendientes() {
 
     if (pedidosCount === 0 && fecha !== hoy) return;
 
+    var filasDia = recepcionPorFecha[fecha] || {};
+    var requeridosDia = proveedoresPorProducto_(pedidos);
+    var recepcionDia = {};
+    Object.keys(filasDia).forEach(function(k) {
+      recepcionDia[k] = agregarRecepcionProducto_(filasDia[k], requeridosDia[k] || []);
+    });
     var estadoDia = calcularEstadoDiaDesdeCache(
       pedidos,
-      recepcionPorFecha[fecha] || {},
+      recepcionDia,
       preciosPorFecha[fecha] || []
     );
 
@@ -4399,10 +4655,7 @@ function calcularEstadoDia(fecha, pedidos) {
   }
 
   var recepciones = getRecepcion(fecha);
-  var recepcionMap = {};
-  recepciones.forEach(function(r) {
-    recepcionMap[r.producto_id] = r;
-  });
+  var recepcionMap = agruparRecepcionPorProducto_(recepciones, pedidos);
 
   var productosPedidos = {};
   pedidos.forEach(function(p) {

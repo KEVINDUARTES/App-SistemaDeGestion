@@ -459,6 +459,9 @@ const DiaOperativo = {
         if (estado === 'recepcion_pendiente') {
             return { pagina: 'recepcion', texto: 'Confirmar recepción', detalle: 'Falta confirmar lo que llegó.' };
         }
+        if (estado === 'precios_pendiente' && !Utils.veePrecios()) {
+            return { pagina: 'dashboard', texto: 'Esperando los precios', detalle: 'La recepción está lista. Falta que se carguen los precios al cliente.' };
+        }
         if (estado === 'precios_pendiente') {
             return { pagina: 'precios', texto: 'Cargar precios', detalle: 'La recepción está lista. Falta el precio al cliente.' };
         }
@@ -556,6 +559,27 @@ const Utils = {
         const hit = (lista || []).find(item => String(item.id) === String(id));
         if (hit?.nombre) return hit.nombre;
         return esProducto ? 'Producto sin ficha' : 'Cliente sin ficha';
+    },
+
+    // El orden de la planilla de pedidos: verdura, fruta, bebida, mercadería y otros; dentro de cada grupo, de la A a la Z.
+    // Camiones, recepción y el PDF al cliente usan este mismo orden.
+    compararProductos(a, b) {
+        const clave = ({ id, nombre }) => {
+            const producto = (AppState.productos || []).find(p => String(p.id) === String(id));
+            const rango = PlanillaPedidos.GRUPOS.findIndex(g => g.tipo === PlanillaPedidos._tipoDe(producto));
+            return { rango: rango < 0 ? PlanillaPedidos.GRUPOS.length : rango, nombre: String((producto && producto.nombre) || nombre || '') };
+        };
+        const x = clave(a);
+        const y = clave(b);
+        return (x.rango - y.rango) || x.nombre.localeCompare(y.nombre, 'es');
+    },
+
+    // Precios al cliente solo lo ve este usuario (en el menú, en los pasos del día y en la pantalla).
+    USUARIOS_CON_PRECIOS: ['cargasluciano@gmail.com'],
+
+    veePrecios() {
+        const email = String(Auth.getUserEmail() || '').toLowerCase();
+        return this.USUARIOS_CON_PRECIOS.includes(email);
     },
 
     parsePrice(value) {
@@ -2354,8 +2378,17 @@ const Navigation = {
         });
     },
     
+    // Quita del menú lo que este usuario no puede ver.
+    aplicarPermisos() {
+        if (Utils.veePrecios()) return;
+        document.querySelectorAll('[data-page="precios"]').forEach(link => (link.closest('li') || link).setAttribute('hidden', ''));
+        const seguir = document.getElementById('btn-seguir-precios');
+        if (seguir) seguir.textContent = 'Seguir a cobranza';
+    },
+
     navigateTo(page) {
         if (!page) return;
+        if (page === 'precios' && !Utils.veePrecios()) page = 'cobros-hoy';
         const requested = page;
         const screen = requested === 'pagos-pendientes'
             ? 'pagos'
@@ -4301,6 +4334,7 @@ const Camiones = {
             if (!grupos.has(key)) {
                 const productoCat = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
                 grupos.set(key, {
+                    productoId: pedido.producto_id,
                     producto: pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto'),
                     tipo: String(productoCat?.tipo || pedido.tipo || '').toLowerCase(),
                     clienteId,
@@ -4311,13 +4345,9 @@ const Camiones = {
             }
             grupos.get(key).cantidad += parseFloat(pedido.cantidad) || 0;
         });
-        // Como lo cargan en el camión: verduras de la A a la Z, después frutas, después el resto.
-        const ordenTipo = { verdura: 0, fruta: 1, bebida: 2, 'mercadería': 3 };
-        const rango = tipo => (ordenTipo[tipo] !== undefined ? ordenTipo[tipo] : 4);
+        // Mismo orden que la planilla de pedidos: verduras de la A a la Z, después frutas, bebidas, mercadería y el resto.
         return [...grupos.values()].filter(fila => fila.cantidad > 0).sort((a, b) => {
-            const tipo = rango(a.tipo) - rango(b.tipo);
-            if (tipo) return tipo;
-            const producto = a.producto.localeCompare(b.producto, 'es');
+            const producto = Utils.compararProductos({ id: a.productoId, nombre: a.producto }, { id: b.productoId, nombre: b.producto });
             if (producto) return producto;
             const puesto = a.puesto.localeCompare(b.puesto, 'es');
             if (puesto) return puesto;
@@ -6162,6 +6192,38 @@ const Recepcion = {
     _actionsBound: false,
     // Filtro por proveedor: con muchos productos, se confirma lo de un proveedor sin recorrer toda la lista.
     _filtroProveedor: '',
+    // Búsqueda por nombre de producto. Solo oculta filas (no redibuja), así no se pierde lo que ya se escribió en Llegó y Precio real.
+    _filtroProducto: '',
+
+    _normalizarBusqueda(texto) {
+        return String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    },
+
+    filtrarProducto(valor) {
+        this._filtroProducto = this._normalizarBusqueda(valor);
+        this._aplicarFiltroProducto();
+    },
+
+    _aplicarFiltroProducto() {
+        const tbody = document.getElementById('recepcion-tbody');
+        if (!tbody) return;
+        let visible = true;
+        let mostrados = 0;
+        tbody.querySelectorAll('tr').forEach(tr => {
+            if (!tr.classList.contains('recepcion-detalle')) {
+                visible = !this._filtroProducto || (tr.dataset.nombre || '').includes(this._filtroProducto);
+                if (visible) mostrados += 1;
+            }
+            tr.classList.toggle('fila-oculta', !visible);
+        });
+        const cuenta = document.getElementById('recepcion-filtro-cuenta');
+        if (!cuenta) return;
+        const total = (AppState.recepcion || []).length;
+        const filtrando = this._filtroProveedor || this._filtroProducto;
+        cuenta.textContent = filtrando
+            ? (mostrados ? `Mostrando ${mostrados} de ${total} productos` : 'Ningún producto coincide con la búsqueda')
+            : '';
+    },
 
     _proveedorDe(item) {
         return String(item.proveedor_id || '') || 'sin-proveedor';
@@ -6193,7 +6255,9 @@ const Recepcion = {
     },
 
     _visibles() {
-        const lista = AppState.recepcion || [];
+        // En el mismo orden en que se cargó el pedido (planilla de pedidos).
+        const lista = (AppState.recepcion || []).slice()
+            .sort((a, b) => Utils.compararProductos({ id: a.producto_id, nombre: a.producto_nombre }, { id: b.producto_id, nombre: b.producto_nombre }));
         if (!this._filtroProveedor) return lista;
         return lista.filter(item => this._proveedorDe(item) === this._filtroProveedor);
     },
@@ -6204,11 +6268,14 @@ const Recepcion = {
     _pedidosDia: [],
     _pedidosDiaFecha: '',
 
-    _clientesDe(productoId) {
+    _clientesDe(clave) {
         if (this._pedidosDiaFecha !== AppState.currentDate) return [];
+        const { productoId, proveedorId } = this._partesClave(clave);
+        const producto = this.findById(AppState.productos || [], productoId);
         const porCliente = new Map();
         (this._pedidosDia || []).forEach(pedido => {
             if (String(pedido.producto_id) !== String(productoId)) return;
+            if (proveedorId !== null && this._proveedorDePedido(pedido, producto) !== proveedorId) return;
             const id = String(pedido.cliente_id);
             if (!porCliente.has(id)) {
                 porCliente.set(id, { cliente_id: id, nombre: pedido.cliente_nombre || '', cantidadPedida: 0 });
@@ -6242,7 +6309,7 @@ const Recepcion = {
     },
 
     _repartoDe(item) {
-        const clientes = this._clientesDe(item.producto_id);
+        const clientes = this._clientesDe(this._claveDe(item));
         if (this._repartoValido(item.reparto, clientes, item.llego)) return item.reparto;
         return this._repartoAuto(clientes, item.llego);
     },
@@ -6297,12 +6364,12 @@ const Recepcion = {
     _sinCargar(item) {
         const confirmada = item.confirmado === true || item.confirmado === 'true';
         if (confirmada || Number(item.llego) > 0) return false;
-        if (this._leerBorrador(AppState.currentDate)[String(item.producto_id)]) return false;
+        if (this._leerBorrador(AppState.currentDate)[this._claveDe(item)]) return false;
         return Number(item.pedido_total) > 0;
     },
 
     _htmlReparto(item, confirmada) {
-        const clientes = this._clientesDe(item.producto_id);
+        const clientes = this._clientesDe(this._claveDe(item));
         if (!clientes.length) return '';
         const sinCargar = this._sinCargar(item);
         const reparto = sinCargar
@@ -6313,7 +6380,7 @@ const Recepcion = {
             <label class="recepcion-cli">
                 <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
                 <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
-                <input type="number" step="any" min="0" class="recepcion-reparto" data-producto-id="${item.producto_id}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${mostrar ? Utils.formatCantidadInput(reparto[c.cliente_id] || 0) : ''}" placeholder="0"${confirmada ? ' disabled' : ''} title="Cuánto le toca de lo que llegó">
+                <input type="number" step="any" min="0" class="recepcion-reparto" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${mostrar ? Utils.formatCantidadInput(reparto[c.cliente_id] || 0) : ''}" placeholder="0"${confirmada ? ' disabled' : ''} title="Cuánto le toca de lo que llegó">
             </label>`).join('');
         return `<tr class="recepcion-detalle${confirmada ? ' recepcion-row-confirmada' : ''}"><td colspan="6"><div class="recepcion-cli-lista"><span class="recepcion-cli-titulo">Para cada cliente:</span>${filas}</div></td></tr>`;
     },
@@ -6325,6 +6392,78 @@ const Recepcion = {
 
     findRecepcionForProducto(recepciones, productoId) {
         return recepciones.find(r => String(r.producto_id) === String(productoId)) || null;
+    },
+
+    // Un producto puede venir de más de un proveedor el mismo día: entonces tiene una fila por proveedor.
+    // La "clave" de la fila es el id del producto o, si tiene varios proveedores, "producto::proveedor".
+    _claveDe(item) {
+        return String(item.clave || item.producto_id);
+    },
+
+    // Las filas que vienen tal cual de la planilla no traen clave: si un producto tiene más de una
+    // (una por proveedor), cada una se identifica con producto y proveedor.
+    _conClaves(lista) {
+        const cuenta = {};
+        (lista || []).forEach(r => { cuenta[String(r.producto_id)] = (cuenta[String(r.producto_id)] || 0) + 1; });
+        return (lista || []).map(r => {
+            if (r.clave) return r;
+            const varias = cuenta[String(r.producto_id)] > 1;
+            return { ...r, clave: varias ? `${r.producto_id}::${r.proveedor_id || ''}` : String(r.producto_id) };
+        });
+    },
+
+    _item(clave) {
+        return (AppState.recepcion || []).find(r => this._claveDe(r) === String(clave)) || null;
+    },
+
+    _partesClave(clave) {
+        const texto = String(clave);
+        const i = texto.indexOf('::');
+        return i === -1
+            ? { productoId: texto, proveedorId: null }
+            : { productoId: texto.slice(0, i), proveedorId: texto.slice(i + 2) };
+    },
+
+    // Proveedor de un pedido: el elegido en Pedidos o, si no tiene, el habitual del producto.
+    _proveedorDePedido(pedido, producto) {
+        return String(pedido.proveedor_id || producto?.proveedor_default || '');
+    },
+
+    // Reparte las filas guardadas de un producto entre sus proveedores. Cada una va con la de su
+    // proveedor; si el producto tiene un solo proveedor y la fila quedó con otro (se cambió en
+    // Pedidos después), esa fila pasa a ser la suya.
+    _asignarFilas(filas, proveedores) {
+        const asignadas = {};
+        const usadas = new Set();
+        proveedores.forEach(prov => {
+            const fila = filas.find(f => !usadas.has(f) && String(f.proveedor_id || '') === prov);
+            if (fila) { usadas.add(fila); asignadas[prov] = fila; }
+        });
+        if (proveedores.length === 1 && !asignadas[proveedores[0]]) {
+            const fila = filas.find(f => !usadas.has(f) && !proveedores.includes(String(f.proveedor_id || '')));
+            if (fila) asignadas[proveedores[0]] = fila;
+        }
+        return asignadas;
+    },
+
+    // Todas las filas de un producto juntas (para las pantallas que miran el producto entero):
+    // lo que llegó se suma, el precio es el promedio ponderado y está confirmado si lo están todas.
+    agregadoDe(filas, productoId) {
+        const propias = (filas || []).filter(r => String(r.producto_id) === String(productoId));
+        if (propias.length <= 1) return propias[0] || null;
+        let llego = 0;
+        let costo = 0;
+        propias.forEach(r => {
+            const l = parseFloat(r.llego) || 0;
+            llego += l;
+            costo += l * (Utils.parsePrice(r.precio_real) || 0);
+        });
+        return {
+            ...propias[0],
+            llego,
+            precio_real: llego > 0 ? Math.round(costo / llego) : (Utils.parsePrice(propias[0].precio_real) || 0),
+            confirmado: propias.every(r => r.confirmado === true || r.confirmado === 'true' || r.confirmado === 1)
+        };
     },
 
     _prepararDiaPendiente() {
@@ -6352,24 +6491,6 @@ const Recepcion = {
         sessionStorage.setItem('sg_work_date', fecha);
         DiaOperativo.renderSelectors();
         return true;
-    },
-
-    _proveedorDePedidos(pedidos, productoId) {
-        const conteo = {};
-        (pedidos || []).forEach(pedido => {
-            if (String(pedido.producto_id) !== String(productoId) || !pedido.proveedor_id) return;
-            const id = String(pedido.proveedor_id);
-            conteo[id] = (conteo[id] || 0) + (parseFloat(pedido.cantidad) || 1);
-        });
-        let mejor = '';
-        let max = 0;
-        Object.keys(conteo).forEach(id => {
-            if (conteo[id] > max) {
-                max = conteo[id];
-                mejor = id;
-            }
-        });
-        return mejor;
     },
 
     initActions() {
@@ -6437,6 +6558,20 @@ const Recepcion = {
         this._actionsBound = true;
     },
 
+    // Si la fila guardada en la planilla de recepción quedó con otro proveedor que el de los pedidos del
+    // día (por ejemplo, se cambió en Pedidos después), se corrige. Se intenta una vez por producto y día.
+    _corregirProveedores(fecha, correcciones) {
+        this._proveedorCorregido = this._proveedorCorregido || new Set();
+        const items = (correcciones || []).filter(c => {
+            const clave = fecha + '|' + c.producto_id + '|' + c.proveedor_id;
+            if (this._proveedorCorregido.has(clave)) return false;
+            this._proveedorCorregido.add(clave);
+            return true;
+        });
+        if (!items.length) return;
+        API.saveRecepcion({ fecha, items }).catch(error => console.warn('No se pudo corregir el proveedor de la recepción:', error));
+    },
+
     _claveBorrador(fecha) {
         return 'sg_recepcion_borrador:' + fecha;
     },
@@ -6472,7 +6607,7 @@ const Recepcion = {
         const map = this._leerBorrador(fecha);
         return (lista || []).map(item => {
             const confirmado = item.confirmado === true || item.confirmado === 'true';
-            const borrador = map[String(item.producto_id)];
+            const borrador = map[this._claveDe(item)];
             if (!borrador || confirmado) return item;
             return { ...item, llego: borrador.llego, precio_real: borrador.precio, reparto: borrador.reparto || null };
         });
@@ -6496,7 +6631,7 @@ const Recepcion = {
     _aplicarCambio(productoId, llego, precio, reparto) {
         const fecha = AppState.currentDate;
         this._ponerBorrador(fecha, productoId, llego, precio, reparto);
-        const idx = (AppState.recepcion || []).findIndex(r => String(r.producto_id) === String(productoId));
+        const idx = (AppState.recepcion || []).findIndex(r => this._claveDe(r) === String(productoId));
         if (idx !== -1) {
             AppState.recepcion[idx] = {
                 ...AppState.recepcion[idx],
@@ -6525,16 +6660,16 @@ const Recepcion = {
         this._guardarTimer = null;
         const fecha = AppState.currentDate;
         const map = this._leerBorrador(fecha);
-        const items = Object.keys(map).map(productoId => {
-            const item = (AppState.recepcion || []).find(r => String(r.producto_id) === String(productoId));
+        const items = Object.keys(map).map(clave => {
+            const item = (AppState.recepcion || []).find(r => this._claveDe(r) === String(clave));
             if (item && (item.confirmado === true || item.confirmado === 'true')) return null;
             return {
-                producto_id: productoId,
-                llego: map[productoId].llego,
-                precio_real: map[productoId].precio,
-                reparto: map[productoId].reparto || null,
+                producto_id: item?.producto_id || this._partesClave(clave).productoId,
+                llego: map[clave].llego,
+                precio_real: map[clave].precio,
+                reparto: map[clave].reparto || null,
                 pedido_total: item?.pedido_total || 0,
-                proveedor_id: item?.proveedor_id || ''
+                proveedor_id: item?.proveedor_id || this._partesClave(clave).proveedorId || ''
             };
         }).filter(Boolean);
         if (!items.length) return;
@@ -6605,7 +6740,7 @@ const Recepcion = {
         const flujoLocal = DataLoader.armarFlujoLocal(fecha);
         const flujoRecordado = flujoLocal || CacheManager.peek(`flujo:${fecha}`);
         if (flujoRecordado && !flujoLocal) {
-            AppState.recepcion = this._fusionarBorrador(flujoRecordado.recepcion || [], fecha);
+            AppState.recepcion = this._fusionarBorrador(this._conClaves(flujoRecordado.recepcion || []), fecha);
             if (Array.isArray(flujoRecordado.pedidos)) {
                 AppState.pedidos = flujoRecordado.pedidos;
                 this._pedidosDia = flujoRecordado.pedidos;
@@ -6640,71 +6775,83 @@ const Recepcion = {
             AppState.productos = productos;
             AppState.proveedores = proveedores;
 
+            // Un producto puede venir de más de un proveedor el mismo día (los pedidos de cada cliente
+            // tienen su proveedor): cada proveedor tiene su propia fila.
             const pedidosPorProducto = {};
             pedidos.forEach(pedido => {
                 const producto = this.findById(productos, pedido.producto_id);
-                if (!pedidosPorProducto[pedido.producto_id]) {
-                    pedidosPorProducto[pedido.producto_id] = {
-                        producto_id: pedido.producto_id,
-                        pedido_total: 0,
-                        producto_nombre: producto?.nombre || pedido.producto_nombre || ''
-                    };
-                }
-                pedidosPorProducto[pedido.producto_id].pedido_total += parseFloat(pedido.cantidad) || 0;
-                if (!pedidosPorProducto[pedido.producto_id].producto_nombre && producto) {
-                    pedidosPorProducto[pedido.producto_id].producto_nombre = producto.nombre;
-                }
+                const grupo = pedidosPorProducto[pedido.producto_id] || (pedidosPorProducto[pedido.producto_id] = {
+                    producto_id: pedido.producto_id,
+                    producto_nombre: producto?.nombre || pedido.producto_nombre || '',
+                    porProveedor: {}
+                });
+                if (!grupo.producto_nombre && producto) grupo.producto_nombre = producto.nombre;
+                const prov = this._proveedorDePedido(pedido, producto);
+                grupo.porProveedor[prov] = (grupo.porProveedor[prov] || 0) + (parseFloat(pedido.cantidad) || 0);
             });
 
             const recepcionesFinales = [];
+            const correcciones = [];
             let pendiente = false;
 
             Object.keys(pedidosPorProducto).forEach(productoId => {
                 const pedidoInfo = pedidosPorProducto[productoId];
                 const producto = this.findById(productos, productoId);
-                const rec = this.findRecepcionForProducto(recepciones, productoId);
-                const proveedorPedidoId = this._proveedorDePedidos(pedidos, productoId);
-                const proveedor = producto
-                    ? this.findById(proveedores, proveedorPedidoId || producto.proveedor_default)
-                    : null;
-                const local = (AppState.recepcion || []).find(r => String(r.producto_id) === String(productoId));
-                const confirmado = rec?.confirmado === true || rec?.confirmado === 'true';
-                const edicion = ediciones[String(productoId)];
-                const borrador = this._leerBorrador(fecha)[String(productoId)];
-                const conservarLocal = local && (local.confirmado === true || local.confirmado === 'true') && !confirmado;
-                let llego = rec?.llego ?? 0;
-                let precioReal = rec?.precio_real ?? 0;
-                let reparto = rec?.reparto || null;
-                if (confirmado) {
-                    this._quitarBorrador(fecha, productoId);
-                } else if (borrador) {
-                    const precioServidor = Utils.parsePrice(precioReal) || 0;
-                    const precioBorrador = Utils.parsePrice(borrador.precio) || 0;
-                    if (Number(borrador.llego) !== Number(llego) || precioBorrador !== precioServidor) pendiente = true;
-                    llego = borrador.llego;
-                    precioReal = borrador.precio;
-                    reparto = borrador.reparto || null;
-                } else if (conservarLocal) {
-                    llego = local.llego ?? llego;
-                    precioReal = local.precio_real ?? precioReal;
-                    reparto = local.reparto || reparto;
-                } else if (edicion) {
-                    llego = edicion.llego;
-                    precioReal = edicion.precio;
-                    reparto = edicion.reparto || null;
-                }
+                const proveedoresDelProducto = Object.keys(pedidoInfo.porProveedor)
+                    .sort((a, b) => pedidoInfo.porProveedor[b] - pedidoInfo.porProveedor[a]);
+                const filasGuardadas = recepciones.filter(r => String(r.producto_id) === String(productoId));
+                const asignadas = this._asignarFilas(filasGuardadas, proveedoresDelProducto);
+                const variosProveedores = proveedoresDelProducto.length > 1;
 
-                recepcionesFinales.push({
-                    id: rec?.id || local?.id || ('temp-' + productoId),
-                    producto_id: productoId,
-                    producto_nombre: producto?.nombre || pedidoInfo.producto_nombre || 'Sin nombre',
-                    pedido_total: pedidoInfo.pedido_total,
-                    llego,
-                    precio_real: precioReal,
-                    reparto,
-                    proveedor_nombre: rec?.proveedor_nombre || proveedor?.nombre || local?.proveedor_nombre || '',
-                    proveedor_id: (confirmado && rec?.proveedor_id) || proveedorPedidoId || rec?.proveedor_id || producto?.proveedor_default || local?.proveedor_id || '',
-                    confirmado: confirmado || conservarLocal
+                proveedoresDelProducto.forEach(proveedorPedidoId => {
+                    const clave = variosProveedores ? `${productoId}::${proveedorPedidoId}` : String(productoId);
+                    const proveedor = proveedorPedidoId ? this.findById(proveedores, proveedorPedidoId) : null;
+                    const rec = asignadas[proveedorPedidoId] || null;
+                    const local = (AppState.recepcion || []).find(r => this._claveDe(r) === clave);
+                    const confirmado = rec?.confirmado === true || rec?.confirmado === 'true';
+                    const edicion = ediciones[clave];
+                    const borrador = this._leerBorrador(fecha)[clave];
+                    const conservarLocal = local && (local.confirmado === true || local.confirmado === 'true') && !confirmado;
+                    let llego = rec?.llego ?? 0;
+                    let precioReal = rec?.precio_real ?? 0;
+                    let reparto = rec?.reparto || null;
+                    if (confirmado) {
+                        this._quitarBorrador(fecha, clave);
+                    } else if (borrador) {
+                        const precioServidor = Utils.parsePrice(precioReal) || 0;
+                        const precioBorrador = Utils.parsePrice(borrador.precio) || 0;
+                        if (Number(borrador.llego) !== Number(llego) || precioBorrador !== precioServidor) pendiente = true;
+                        llego = borrador.llego;
+                        precioReal = borrador.precio;
+                        reparto = borrador.reparto || null;
+                    } else if (conservarLocal) {
+                        llego = local.llego ?? llego;
+                        precioReal = local.precio_real ?? precioReal;
+                        reparto = local.reparto || reparto;
+                    } else if (edicion) {
+                        llego = edicion.llego;
+                        precioReal = edicion.precio;
+                        reparto = edicion.reparto || null;
+                    }
+
+                    // La fila guardada sigue al proveedor de los pedidos: si quedó con otro, se corrige.
+                    if (rec && proveedorPedidoId && String(rec.proveedor_id || '') !== proveedorPedidoId) {
+                        correcciones.push({ producto_id: productoId, proveedor_id: proveedorPedidoId, solo_proveedor: true });
+                    }
+
+                    recepcionesFinales.push({
+                        id: rec?.id || local?.id || ('temp-' + clave),
+                        clave,
+                        producto_id: productoId,
+                        producto_nombre: producto?.nombre || pedidoInfo.producto_nombre || 'Sin nombre',
+                        pedido_total: pedidoInfo.porProveedor[proveedorPedidoId],
+                        llego,
+                        precio_real: precioReal,
+                        reparto,
+                        proveedor_nombre: proveedor?.nombre || (proveedorPedidoId ? '' : (rec?.proveedor_nombre || local?.proveedor_nombre || '')),
+                        proveedor_id: proveedorPedidoId || rec?.proveedor_id || local?.proveedor_id || '',
+                        confirmado: confirmado || conservarLocal
+                    });
                 });
             });
 
@@ -6712,6 +6859,7 @@ const Recepcion = {
             this._reflejarEnCache(fecha);
             this.render();
             if (pendiente) this._programarGuardado();
+            this._corregirProveedores(fecha, correcciones);
         } catch (error) {
             console.error('Error loading recepcion:', error);
             if ((AppState.recepcion || []).length) {
@@ -6738,9 +6886,6 @@ const Recepcion = {
         }
 
         const visibles = this._visibles();
-        const cuenta = document.getElementById('recepcion-filtro-cuenta');
-        if (cuenta) cuenta.textContent = this._filtroProveedor ? `Mostrando ${visibles.length} de ${AppState.recepcion.length} productos` : '';
-        
         let rowsHtml = '';
         
         visibles.forEach(item => {
@@ -6750,10 +6895,10 @@ const Recepcion = {
             const accionCell = confirmada
                 ? `<div class="recepcion-acciones-group">
                     <span class="status-badge status-activo">Confirmado</span>
-                    <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${item.producto_id}">Editar</button>
-                    <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${item.producto_id}">Eliminar</button>
+                    <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${this._claveDe(item)}">Editar</button>
+                    <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${this._claveDe(item)}">Eliminar</button>
                    </div>`
-                : `<button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${item.producto_id}">Confirmar</button>`;
+                : `<button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${this._claveDe(item)}">Confirmar</button>`;
 
             // Sin confirmar y sin cargar, los campos quedan vacíos (el 0 es solo de ayuda): así se escribe
             // directo, sin borrar un 0 en cada producto. Vacío vale lo mismo que 0 al confirmar.
@@ -6762,11 +6907,11 @@ const Recepcion = {
                 : (this._sinCargar(item) ? Utils.formatCantidadInput(item.pedido_total) : '');
             const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
             rowsHtml += `
-                <tr${rowClass}>
+                <tr${rowClass} data-nombre="${Utils.esc(this._normalizarBusqueda(item.producto_nombre))}">
                     <td>${Utils.esc(item.producto_nombre || '')}</td>
                     <td>${item.pedido_total || 0}</td>
-                    <td><input type="number" step="any" class="recepcion-llego" data-id="${item.id}" data-producto-id="${item.producto_id}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
-                    <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${item.producto_id}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
+                    <td><input type="number" step="any" class="recepcion-llego" data-id="${item.id}" data-producto-id="${this._claveDe(item)}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
+                    <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${this._claveDe(item)}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
                     <td>${Utils.esc(item.proveedor_nombre || '')}</td>
                     <td class="recepcion-acciones">${accionCell}</td>
                 </tr>
@@ -6776,6 +6921,7 @@ const Recepcion = {
         
         tbody.innerHTML = rowsHtml;
         Utils.enablePriceInputs(tbody);
+        this._aplicarFiltroProducto();
     },
     
     async save() {
@@ -6789,8 +6935,10 @@ const Recepcion = {
             const precioInput = document.querySelector(`.recepcion-precio[data-id="${id}"]`);
             const precio = Utils.parsePrice(precioInput ? precioInput.value : 0);
             
+            const fila = this._item(productoId);
             items.push({
-                producto_id: productoId,
+                producto_id: fila?.producto_id || this._partesClave(productoId).productoId,
+                proveedor_id: fila?.proveedor_id || '',
                 llego: llego,
                 precio_real: precio,
                 reparto: this._repartoDeLaPantalla(productoId, llego)
@@ -6818,8 +6966,10 @@ const Recepcion = {
     },
 
     async confirmarCompletos() {
-        // Con un proveedor elegido, se confirma solo lo que se ve en pantalla.
-        const pendientes = this._visibles().filter(item => item.confirmado !== true && item.confirmado !== 'true');
+        // Con un proveedor o una búsqueda, se confirma solo lo que se ve en pantalla.
+        const pendientes = this._visibles()
+            .filter(item => !this._filtroProducto || this._normalizarBusqueda(item.producto_nombre).includes(this._filtroProducto))
+            .filter(item => item.confirmado !== true && item.confirmado !== 'true');
         if (pendientes.length === 0) {
             Utils.showInfo('No hay productos pendientes de confirmar.');
             return;
@@ -6831,7 +6981,7 @@ const Recepcion = {
         const incompletos = [];
         const sinCargar = [];
         pendientes.forEach(item => {
-            const { llego, precio, reparto } = this.getValoresProducto(item.producto_id);
+            const { llego, precio, reparto } = this.getValoresProducto(this._claveDe(item));
             const nombre = item.producto_nombre || 'producto';
             if (!(llego > 0)) sinCargar.push(nombre);
             else if (precio <= 0) incompletos.push(nombre);
@@ -6850,7 +7000,7 @@ const Recepcion = {
 
         const anteriores = listos.map(entrada => ({ ...entrada.item }));
         listos.forEach(entrada => {
-            const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(entrada.item.producto_id));
+            const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === this._claveDe(entrada.item));
             if (idx !== -1) {
                 AppState.recepcion[idx] = {
                     ...AppState.recepcion[idx],
@@ -6886,7 +7036,7 @@ const Recepcion = {
                 this._ajustarSaldoProveedor(entrada.item.proveedor_id, -this._subtotal(entrada.llego, entrada.precio));
             });
             anteriores.forEach(anterior => {
-                const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(anterior.producto_id));
+                const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === this._claveDe(anterior));
                 if (idx !== -1) AppState.recepcion[idx] = anterior;
             });
             CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
@@ -6905,7 +7055,7 @@ const Recepcion = {
     },
 
     async confirmarProducto(productoId) {
-        const item = AppState.recepcion.find(r => String(r.producto_id) === String(productoId));
+        const item = AppState.recepcion.find(r => this._claveDe(r) === String(productoId));
         if (!item) {
             Utils.showError('Producto no encontrado');
             return;
@@ -6933,7 +7083,7 @@ const Recepcion = {
         if (!confirmar) return;
 
         const anterior = { ...item };
-        const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+        const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
         if (idx !== -1) {
             AppState.recepcion[idx] = {
                 ...AppState.recepcion[idx],
@@ -6953,7 +7103,7 @@ const Recepcion = {
         Utils.enSegundoPlano(async () => {
             await API.confirmarRecepcionItem({
                 fecha: AppState.currentDate,
-                producto_id: productoId,
+                producto_id: item.producto_id,
                 llego,
                 precio_real: precio,
                 reparto: reparto || null,
@@ -6962,7 +7112,7 @@ const Recepcion = {
             });
             this._armarListaPrecios();
         }, () => {
-            const actual = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+            const actual = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
             if (actual !== -1) AppState.recepcion[actual] = anterior;
             this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(llego, precio));
             CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
@@ -6972,7 +7122,7 @@ const Recepcion = {
     },
 
     async editarProducto(productoId) {
-        const item = AppState.recepcion.find(r => String(r.producto_id) === String(productoId));
+        const item = AppState.recepcion.find(r => this._claveDe(r) === String(productoId));
         if (!item) {
             Utils.showError('Producto no encontrado');
             return;
@@ -7003,7 +7153,7 @@ const Recepcion = {
                     <label class="recepcion-cli">
                         <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
                         <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
-                        <input type="number" step="any" min="0" class="modal-reparto" data-producto-id="${item.producto_id}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${Utils.formatCantidadInput(repartoModal[c.cliente_id] || 0)}">
+                        <input type="number" step="any" min="0" class="modal-reparto" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${Utils.formatCantidadInput(repartoModal[c.cliente_id] || 0)}">
                     </label>`).join('')}
                 </div>
                 <small class="modal-hint">Si cambiás el total, se reparte en proporción a lo pedido. Si cambiás lo de un cliente, el total se ajusta solo.</small>
@@ -7033,7 +7183,7 @@ const Recepcion = {
             const yaConfirmado = item.confirmado === true || item.confirmado === 'true';
             const anterior = { llego: item.llego, precio_real: item.precio_real, reparto: item.reparto || null };
             const delta = (yaConfirmado ? this._subtotal(llego, precio) : 0) - (yaConfirmado ? this._subtotal(item.llego, item.precio_real) : 0);
-            const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+            const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
             if (idx !== -1) {
                 AppState.recepcion[idx] = {
                     ...AppState.recepcion[idx],
@@ -7053,7 +7203,7 @@ const Recepcion = {
                 await API.saveRecepcion({
                     fecha: AppState.currentDate,
                     items: [{
-                        producto_id: productoId,
+                        producto_id: item.producto_id,
                         llego,
                         precio_real: precio,
                         reparto: reparto || null,
@@ -7063,7 +7213,7 @@ const Recepcion = {
                 });
                 if (yaConfirmado) this._armarListaPrecios();
             }, () => {
-                const actual = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+                const actual = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
                 if (actual !== -1) {
                     AppState.recepcion[actual] = {
                         ...AppState.recepcion[actual],
@@ -7100,7 +7250,7 @@ const Recepcion = {
     },
 
     async eliminarProducto(productoId) {
-        const item = AppState.recepcion.find(r => String(r.producto_id) === String(productoId));
+        const item = AppState.recepcion.find(r => this._claveDe(r) === String(productoId));
         if (!item) {
             Utils.showError('Producto no encontrado');
             return;
@@ -7119,7 +7269,7 @@ const Recepcion = {
         if (estabaConfirmado) {
             this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(item.llego, item.precio_real));
         }
-        const idx = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+        const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
         if (idx !== -1) {
             AppState.recepcion[idx] = {
                 ...AppState.recepcion[idx],
@@ -7139,11 +7289,12 @@ const Recepcion = {
         Utils.enSegundoPlano(async () => {
             await API.deleteRecepcionItem({
                 fecha: AppState.currentDate,
-                producto_id: productoId
+                producto_id: item.producto_id,
+                proveedor_id: item.proveedor_id || ''
             });
             if (estabaConfirmado) this._armarListaPrecios();
         }, () => {
-            const actual = AppState.recepcion.findIndex(r => String(r.producto_id) === String(productoId));
+            const actual = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
             if (actual !== -1) AppState.recepcion[actual] = anterior;
             if (estabaConfirmado) {
                 this._ajustarSaldoProveedor(anterior.proveedor_id, this._subtotal(anterior.llego, anterior.precio_real));
@@ -7177,7 +7328,8 @@ const Recepcion = {
 // va por kilo: de 500 kg al 10 % se cobra la comisión general por 50 bultos).
 const Comisiones = {
     TIPOS: [
-        { valor: '', texto: 'General del día' },
+        { valor: '', texto: 'Automática (según el tipo de producto)' },
+        { valor: 'general', texto: 'General del día' },
         { valor: 'ninguna', texto: 'Sin comisión' },
         { valor: 'monto', texto: 'Monto fijo por unidad' },
         { valor: 'porcentaje', texto: 'Porcentaje de la cantidad' }
@@ -7188,13 +7340,34 @@ const Comisiones = {
         return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n * 100) / 100, 100) : 0;
     },
 
+    // Si el producto no tiene una regla propia, la comisión sale de su tipo: verduras y frutas llevan la
+    // comisión fija (la general del día); bebidas y mercadería no llevan. Zapallo criollo y sandía no llevan
+    // la fija: tienen su propia comisión (por porcentaje) que se elige en el producto.
+    EXCEPTUADOS: ['zapallo criollo', 'sandia'],
+
+    defectoDe(producto) {
+        const tipo = PlanillaPedidos._tipoDe(producto);
+        if (tipo === 'bebida' || tipo === 'mercaderia') return { tipo: 'ninguna' };
+        if (tipo === 'verdura' || tipo === 'fruta') {
+            const nombre = FiltroTabla._normalizar(producto && producto.nombre);
+            if (this.EXCEPTUADOS.some(e => nombre.includes(e))) return { tipo: 'ninguna', sinDefinir: true };
+        }
+        return { tipo: '' };
+    },
+
+    // tipo/valor: lo que se aplica de verdad. guardado: lo que tiene elegido el producto ('' = automática).
     reglaDe(productoId) {
         const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
-        let tipo = String(producto?.comision_tipo || '').toLowerCase();
-        if (tipo === 'general' || !this.TIPOS.some(t => t.valor === tipo)) tipo = '';
+        let guardado = String(producto?.comision_tipo || '').toLowerCase();
+        if (!this.TIPOS.some(t => t.valor === guardado)) guardado = '';
+        if (guardado === '') {
+            const defecto = this.defectoDe(producto);
+            return { tipo: defecto.tipo, valor: 0, guardado, automatica: true, sinDefinir: !!defecto.sinDefinir };
+        }
+        const tipo = guardado === 'general' ? '' : guardado;
         const valor = tipo === 'porcentaje' ? this.porcentaje(producto.comision_valor)
             : tipo === 'monto' ? (Utils.parsePrice(producto.comision_valor) || 0) : 0;
-        return { tipo, valor };
+        return { tipo, valor, guardado, automatica: false, sinDefinir: false };
     },
 
     // Comisión por unidad de una línea según la regla del producto y la comisión general del día.
@@ -7210,7 +7383,8 @@ const Comisiones = {
     },
 
     texto(regla, general) {
-        if (regla.tipo === 'ninguna') return 'Sin comisión';
+        if (regla.sinDefinir) return 'Sin definir: elegí su comisión (porcentaje)';
+        if (regla.tipo === 'ninguna') return regla.automatica ? 'Sin comisión (automático)' : 'Sin comisión';
         if (regla.tipo === 'monto') return `${Utils.formatCurrency(regla.valor)} por unidad`;
         if (regla.tipo === 'porcentaje') {
             const porUnidad = Math.round((Utils.parsePrice(general) || 0) * regla.valor) / 100;
@@ -7247,6 +7421,7 @@ const Comisiones = {
 
     textoCorto(producto) {
         const regla = this.reglaDe(producto.id);
+        if (regla.sinDefinir) return 'Sin definir';
         if (regla.tipo === 'ninguna') return 'Sin comisión';
         if (regla.tipo === 'monto') return Utils.formatCurrency(regla.valor);
         if (regla.tipo === 'porcentaje') return `${String(regla.valor).replace('.', ',')} % de la cantidad`;
@@ -7255,7 +7430,7 @@ const Comisiones = {
 
     // Campos del formulario de producto (agregar y editar).
     camposHtml(producto = {}) {
-        const regla = producto.id ? this.reglaDe(producto.id) : { tipo: '', valor: 0 };
+        const regla = producto.id ? this.reglaDe(producto.id) : { tipo: '', valor: 0, guardado: '' };
         return `
             <div class="form-group">
                 <label class="checkbox-label" for="modal-producto-por-kilo">
@@ -7267,8 +7442,9 @@ const Comisiones = {
             <div class="form-group">
                 <label for="modal-producto-comision-tipo">Comisión de reparto</label>
                 <select id="modal-producto-comision-tipo" class="form-control">
-                    ${this.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.tipo ? 'selected' : ''}>${t.texto}</option>`).join('')}
+                    ${this.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.guardado ? 'selected' : ''}>${t.texto}</option>`).join('')}
                 </select>
+                <small>Automática: verduras y frutas llevan la comisión fija; bebidas y mercadería, no. Zapallo criollo y sandía llevan su propio porcentaje.</small>
             </div>
             <div class="form-group" id="modal-producto-comision-grupo" ${regla.tipo === 'monto' || regla.tipo === 'porcentaje' ? '' : 'hidden'}>
                 <label for="modal-producto-comision-valor" id="modal-producto-comision-label">${regla.tipo === 'porcentaje' ? 'Porcentaje de la cantidad (%)' : 'Monto por unidad ($)'}</label>
@@ -7340,11 +7516,12 @@ const Precios = {
             if (!clientesMap.has(cid)) clientesMap.set(cid, { id: cid, nombre: Utils.nombreCatalogo(p, 'cliente') || 'Cliente' });
             const pid = String(p.producto_id);
             if (!productosMap.has(pid)) {
-                const recepcion = (this.recepciones || []).find(r => String(r.producto_id) === pid);
+                const recepcion = Recepcion.agregadoDe(this.recepciones, pid);
                 const producto = (AppState.productos || []).find(x => String(x.id) === pid);
                 const provId = String(recepcion?.proveedor_id || producto?.proveedor_default || '');
                 const proveedor = (AppState.proveedores || []).find(x => String(x.id) === provId);
                 productosMap.set(pid, {
+                    id: pid,
                     producto: Utils.nombreCatalogo(p, 'producto') || 'Producto',
                     precio: Utils.parsePrice(recepcion?.precio_real) || 0,
                     puesto: proveedor?.nombre || recepcion?.proveedor_nombre || '',
@@ -7359,7 +7536,7 @@ const Precios = {
         const clientes = [...clientesMap.values()].sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
         const productos = [...productosMap.values()]
             .map(f => ({ ...f, precioTotal: Math.round(f.total * f.precio) }))
-            .sort((a, b) => a.producto.localeCompare(b.producto, 'es'));
+            .sort((a, b) => Utils.compararProductos({ id: a.id, nombre: a.producto }, { id: b.id, nombre: b.producto }));
         return { clientes, productos, total: productos.reduce((s, f) => s + f.precioTotal, 0) };
     },
 
@@ -7669,7 +7846,7 @@ const Precios = {
         });
         
         // Filtrar precios por cliente si hay filtro activo
-        let preciosFiltrados = AppState.precios || [];
+        let preciosFiltrados = this._ordenados(AppState.precios || []);
         if (this.selectedClienteId) {
             preciosFiltrados = preciosFiltrados.filter(p => p.cliente_id === this.selectedClienteId);
         }
@@ -7706,7 +7883,7 @@ const Precios = {
                 : Utils.parsePrice(precio.precio_cliente || 0);
             
             // Obtener precio_real de la recepción
-            const recepcion = this.recepciones.find(r => String(r.producto_id) === String(precio.producto_id));
+            const recepcion = Recepcion.agregadoDe(this.recepciones, precio.producto_id);
             const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
             const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
             // Se completa solo con el costo de la recepción; si lo cambian a mano, vale el de la línea.
@@ -7801,7 +7978,7 @@ const Precios = {
         }
         const cerrado = DiaOperativo.diaCerrado(fecha);
         const lista = [...productos.entries()].sort((a, b) => a[1].localeCompare(b[1], 'es'));
-        const propias = lista.filter(([pid]) => Comisiones.reglaDe(pid).tipo !== '').length;
+        const propias = lista.filter(([pid]) => !Comisiones.reglaDe(pid).automatica).length;
         const abierto = caja.querySelector('details')?.open || false;
         const filas = lista.map(([pid, nombre]) => {
             const regla = Comisiones.reglaDe(pid);
@@ -7811,7 +7988,7 @@ const Precios = {
                     <td>${Utils.esc(nombre)}</td>
                     <td>
                         <select class="form-control comision-tipo" ${cerrado ? 'disabled' : ''} aria-label="Comisión de ${Utils.esc(nombre)}">
-                            ${Comisiones.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.tipo ? 'selected' : ''}>${t.texto}</option>`).join('')}
+                            ${Comisiones.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.guardado ? 'selected' : ''}>${t.texto}</option>`).join('')}
                         </select>
                     </td>
                     <td>
@@ -7824,8 +8001,8 @@ const Precios = {
         caja.hidden = false;
         caja.innerHTML = `
             <details ${abierto ? 'open' : ''}>
-                <summary>Comisión por producto <span class="th-hint">${propias ? `${propias} producto(s) con comisión propia` : 'todos usan la general'}</span></summary>
-                <p class="dia-operativo-hint">Cada producto puede usar la comisión general, no llevar comisión, llevar un monto fijo por unidad o un porcentaje de la cantidad (la sandía por kilo: 500 kg al 10 % paga la comisión general de 50 bultos). Queda guardado en el producto para los próximos días.</p>
+                <summary>Comisión por producto <span class="th-hint">${propias ? `${propias} producto(s) con comisión propia` : 'el resto sigue la regla automática del tipo'}</span></summary>
+                <p class="dia-operativo-hint">Por defecto (automática) las verduras y frutas llevan la comisión general fija, las bebidas y la mercadería no llevan, y zapallo criollo y sandía se definen aparte. Cada producto puede además usar la comisión general, no llevar comisión, llevar un monto fijo por unidad o un porcentaje de la cantidad (la sandía por kilo: 500 kg al 10 % paga la comisión general de 50 bultos). Queda guardado en el producto para los próximos días.</p>
                 <div class="table-container">
                     <table class="data-table precios-comisiones-tabla">
                         <thead><tr><th>Producto</th><th>Comisión</th><th>Valor</th><th>Se cobra</th></tr></thead>
@@ -7854,7 +8031,7 @@ const Precios = {
                 const valor = select.value === 'porcentaje' ? Comisiones.porcentaje(input.value) : (Utils.parsePrice(input.value) || 0);
                 if (!(valor > 0)) return;
                 const regla = Comisiones.reglaDe(pid);
-                if (regla.tipo === select.value && regla.valor === valor) return;
+                if (regla.guardado === select.value && regla.valor === valor) return;
                 this.cambiarReglaProducto(pid, select.value, valor);
             };
             input.addEventListener('change', guardarValor);
@@ -7986,6 +8163,38 @@ const Precios = {
         });
     },
 
+    // "Mismo precio para todos los clientes": al cambiar el precio de un producto en una línea, los demás
+    // clientes de ese producto (del día) quedan con ese mismo precio. Se puede apagar para un precio especial.
+    get mismoPrecio() {
+        try { return localStorage.getItem('precios-mismo-precio') !== '0'; } catch (e) { return true; }
+    },
+
+    set mismoPrecio(valor) {
+        try { localStorage.setItem('precios-mismo-precio', valor ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+    },
+
+    propagarPrecio(input) {
+        if (!this.mismoPrecio || DiaOperativo.diaCerrado(AppState.currentDate)) return;
+        const id = input.getAttribute('data-id');
+        const linea = (AppState.precios || []).find(p => String(p.id) === String(id));
+        const valor = Utils.parsePrice(input.value) || 0;
+        if (!linea || !(valor > 0)) return;
+        let cambiados = 0;
+        (AppState.precios || []).forEach(p => {
+            if (String(p.id) === String(id) || String(p.producto_id) !== String(linea.producto_id)) return;
+            if (p.fecha && Utils.fechaIso(p.fecha) !== AppState.currentDate) return;
+            if ((Utils.parsePrice(p.precio_cliente) || 0) === valor) return;
+            p.precio_cliente = valor;
+            this._tocadas.add(String(p.id));
+            cambiados += 1;
+            const otro = document.querySelector(`.precio-cliente[data-id="${p.id}"]`);
+            if (otro) otro.value = Utils.formatPrice(valor);
+        });
+        if (!cambiados) return;
+        this.refrescarCalculo();
+        Utils.avisar(`Mismo precio para ${cambiados} cliente${cambiados === 1 ? '' : 's'} más`);
+    },
+
     // Al salir de un campo de precio NO se rearma la tabla: si se rearmaba, el campo siguiente que
     // la persona acababa de tocar desaparecía y lo que escribía se perdía (pasaba con un precio sí y
     // otro no). Solo se recalculan comisión, ganancia y totales.
@@ -8024,7 +8233,7 @@ const Precios = {
 
             const cantidad = parseFloat(precio.cantidad || 0);
             totalCantidad += cantidad;
-            const recepcion = (this.recepciones || []).find(r => String(r.producto_id) === String(precio.producto_id));
+            const recepcion = Recepcion.agregadoDe(this.recepciones, precio.producto_id);
             const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
             const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
             const inputReal = tr.querySelector('.precio-real');
@@ -8082,9 +8291,44 @@ const Precios = {
         }
     },
     
+    // Los precios de días anteriores: cada cliente arranca con el último precio que se le puso a ese producto
+    // (si nunca lo compró, con el último que se le puso a cualquier cliente). Solo cambian si alguien los cambia.
+    _historial: null,
+    async _preciosAnteriores() {
+        const fecha = AppState.currentDate;
+        if (this._historial && this._historial.fecha === fecha && Date.now() - this._historial.ts < 300000) return this._historial.mapa;
+        const mapa = { porCliente: new Map(), porProducto: new Map() };
+        try {
+            const todos = await API.request('precios-cliente', 'GET');
+            (todos || []).forEach(p => {
+                const dia = Utils.fechaIso(p.fecha);
+                const precio = Utils.parsePrice(p.precio_cliente) || 0;
+                if (!dia || dia >= fecha || precio <= 0) return;
+                const claveCliente = `${p.cliente_id}|${p.producto_id}`;
+                const delCliente = mapa.porCliente.get(claveCliente);
+                if (!delCliente || dia > delCliente.dia) mapa.porCliente.set(claveCliente, { dia, precio });
+                const claveProducto = String(p.producto_id);
+                const delProducto = mapa.porProducto.get(claveProducto);
+                if (!delProducto || dia > delProducto.dia) mapa.porProducto.set(claveProducto, { dia, precio });
+            });
+        } catch (error) {
+            // Sin historial las líneas nuevas quedan sin precio, como antes.
+        }
+        this._historial = { fecha, ts: Date.now(), mapa };
+        return mapa;
+    },
+
+    _precioAnterior(historial, clienteId, productoId) {
+        const propio = historial.porCliente.get(`${clienteId}|${productoId}`);
+        if (propio) return propio.precio;
+        const general = historial.porProducto.get(String(productoId));
+        return general ? general.precio : 0;
+    },
+
     async armarLista(opciones = {}) {
         const silencioso = !!opciones.silencioso;
         this._sincronizarComision();
+        const historial = await this._preciosAnteriores();
 
         const [recepciones, pedidos] = await Promise.all([
             API.getRecepcion(AppState.currentDate),
@@ -8108,50 +8352,82 @@ const Precios = {
 
         const preciosItems = [];
         const avisosFaltante = [];
-        const confirmadosIds = new Set(recepcionesConfirmadas.map(r => String(r.producto_id)));
+        // Productos con algún proveedor ya confirmado, y clientes que solo esperan a uno sin confirmar.
+        const confirmadosIds = new Set();
+        const esperandoKeys = new Set();
 
         Object.keys(porProducto).forEach(productoId => {
-            const recepcion = recepcionesConfirmadas.find(r => String(r.producto_id) === String(productoId));
-            if (!recepcion) return;
+            const producto = (AppState.productos || []).find(x => String(x.id) === String(productoId));
 
-            const porCliente = {};
+            // Un producto puede venir de más de un proveedor: lo que llegó de cada uno se reparte entre
+            // los clientes que le pidieron a ese proveedor, y la línea de cada cliente suma todo.
+            const porProveedor = {};
             porProducto[productoId].forEach(pedido => {
-                const key = String(pedido.cliente_id);
-                if (!porCliente[key]) {
-                    porCliente[key] = {
-                        cliente_id: pedido.cliente_id,
-                        producto_id: productoId,
-                        producto_nombre: pedido.producto_nombre || '',
-                        cantidadPedida: 0
-                    };
+                const prov = Recepcion._proveedorDePedido(pedido, producto);
+                if (!porProveedor[prov]) porProveedor[prov] = [];
+                porProveedor[prov].push(pedido);
+            });
+            const proveedoresDelProducto = Object.keys(porProveedor);
+            const asignadas = Recepcion._asignarFilas(
+                (recepciones || []).filter(r => String(r.producto_id) === String(productoId)),
+                proveedoresDelProducto
+            );
+
+            const acumulado = {};
+            proveedoresDelProducto.forEach(prov => {
+                const recepcion = asignadas[prov];
+                if (!recepcion || !confirmada(recepcion)) {
+                    porProveedor[prov].forEach(pedido => esperandoKeys.add(`${pedido.cliente_id}|${productoId}`));
+                    return;
                 }
-                porCliente[key].cantidadPedida += parseFloat(pedido.cantidad) || 0;
+                confirmadosIds.add(String(productoId));
+
+                const porCliente = {};
+                porProveedor[prov].forEach(pedido => {
+                    const key = String(pedido.cliente_id);
+                    if (!porCliente[key]) {
+                        porCliente[key] = {
+                            cliente_id: pedido.cliente_id,
+                            producto_id: productoId,
+                            producto_nombre: pedido.producto_nombre || '',
+                            cantidadPedida: 0
+                        };
+                    }
+                    porCliente[key].cantidadPedida += parseFloat(pedido.cantidad) || 0;
+                });
+
+                const lineas = Object.values(porCliente);
+                const pedidoTotal = lineas.reduce((sum, linea) => sum + linea.cantidadPedida, 0);
+                const llego = parseFloat(recepcion.llego) || 0;
+                if (llego !== pedidoTotal) {
+                    const nombre = lineas[0].producto_nombre || 'Producto';
+                    const proveedor = proveedoresDelProducto.length > 1 ? (recepcion.proveedor_nombre || '') : '';
+                    avisosFaltante.push(`${nombre}${proveedor ? ' (' + proveedor + ')' : ''}: pedido ${pedidoTotal}, llegó ${llego}`);
+                }
+
+                // Si se repartió a mano (a quién le toca de más o de menos), se respeta; si no, es proporcional.
+                const repartoManual = recepcion.reparto && typeof recepcion.reparto === 'object' ? recepcion.reparto : null;
+                const manualValido = repartoManual
+                    && lineas.every(l => repartoManual[String(l.cliente_id)] !== undefined)
+                    && Math.abs(lineas.reduce((t, l) => t + (Number(repartoManual[String(l.cliente_id)]) || 0), 0) - llego) <= 0.05;
+                const repartidas = manualValido
+                    ? lineas.map(l => ({ ...l, cantidad: Math.round((Number(repartoManual[String(l.cliente_id)]) || 0) * 100) / 100 }))
+                    : this.repartirRecibido(lineas, llego);
+                repartidas.forEach(linea => {
+                    const key = String(linea.cliente_id);
+                    if (!acumulado[key]) acumulado[key] = { ...linea, cantidad: 0 };
+                    acumulado[key].cantidad = Math.round((acumulado[key].cantidad + (Number(linea.cantidad) || 0)) * 100) / 100;
+                });
             });
 
-            const lineas = Object.values(porCliente);
-            const pedidoTotal = lineas.reduce((sum, linea) => sum + linea.cantidadPedida, 0);
-            const llego = parseFloat(recepcion.llego) || 0;
-            if (llego !== pedidoTotal) {
-                const nombre = lineas[0].producto_nombre || 'Producto';
-                avisosFaltante.push(`${nombre}: pedido ${pedidoTotal}, llegó ${llego}`);
-            }
-
-            // Si se repartió a mano (a quién le toca de más o de menos), se respeta; si no, es proporcional.
-            const repartoManual = recepcion.reparto && typeof recepcion.reparto === 'object' ? recepcion.reparto : null;
-            const manualValido = repartoManual
-                && lineas.every(l => repartoManual[String(l.cliente_id)] !== undefined)
-                && Math.abs(lineas.reduce((t, l) => t + (Number(repartoManual[String(l.cliente_id)]) || 0), 0) - llego) <= 0.05;
-            const repartidas = manualValido
-                ? lineas.map(l => ({ ...l, cantidad: Math.round((Number(repartoManual[String(l.cliente_id)]) || 0) * 100) / 100 }))
-                : this.repartirRecibido(lineas, llego);
-            repartidas.forEach(linea => {
+            Object.values(acumulado).forEach(linea => {
                 const existentes = (AppState.precios || []).filter(p =>
                     String(p.cliente_id) === String(linea.cliente_id) &&
                     String(p.producto_id) === String(linea.producto_id)
                 );
                 const existente = existentes.find(p => Utils.parsePrice(p.precio_cliente) > 0) || existentes[0];
                 if (linea.cantidad <= 0 && !existente) return;
-                const precioCliente = Utils.parsePrice(existente?.precio_cliente) || 0;
+                const precioCliente = Utils.parsePrice(existente?.precio_cliente) || this._precioAnterior(historial, linea.cliente_id, linea.producto_id);
                 preciosItems.push({
                     cliente_id: linea.cliente_id,
                     producto_id: linea.producto_id,
@@ -8166,7 +8442,7 @@ const Precios = {
             const ya = new Set(preciosItems.map(item => `${item.cliente_id}|${item.producto_id}`));
             (AppState.precios || []).forEach(precio => {
                 const key = `${precio.cliente_id}|${precio.producto_id}`;
-                if (ya.has(key) || confirmadosIds.has(String(precio.producto_id))) return;
+                if (ya.has(key) || (confirmadosIds.has(String(precio.producto_id)) && !esperandoKeys.has(key))) return;
                 preciosItems.push({
                     cliente_id: precio.cliente_id,
                     producto_id: precio.producto_id,
@@ -8214,9 +8490,11 @@ const Precios = {
         const items = [];
         const precios = AppState.precios;
         
+        const enPantalla = new Set();
         document.querySelectorAll('.precio-cliente').forEach(input => {
             const id = input.getAttribute('data-id');
             const precio = Utils.parsePrice(input.value) || 0;
+            enPantalla.add(String(id));
             
             const precioData = precios.find(p => p.id === id);
             if (precioData) {
@@ -8238,6 +8516,23 @@ const Precios = {
                     items.push({ ...item, solo_comision: true });
                 }
             }
+        });
+        
+        // Líneas de otros clientes que cambiaron por "mismo precio" y no se ven (hay un cliente filtrado).
+        this._tocadas.forEach(id => {
+            if (enPantalla.has(String(id))) return;
+            const precioData = precios.find(p => String(p.id) === String(id));
+            if (!precioData) return;
+            const item = {
+                cliente_id: precioData.cliente_id,
+                producto_id: precioData.producto_id,
+                cantidad: precioData.cantidad || 0,
+                precio_cliente: Utils.parsePrice(precioData.precio_cliente) || 0,
+                ...this._comisionLinea(precioData, precioData.precio_cliente),
+                precio_real: Utils.parsePrice(precioData.precio_real) || 0
+            };
+            todas.push(item);
+            items.push(item);
         });
         
         if (todas.length === 0) {
@@ -8371,10 +8666,16 @@ const Precios = {
     },
     
     /** Lee precios actuales de la tabla (inputs + filtro cliente) para exportar */
+    // Las líneas en el orden de la planilla de pedidos (la pantalla y el PDF al cliente salen iguales).
+    _ordenados(precios) {
+        return precios.slice().sort((a, b) =>
+            Utils.compararProductos({ id: a.producto_id, nombre: a.producto_nombre }, { id: b.producto_id, nombre: b.producto_nombre }));
+    },
+
     _obtenerDatosClienteParaExportar() {
         if (!this.selectedClienteId) return null;
 
-        const preciosFiltrados = (AppState.precios || []).filter(
+        const preciosFiltrados = this._ordenados(AppState.precios || []).filter(
             p => p.cliente_id === this.selectedClienteId
         );
         if (preciosFiltrados.length === 0) return null;
@@ -9329,7 +9630,7 @@ const Cierre = {
         const pedidos = AppState.pedidos || [];
         const conPrecio = (precios || []).filter(p => Utils.parsePrice(p.precio_cliente) > 0);
         const faltantes = pedidos.filter(pedido => {
-            const rec = (AppState.recepcion || []).find(r => String(r.producto_id) === String(pedido.producto_id));
+            const rec = Recepcion.agregadoDe(AppState.recepcion, pedido.producto_id);
             const confirmado = rec && (rec.confirmado === true || rec.confirmado === 'true' || rec.confirmado === 1);
             if (confirmado && (Number(rec.llego) || 0) <= 0) return false;
             return !conPrecio.some(pr =>
@@ -10299,6 +10600,29 @@ const SaldoCliente = {
     }
 };
 
+// Deudas de un cliente o proveedor separadas por la fecha en que quedaron. El total va solo como referencia.
+const DeudasPorFecha = {
+    // accion: texto del onclick del botón de cada línea; "{fecha}" se reemplaza por la fecha (YYYY-MM-DD).
+    html(deudas, total, aFavor, accion) {
+        const lineas = (deudas || []).map(d => {
+            const fecha = Utils.fechaIso(d.fecha);
+            const rotulo = fecha ? Utils.formatDate(fecha) : 'Anterior';
+            const onclick = d.onclick || (accion && fecha ? accion.replace('{fecha}', fecha) : '');
+            const boton = onclick
+                ? `<button class="btn btn-primary btn-sm" type="button" onclick="${onclick}">${Utils.esc(d.boton || 'Pagar')}</button>`
+                : '';
+            const nota = d.nota ? `<small class="fila-nota">${Utils.esc(d.nota)}</small>` : '';
+            return `<div class="deuda-fecha">
+                <span class="deuda-fecha-dia">${Utils.esc(rotulo)}${nota}</span>
+                <strong class="deuda-fecha-monto">${Utils.formatCurrency(Utils.parsePrice(d.saldo) || 0)}</strong>
+                ${boton}
+            </div>`;
+        }).join('');
+        const favor = aFavor > 0.009 ? `<div class="deuda-total-ref">A favor: ${Utils.formatCurrency(aFavor)}</div>` : '';
+        return `<div class="deuda-fechas">${lineas}<div class="deuda-total-ref">Total (referencia): ${Utils.formatCurrency(total)}</div>${favor}</div>`;
+    }
+};
+
 const Cobranzas = {
     _agregando: false,
     _guardando: false,
@@ -10345,34 +10669,39 @@ const Cobranzas = {
         
         if (AppState.cobranzas.length === 0) {
             const vacia = document.createElement('tr');
-            vacia.innerHTML = '<td colspan="6" style="text-align: center; padding: 30px; color: #666;">' +
+            vacia.innerHTML = '<td colspan="4" style="text-align: center; padding: 30px; color: #666;">' +
                 'No hay cobranzas pendientes.' +
                 '</td>';
             tbody.appendChild(vacia);
             return;
         }
         
+        // Una tarjeta por cliente, con cada deuda en su fecha (no se suman entre sí).
+        const porCliente = new Map();
         AppState.cobranzas.forEach(cobranza => {
+            const clave = String(cobranza.cliente_id || '');
+            if (!porCliente.has(clave)) porCliente.set(clave, []);
+            porCliente.get(clave).push(cobranza);
+        });
+        porCliente.forEach(cobranzas => {
+            cobranzas.sort((a, b) => String(Utils.fechaIso(a.fecha) || '').localeCompare(String(Utils.fechaIso(b.fecha) || '')));
             const tr = document.createElement('tr');
-            const saldo = Utils.getCobranzaSaldo(cobranza);
-            const cliente = this._clienteDe(cobranza);
-            tr.dataset.clienteId = String(cobranza.cliente_id || '');
-            tr.dataset.cobranzaId = String(cobranza.id || '');
-            const rotuloManual = cobranza.origen === 'manual'
-                ? `<small class="fila-nota">Deuda anterior${cobranza.nota ? ' · ' + Utils.esc(cobranza.nota) : ''}</small>`
-                : '';
+            const cliente = this._clienteDe(cobranzas[0]);
+            const total = cobranzas.reduce((suma, c) => suma + Utils.getCobranzaSaldo(c), 0);
+            tr.dataset.clienteId = String(cobranzas[0].cliente_id || '');
+            tr.dataset.cobranzaIds = cobranzas.map(c => String(c.id || '')).join(' ');
+            const lineas = cobranzas.map(c => ({
+                fecha: c.fecha,
+                saldo: Utils.getCobranzaSaldo(c),
+                nota: c.origen === 'manual' ? 'Deuda anterior' + (c.nota ? ' · ' + c.nota : '') : '',
+                onclick: `Cobranzas.cobrar('${c.id}')`,
+                boton: 'Cobrar'
+            }));
             tr.innerHTML = `
-                <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}${rotuloManual}</td>
-                <td data-label="Te debe" style="color:#dc3545;font-weight:700;">${Utils.formatCurrency(saldo)}</td>
-                <td data-label="Cómo pagó" class="medios-texto">${MediosPago.texto(cobranza.medios)}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</td>
-                <td data-label="Fecha">${Utils.formatDate(cobranza.fecha)}</td>
+                <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}</td>
+                <td data-label="Te debe">${DeudasPorFecha.html(lineas, total, 0, '')}</td>
+                <td data-label="Fecha">${Utils.formatDate(cobranzas[0].fecha)}${cobranzas.length > 1 ? `<small class="fila-nota">y ${cobranzas.length - 1} más</small>` : ''}</td>
                 <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span></td>
-                <td data-label="Acciones">
-                    <div class="pagos-acciones">
-                        <button class="btn btn-primary btn-sm" type="button" onclick="Cobranzas.cobrar('${cobranza.id}')">Cobrar</button>
-                        <button class="btn btn-secondary btn-sm" type="button" onclick="CuentaCorriente.abrir('cliente', '${cliente.id}')">Cuenta</button>
-                    </div>
-                </td>
             `;
             tbody.appendChild(tr);
         });
@@ -10398,10 +10727,9 @@ const Cobranzas = {
                 <input type="text" id="nueva-cobranza-nota" class="form-control fila-nueva-nota" placeholder="Nota (opcional)" maxlength="120" value="${Utils.esc(b.nota)}" aria-label="Nota">
             </td>
             <td data-label="Te debe"><input type="text" id="nueva-cobranza-total" class="form-control" data-price-input="true" inputmode="numeric" placeholder="$ 0" value="${Utils.esc(b.total)}" aria-label="Cuánto te debe"></td>
-            <td data-label="Cómo pagó" class="medios-texto"><span class="fila-nueva-hint">Se registra con Cobrar</span></td>
             <td data-label="Fecha"><input type="date" id="nueva-cobranza-fecha" class="form-control" max="${Utils.ayerAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha te debe"></td>
-            <td data-label="Estado"><span class="status-badge status-pendiente">Nueva</span></td>
-            <td data-label="Acciones">
+            <td data-label="Estado">
+                <span class="status-badge status-pendiente">Nueva</span>
                 <div class="pagos-acciones">
                     <button type="button" class="btn btn-primary btn-sm" id="nueva-cobranza-guardar">Guardar</button>
                     <button type="button" class="btn btn-secondary btn-sm" id="nueva-cobranza-cancelar">Cancelar</button>
@@ -10473,7 +10801,7 @@ const Cobranzas = {
             this._filaEl = null;
             this._borrador = { cliente_id: '', total: '', fecha: '', nota: '' };
             this.render();
-            const tr = document.querySelector(`#cobranzas-tbody tr[data-cobranza-id="${creada.id}"]`);
+            const tr = document.querySelector(`#cobranzas-tbody tr[data-cobranza-ids~="${creada.id}"]`);
             if (tr) {
                 tr.classList.add('fila-recien-agregada');
                 tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -10514,11 +10842,16 @@ const Cobranzas = {
 
         const inicial = MediosPago.vacio();
         inicial.efectivo = saldo;
+        const yaPagado = Utils.parsePrice(cobranza.pagado) || 0;
+        const yaPago = yaPagado > 0.01
+            ? `<p class="modal-hint"><strong>Ya pagó ${Utils.formatCurrency(yaPagado)}</strong>${MediosPago.texto(cobranza.medios) !== '—' ? ' · ' + MediosPago.texto(cobranza.medios) : ''}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</p>`
+            : '';
         const content = `
             <div class="form-group">
-                <label for="modal-cobro-deuda">Te debe</label>
+                <label for="modal-cobro-deuda">Te debe${cobranza.fecha ? ' del ' + Utils.formatDate(cobranza.fecha) : ''}</label>
                 <input type="text" id="modal-cobro-deuda" class="form-control" value="${Utils.formatCurrency(saldo)}" readonly tabindex="-1">
             </div>
+            ${yaPago}
             <p class="modal-hint">Repartí el pago. Lo que no cargues queda adeudado.</p>
             ${MediosPago.html(MediosPago.deCliente, inicial)}
         `;
@@ -11348,7 +11681,7 @@ const Pagos = {
             const mediosServer = MediosPago.total(MediosPago.parse(proveedor.medios));
             const mediosLocal = MediosPago.total(MediosPago.parse(local.medios));
             if (mediosLocal > mediosServer + 0.05 && serverSaldo + 0.05 >= localSaldo) {
-                return { ...proveedor, saldo: localSaldo, medios: local.medios };
+                return { ...proveedor, saldo: localSaldo, medios: local.medios, deudas: local.deudas || proveedor.deudas };
             }
             if (mediosLocal > mediosServer + 0.05) {
                 return { ...proveedor, medios: local.medios };
@@ -11359,13 +11692,13 @@ const Pagos = {
 
     _reflejarPago(proveedorId) {
         const actual = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
-        const local = this._optimo[String(proveedorId)] || (actual ? { saldo: actual.saldo, medios: actual.medios } : null);
+        const local = this._optimo[String(proveedorId)] || (actual ? { saldo: actual.saldo, medios: actual.medios, deudas: actual.deudas } : null);
         if (!local) return;
         const tocar = (lista) => {
             if (!Array.isArray(lista)) return;
             const index = lista.findIndex(item => String(item.id) === String(proveedorId));
             if (index < 0) return;
-            lista[index] = { ...lista[index], saldo: local.saldo, medios: local.medios };
+            lista[index] = { ...lista[index], saldo: local.saldo, medios: local.medios, deudas: local.deudas || lista[index].deudas };
         };
         tocar(CacheManager.peek('proveedores'));
         tocar(AppState.proveedores);
@@ -11500,7 +11833,7 @@ const Pagos = {
                     ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
                     : 'No hay mercadería confirmada para pagar en este día.');
             const vaciaTr = document.createElement('tr');
-            vaciaTr.innerHTML = `<td colspan="6" style="text-align:center;padding:30px;color:#666;">${vacio}</td>`;
+            vaciaTr.innerHTML = `<td colspan="4" style="text-align:center;padding:30px;color:#666;">${vacio}</td>`;
             tbody.appendChild(vaciaTr);
             if (resumen) resumen.hidden = true;
             Depositos.pintarEnPagos();
@@ -11514,9 +11847,14 @@ const Pagos = {
             const saldo = Utils.parsePrice(proveedor.saldo) || 0;
             const pendiente = saldo > 0;
             const puedePagar = pendiente && !pagado;
-            const btnPagar = puedePagar
+            // Con deudas de varias fechas, cada una se paga por separado desde su propia línea.
+            const porFecha = Array.isArray(proveedor.deudas) && proveedor.deudas.length > 0;
+            const btnPagar = puedePagar && !porFecha
                 ? `<button class="btn btn-primary btn-sm" type="button" onclick="Pagos.registrar('${proveedor.id}')">Pagar</button>`
                 : '';
+            const celdaDebes = porFecha
+                ? DeudasPorFecha.html(proveedor.deudas, saldo, Utils.parsePrice(proveedor.a_favor) || 0, pagado ? '' : `Pagos.registrar('${proveedor.id}', { fecha: '{fecha}' })`)
+                : Utils.formatCurrency(saldo);
             const identificados = Depositos.deProveedor(proveedor.id);
             const vino = identificados.length
                 ? `<div class="deposito-texto">${identificados.map(item => `${Depositos._esc(item.cuenta)} · vino de ${Depositos._esc(item.cliente)} ${Utils.formatCurrency(item.monto)}`).join('<br>')}</div>`
@@ -11524,16 +11862,9 @@ const Pagos = {
             tr.dataset.proveedorId = String(proveedor.id || '');
             tr.innerHTML = `
                 <td data-label="Proveedor">${Utils.esc(proveedor.nombre || '')}${vino}</td>
-                <td data-label="Le debés" style="${saldo > 0 ? 'color:#dc3545;font-weight:700;' : ''}">${Utils.formatCurrency(saldo)}</td>
-                <td data-label="Cómo pagaste" class="medios-texto">${MediosPago.texto(proveedor.medios)}</td>
+                <td data-label="Le debés" style="${saldo > 0 && !porFecha ? 'color:#dc3545;font-weight:700;' : ''}">${celdaDebes}${btnPagar}</td>
                 <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
                 <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span></td>
-                <td data-label="Acciones">
-                    <div class="pagos-acciones">
-                        ${btnPagar}
-                        <button class="btn btn-secondary btn-sm" type="button" onclick="CuentaCorriente.abrir('proveedor', '${proveedor.id}')">Cuenta</button>
-                    </div>
-                </td>
             `;
             tbody.appendChild(tr);
         });
@@ -11560,10 +11891,9 @@ const Pagos = {
                 <input type="text" id="nueva-deuda-nota" class="form-control fila-nueva-nota" placeholder="Nota (opcional)" maxlength="120" value="${Utils.esc(b.nota)}" aria-label="Nota">
             </td>
             <td data-label="Le debés"><input type="text" id="nueva-deuda-monto" class="form-control" data-price-input="true" inputmode="numeric" placeholder="$ 0" value="${Utils.esc(b.monto)}" aria-label="Cuánto le debés"></td>
-            <td data-label="Cómo pagaste" class="medios-texto"><span class="fila-nueva-hint">Se registra con Pagar</span></td>
-            <td data-label="Deuda desde"><small class="fila-nueva-etiqueta">Deuda desde</small><input type="date" id="nueva-deuda-fecha" class="form-control" max="${fechaHoyAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha le debés"></td>
-            <td data-label="Estado"><span class="status-badge status-pendiente">Nueva</span></td>
-            <td data-label="Acciones">
+                        <td data-label="Deuda desde"><small class="fila-nueva-etiqueta">Deuda desde</small><input type="date" id="nueva-deuda-fecha" class="form-control" max="${fechaHoyAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha le debés"></td>
+            <td data-label="Estado">
+                <span class="status-badge status-pendiente">Nueva</span>
                 <div class="pagos-acciones">
                     <button type="button" class="btn btn-primary btn-sm" id="nueva-deuda-guardar">Guardar</button>
                     <button type="button" class="btn btn-secondary btn-sm" id="nueva-deuda-cancelar">Cancelar</button>
@@ -11699,6 +12029,18 @@ const Pagos = {
         return total;
     },
 
+    // Lo que queda de cada deuda por fecha después de pagar. Con fecha, solo toca esa; sin fecha, de la más vieja a la más nueva.
+    _descontarDeudas(deudas, monto, fecha) {
+        let resto = monto;
+        return (deudas || []).map(d => {
+            const saldo = Utils.parsePrice(d.saldo) || 0;
+            if (resto <= 0 || (fecha && Utils.fechaIso(d.fecha) !== fecha)) return d;
+            const aplicado = Math.min(resto, saldo);
+            resto -= aplicado;
+            return { ...d, saldo: saldo - aplicado, pagado: (Utils.parsePrice(d.pagado) || 0) + aplicado };
+        }).filter(d => (Utils.parsePrice(d.saldo) || 0) > 0.009);
+    },
+
     _dineroAPagar(proveedorId, saldoPendiente) {
         if (saldoPendiente > 0) return saldoPendiente;
         const mercaderiaHoy = this._montosHoy[String(proveedorId)] || 0;
@@ -11708,6 +12050,8 @@ const Pagos = {
 
     async registrar(proveedorId = null, opciones = {}) {
         const desdePedido = !!opciones.desdePedido;
+        // Si viene una fecha, el pago es de la deuda de ese día; si no, descuenta de las más viejas primero.
+        const fechaDeuda = opciones.fecha ? Utils.fechaIso(opciones.fecha) : '';
         if (!proveedorId) return;
         if (this._pagados.has(proveedorId)) {
             Utils.showInfo('En esta sesión ya registraste un pago a este proveedor. Si falta algo, usá Pagos a proveedores.');
@@ -11727,7 +12071,12 @@ const Pagos = {
             }
         }
 
-        const saldoPendiente = Utils.parsePrice(proveedorSaldo) || 0;
+        const saldoTotal = Utils.parsePrice(proveedorSaldo) || 0;
+        let saldoPendiente = saldoTotal;
+        if (fechaDeuda) {
+            const deudaFecha = (proveedorCompleto?.deudas || []).find(d => Utils.fechaIso(d.fecha) === fechaDeuda);
+            saldoPendiente = Utils.parsePrice(deudaFecha?.saldo) || 0;
+        }
         if (saldoPendiente <= 0 && !desdePedido) {
             Utils.showInfo(`"${proveedorNombre || 'Este proveedor'}" está al día. No hay nada para pagar.`);
             return;
@@ -11735,20 +12084,26 @@ const Pagos = {
 
         await this._asegurarRecepcionHoy();
 
-        const anticipo = desdePedido && saldoPendiente <= 0;
+        const anticipo = desdePedido && saldoPendiente <= 0 && !fechaDeuda;
         const mercaderiaHoy = this._montosHoy[String(proveedorId)] || 0;
         const dineroAPagar = this._dineroAPagar(proveedorId, saldoPendiente);
 
         const inicial = MediosPago.vacio();
         if (!anticipo && saldoPendiente > 0) inicial.efectivo = saldoPendiente;
-        const chipHoy = mercaderiaHoy > 0 && mercaderiaHoy < saldoPendiente
+        const chipHoy = !fechaDeuda && mercaderiaHoy > 0 && mercaderiaHoy < saldoPendiente
             ? `<button type="button" class="pago-chip" id="pago-chip-hoy">Lo de hoy (${Utils.formatCurrency(mercaderiaHoy)})</button>`
+            : '';
+        const deudaElegida = fechaDeuda ? (proveedorCompleto?.deudas || []).find(d => Utils.fechaIso(d.fecha) === fechaDeuda) : null;
+        const yaPagadoProv = Utils.parsePrice(deudaElegida?.pagado) || 0;
+        const yaPago = yaPagadoProv > 0.01
+            ? `<p class="modal-hint"><strong>Ya pagaste ${Utils.formatCurrency(yaPagadoProv)}</strong> de ${Utils.formatCurrency(Utils.parsePrice(deudaElegida.debe) || 0)}</p>`
             : '';
         const content = `
             <div class="form-group">
-                <label for="modal-pago-deuda">Le debés</label>
-                <input type="text" id="modal-pago-deuda" class="form-control" value="${Utils.formatCurrency(dineroAPagar)}" readonly tabindex="-1">
+                <label for="modal-pago-deuda">${fechaDeuda ? 'Le debés del ' + Utils.formatDate(fechaDeuda) : 'Le debés'}</label>
+                <input type="text" id="modal-pago-deuda" class="form-control" value="${Utils.formatCurrency(fechaDeuda ? saldoPendiente : dineroAPagar)}" readonly tabindex="-1">
             </div>
+            ${yaPago}
             <p class="modal-hint">Repartí el pago en efectivo y transferencia. Lo que no cargues queda adeudado.</p>
             ${MediosPago.html(MediosPago.deProveedor, inicial)}
             <div class="pago-chips">${chipHoy}</div>
@@ -11765,21 +12120,25 @@ const Pagos = {
                 throw new Error('Monto mayor al saldo');
             }
 
-            const saldoRestante = Math.max(0, saldoPendiente - leido.total);
+            const saldoRestante = Math.max(0, saldoTotal - leido.total);
             const proveedorLocal = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
             const saldoPrevio = proveedorLocal ? proveedorLocal.saldo : saldoPendiente;
             const mediosPrevios = MediosPago.parse(proveedorLocal?.medios);
+            const deudasPrevias = proveedorLocal ? proveedorLocal.deudas : undefined;
+            const deudasNuevas = this._descontarDeudas(proveedorCompleto?.deudas, leido.total, fechaDeuda);
             const optimoPrevio = this._optimo[String(proveedorId)];
             if (proveedorLocal) {
                 proveedorLocal.saldo = saldoRestante;
                 proveedorLocal.medios = MediosPago.sumar(mediosPrevios, leido.medios);
+                proveedorLocal.deudas = deudasNuevas;
             }
             this._optimo[String(proveedorId)] = {
                 saldo: saldoRestante,
-                medios: proveedorLocal ? proveedorLocal.medios : leido.medios
+                medios: proveedorLocal ? proveedorLocal.medios : leido.medios,
+                deudas: deudasNuevas
             };
             this._guardarOptimo();
-            if (!anticipo && leido.total >= saldoPendiente) this._pagados.add(proveedorId);
+            if (!anticipo && leido.total >= saldoTotal) this._pagados.add(proveedorId);
             CacheManager.set('proveedores', AppState.proveedores);
             this._reflejarPago(proveedorId);
             this.render(AppState.proveedores);
@@ -11800,11 +12159,13 @@ const Pagos = {
                 medios: leido.lista,
                 fecha: AppState.currentDate,
                 anticipo: anticipo,
+                aplica_fecha: fechaDeuda,
                 nota: anticipo ? 'Pago al hacer el pedido' : ''
             }), () => {
                 if (proveedorLocal) {
                     proveedorLocal.saldo = saldoPrevio;
                     proveedorLocal.medios = mediosPrevios;
+                    proveedorLocal.deudas = deudasPrevias;
                 }
                 if (optimoPrevio) this._optimo[String(proveedorId)] = optimoPrevio;
                 else delete this._optimo[String(proveedorId)];
@@ -13352,6 +13713,7 @@ const DataLoader = {
 document.addEventListener('DOMContentLoaded', async () => {
     if (window.__sinSesion) return; // sin sesión válida: ya se está yendo al ingreso
     Navigation.init();
+    Navigation.aplicarPermisos();
     DiaOperativo.init();
     Sync.iniciar();
 
@@ -13431,10 +13793,46 @@ document.addEventListener('DOMContentLoaded', async () => {
             Precios._tocadas.add(String(e.target.getAttribute('data-id')));
             Precios.refrescarCalculo();
         });
+        preciosTbody.addEventListener('focusin', (e) => {
+            if (esCampoPrecio(e.target)) e.target.dataset.alEntrar = e.target.value;
+        });
         preciosTbody.addEventListener('focusout', (e) => {
             if (!esCampoPrecio(e.target)) return;
             Precios.onPrecioChange();
+            if (e.target.classList.contains('precio-cliente') && e.target.value !== e.target.dataset.alEntrar) {
+                Precios.propagarPrecio(e.target);
+            }
         });
+        // Flechas: arriba/abajo pasan al campo de la fila anterior/siguiente (mismo tipo de precio);
+        // izquierda/derecha, al borde del texto, pasan entre precio real y precio al cliente.
+        preciosTbody.addEventListener('keydown', (e) => {
+            if (!esCampoPrecio(e.target)) return;
+            const campo = e.target;
+            const mover = (destino) => {
+                if (!destino) return;
+                e.preventDefault();
+                destino.focus();
+                destino.select();
+            };
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                const clase = campo.classList.contains('precio-cliente') ? '.precio-cliente' : '.precio-real';
+                const campos = [...preciosTbody.querySelectorAll(`tr:not(.fila-oculta) ${clase}`)];
+                const i = campos.indexOf(campo);
+                mover(campos[i + (e.key === 'ArrowDown' ? 1 : -1)]);
+            } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                const alFinal = campo.selectionStart === campo.value.length && campo.selectionEnd === campo.value.length;
+                const alInicio = campo.selectionStart === 0 && campo.selectionEnd === 0;
+                if (e.key === 'ArrowRight' && !alFinal) return;
+                if (e.key === 'ArrowLeft' && !alInicio) return;
+                const fila = [...campo.closest('tr').querySelectorAll('input.precio-real, input.precio-cliente')];
+                mover(fila[fila.indexOf(campo) + (e.key === 'ArrowRight' ? 1 : -1)]);
+            }
+        });
+        const mismoPrecio = document.getElementById('precios-mismo-precio');
+        if (mismoPrecio) {
+            mismoPrecio.checked = Precios.mismoPrecio;
+            mismoPrecio.addEventListener('change', () => { Precios.mismoPrecio = mismoPrecio.checked; });
+        }
     }
     Utils.enablePriceInputs(document);
     addButtonListener('btn-seguir-recepcion', () => Navigation.navigateTo('camiones'), 'Abriendo...');
@@ -13504,3 +13902,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     Navigation.navigateTo('dashboard');
 });
 
+
+
+// Buscador de cada paso: <input data-filtro-tabla="#selector"> esconde las filas de la tabla que no coinciden.
+// Solo oculta (no redibuja), y se vuelve a aplicar cada vez que el paso dibuja de nuevo sus filas.
+const FiltroTabla = {
+    _normalizar(texto) {
+        return String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    },
+
+    aplicar(input, destino) {
+        const buscado = this._normalizar(input.value);
+        let visible = true;
+        destino.querySelectorAll('tbody tr, :scope > tr').forEach(tr => {
+            if (tr.classList.contains('fila-nueva') || tr.querySelector('td[colspan]') && !tr.classList.contains('recepcion-detalle')) return;
+            if (!tr.classList.contains('recepcion-detalle')) {
+                visible = !buscado || this._normalizar(tr.textContent).includes(buscado);
+            }
+            tr.classList.toggle('fila-oculta', !visible);
+        });
+    },
+
+    iniciar() {
+        document.querySelectorAll('input[data-filtro-tabla]').forEach(input => {
+            const destino = document.querySelector(input.dataset.filtroTabla);
+            if (!destino || input.dataset.filtroListo) return;
+            input.dataset.filtroListo = '1';
+            const reaplicar = () => this.aplicar(input, destino);
+            input.addEventListener('input', reaplicar);
+            new MutationObserver(reaplicar).observe(destino, { childList: true, subtree: true });
+        });
+    }
+};
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => FiltroTabla.iniciar());
+else FiltroTabla.iniciar();
