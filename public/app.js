@@ -11779,16 +11779,24 @@ const Pagos = {
                     : 'Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).');
         }
 
+        // "Pagar al proveedor" (el del día) muestra solo lo que se le debe de la fecha del pedido; las deudas
+        // de otras fechas se ven y se pagan en "Pagos a proveedores (pendientes)".
+        const fechaDia = AppState.currentDate;
+        const saldoDe = (p) => {
+            if (soloPendientes || !Array.isArray(p.deudas)) return Utils.parsePrice(p.saldo) || 0;
+            const deuda = p.deudas.find(d => Utils.fechaIso(d.fecha) === fechaDia);
+            return Utils.parsePrice(deuda?.saldo) || 0;
+        };
         const lista = [...this._fusionar(proveedores)]
             .filter(p => {
-                const saldo = Utils.parsePrice(p.saldo) || 0;
+                const saldo = saldoDe(p);
                 if (soloPendientes) return saldo > 0;
                 if (diaCerrado) return false;
                 return (this._montosHoy[String(p.id)] || 0) > 0;
             })
             .sort((a, b) => {
-            const saldoA = Utils.parsePrice(a.saldo) || 0;
-            const saldoB = Utils.parsePrice(b.saldo) || 0;
+            const saldoA = saldoDe(a);
+            const saldoB = saldoDe(b);
             const hoyA = this._montosHoy[String(a.id)] || 0;
             const hoyB = this._montosHoy[String(b.id)] || 0;
             const pendA = saldoA > 0 || hoyA > 0;
@@ -11800,7 +11808,7 @@ const Pagos = {
         let totalDeuda = 0;
         let pendientes = 0;
         lista.forEach(p => {
-            const saldo = Utils.parsePrice(p.saldo) || 0;
+            const saldo = saldoDe(p);
             if (saldo > 0) {
                 totalDeuda += saldo;
                 pendientes++;
@@ -11844,13 +11852,15 @@ const Pagos = {
             const tr = document.createElement('tr');
             const pagado = this._pagados.has(proveedor.id);
             const deudaHoy = this._montosHoy[String(proveedor.id)] || 0;
-            const saldo = Utils.parsePrice(proveedor.saldo) || 0;
+            const saldo = saldoDe(proveedor);
             const pendiente = saldo > 0;
             const puedePagar = pendiente && !pagado;
-            // Con deudas de varias fechas, cada una se paga por separado desde su propia línea.
-            const porFecha = Array.isArray(proveedor.deudas) && proveedor.deudas.length > 0;
+            // En pendientes, cada fecha adeudada se paga por separado desde su propia línea.
+            const porFecha = soloPendientes && Array.isArray(proveedor.deudas) && proveedor.deudas.length > 0;
+            // En el pago del día, el pago descuenta de la deuda de esta fecha (no de las más viejas).
+            const opcionesPago = !soloPendientes && Array.isArray(proveedor.deudas) ? `, { fecha: '${fechaDia}' }` : '';
             const btnPagar = puedePagar && !porFecha
-                ? `<button class="btn btn-primary btn-sm" type="button" onclick="Pagos.registrar('${proveedor.id}')">Pagar</button>`
+                ? `<button class="btn btn-primary btn-sm" type="button" onclick="Pagos.registrar('${proveedor.id}'${opcionesPago})">Pagar</button>`
                 : '';
             const celdaDebes = porFecha
                 ? DeudasPorFecha.html(proveedor.deudas, saldo, Utils.parsePrice(proveedor.a_favor) || 0, pagado ? '' : `Pagos.registrar('${proveedor.id}', { fecha: '{fecha}' })`)
