@@ -7673,6 +7673,9 @@ const Recepcion = {
         try {
             return await Precios.armarLista({ silencioso: true, ajustarNoConfirmados: true });
         } catch (error) {
+            // Un producto de varios proveedores no cuenta como confirmado hasta que lo está cada uno:
+            // mientras falten filas la lista todavía no se puede armar, y no es un error.
+            if (/No se encontraron productos con recepción confirmada/.test(String(error && error.message))) return null;
             console.error('Error armando lista de precios:', error);
             Utils.showWarning('La recepción quedó guardada, pero no se pudo armar la lista de precios. Podés usar Armar lista en Precios al cliente.');
             return null;
@@ -10472,6 +10475,11 @@ const Depositos = {
         document.getElementById('deposito-agregar')?.addEventListener('click', () => {
             this.agregarLinea(0);
         });
+        // Si la persona cambia a mano el monto de la línea, deja de seguir a la transferencia.
+        document.getElementById('deposito-lineas')?.addEventListener('input', (event) => {
+            const fila = event.target.closest('.deposito-linea');
+            if (fila && event.target.classList.contains('deposito-monto') && event.isTrusted) fila.dataset.manual = '1';
+        });
         document.getElementById('deposito-lineas')?.addEventListener('click', (event) => {
             const boton = event.target.closest('.deposito-quitar');
             if (!boton) return;
@@ -10493,7 +10501,15 @@ const Depositos = {
         const visible = (parseFloat(monto) || 0) > 0.009;
         box.hidden = !visible;
         if (!visible) return;
-        if (!document.querySelector('.deposito-linea')) this.agregarLinea(monto);
+        const lineas = document.querySelectorAll('.deposito-linea');
+        if (!lineas.length) {
+            this.agregarLinea(monto);
+        } else if (lineas.length === 1 && !lineas[0].dataset.manual) {
+            // Con una sola línea sin tocar, el monto sigue a lo que se escribe en Transferencia
+            // (si no, queda con el primer dígito: $1.000 se guardaba como $1).
+            const input = lineas[0].querySelector('.deposito-monto');
+            if (input) input.value = Utils.formatPrice(monto);
+        }
     },
 
     precargar(depositos) {
