@@ -1271,7 +1271,7 @@ const Sync = {
         try { localStorage.setItem(this.CLAVE_VERSION, String(this.ver)); } catch (error) { /* sin almacenamiento */ }
     },
 
-    observar(ver, esEscritura) {
+    observar(ver, esEscritura, cambios) {
         const nueva = Number(ver);
         if (!Number.isFinite(nueva)) return;
         if (this.ver === null) {
@@ -1289,7 +1289,7 @@ const Sync = {
         const soloMia = esEscritura === true && nueva === this.ver + 1;
         if (nueva > this.ver) this.ver = nueva;
         if (soloMia) this._recordarVersion();
-        else this._pedirRefresco();
+        else this._pedirRefresco(cambios);
     },
 
     iniciar() {
@@ -1308,7 +1308,7 @@ const Sync = {
         this._chequeando = true;
         try {
             // La respuesta pasa por observar(); no hace falta mirar el resultado.
-            await API._executeRequest('app/version', 'GET', null, 1);
+            await API._executeRequest('app/version', 'GET', this.ver === null ? null : { desde: this.ver }, 1);
         } catch (error) {
             // Sin conexión: se reintenta en el próximo ciclo.
         } finally {
@@ -1323,7 +1323,14 @@ const Sync = {
         return !!(el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) && el.closest('.main-content, main, .page'));
     },
 
-    _pedirRefresco() {
+    // Qué cambió desde la última vez: si todo lo que hicieron otros fue un día de pedidos, se recarga
+    // solo ese día; si no se sabe qué fue (o fue otra cosa), se recarga todo como antes.
+    _alcances: new Set(),
+    _refrescoTotal: false,
+
+    _pedirRefresco(cambios) {
+        if (!Array.isArray(cambios) || !cambios.length) this._refrescoTotal = true;
+        else cambios.forEach(c => this._alcances.add(String(c)));
         this._pendiente = true;
         this._intentarRefresco();
     },
@@ -1338,17 +1345,44 @@ const Sync = {
         }
         this._pendiente = false;
         this._aplicando = true;
+        const total = this._refrescoTotal;
+        const alcances = [...this._alcances];
+        this._refrescoTotal = false;
+        this._alcances.clear();
         try {
-            await this.refrescar();
+            if (!total && alcances.length && alcances.every(a => a.startsWith('dia:'))) await this.refrescarDias(alcances);
+            else await this.refrescar();
             Utils.avisar('Se actualizaron datos cargados por otra persona');
         } catch (error) {
             console.warn('No se pudo actualizar con los cambios de otra persona:', error);
+            if (total) this._refrescoTotal = true;
+            alcances.forEach(a => this._alcances.add(a));
             this._pendiente = true;
             clearTimeout(this._espera);
             this._espera = setTimeout(() => this._intentarRefresco(), this.REINTENTO * 4);
         } finally {
             this._aplicando = false;
         }
+    },
+
+    // Otra persona solo tocó pedidos de uno o más días: se descarta y se vuelve a leer únicamente
+    // ese día (si es el que se está mirando), sin recargar catálogo, saldos ni cobranzas.
+    async refrescarDias(alcances) {
+        const pantalla = AppState.currentDate;
+        const fechas = new Set(alcances.map(a => a.slice(4) === '*' ? pantalla : a.slice(4)));
+        fechas.forEach(f => {
+            ['pedidos', 'recepcion', 'precios', 'flujo'].forEach(k => CacheManager.invalidate(`${k}:${f}`));
+            DataLoader.invalidateFlujo(f);
+        });
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        if (!fechas.has(pantalla)) { this._recordarVersion(); return; }
+        AppState.fechaCargada = null;
+        const versionLeida = this.ver;
+        await DataLoader.getFlujo(pantalla);
+        if (this.ver === versionLeida) this._recordarVersion();
+        try { await DiaOperativo.refresh(); } catch (error) { /* se recalcula al navegar */ }
+        await Navigation.loadPageData(AppState.currentPage);
     },
 
     async refrescar() {
@@ -1388,7 +1422,7 @@ const API = {
 
         const escribe = method !== 'GET';
         if (escribe) Sync.escribiendo++;
-        const promise = this._executeRequest(endpoint, method, data, retryCount)
+        const promise = this._conReintentoOcupado(() => this._executeRequest(endpoint, method, data, retryCount), escribe)
             .finally(() => {
                 delete this._pending[dedupKey];
                 if (escribe) Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
@@ -1396,6 +1430,20 @@ const API = {
 
         this._pending[dedupKey] = promise;
         return promise;
+    },
+
+    // "Hay mucha actividad": el servidor no pudo tomar su turno y no ejecutó nada, así que repetir es seguro.
+    // Se espera cada vez más antes de volver a intentar, en vez de dar el error y perder el cambio.
+    async _conReintentoOcupado(enviar, escribe) {
+        const esperas = [2000, 4000, 8000, 12000];
+        for (let intento = 0; ; intento++) {
+            try {
+                return await enviar();
+            } catch (error) {
+                if (!escribe || !error || !error.busy || intento >= esperas.length) throw error;
+                await new Promise(r => setTimeout(r, esperas[intento]));
+            }
+        }
     },
 
     _executeRequest(endpoint, method, data, retryCount) {
@@ -1530,11 +1578,20 @@ const API = {
                     finish(reject, new Error(response.error || 'Tu sesión venció. Volvé a iniciar sesión.'));
                     return;
                 }
-                if (response.ver !== undefined) Sync.observar(response.ver, method !== 'GET');
+                if (response.tm) {
+                    // Cuánto tardó cada paso en el servidor; sirve para ver dónde se va el tiempo.
+                    (API.tiempos = API.tiempos || []).push({ endpoint, ...response.tm });
+                    if (API.tiempos.length > 60) API.tiempos.shift();
+                }
+                if (response.ver !== undefined) Sync.observar(response.ver, method !== 'GET', response.data && response.data.cambios);
                 if (response.success === true || response.success === 'true') {
                     finish(resolve, response.data || response);
                 } else {
-                    finish(reject, new Error(response?.error || response?.message || 'Error en la petición'));
+                    const error = new Error(response?.error || response?.message || 'Error en la petición');
+                    // El servidor no llegó a ejecutar nada (había otra escritura en curso): se puede reintentar.
+                    if (response && response.busy) error.busy = true;
+                    error.servidor = true;
+                    finish(reject, error);
                 }
             };
 
@@ -3570,6 +3627,7 @@ const PlanillaPedidos = {
     },
 
     render() {
+        this.superponerPendientes();
         this.enganchar();
         this._pintarVista();
         const tabla = document.getElementById('planilla-pedidos');
@@ -3706,8 +3764,14 @@ const PlanillaPedidos = {
     _pintarGuardado() {
         const el = document.getElementById('planilla-guardado');
         if (!el) return;
-        el.textContent = this._pendientes > 0 ? `Guardando… (${this._pendientes})` : 'Todo guardado';
-        el.classList.toggle('is-guardando', this._pendientes > 0);
+        const celdas = this._salida ? this._salida.size : 0;
+        const total = this._pendientes + celdas;
+        if (celdas > 0 && this._reintentos > 0) {
+            el.textContent = `Sin guardar: ${celdas} cambio(s). No se perdieron, se reintenta solo…`;
+        } else {
+            el.textContent = total > 0 ? `Guardando… (${total})` : 'Todo guardado';
+        }
+        el.classList.toggle('is-guardando', total > 0);
     },
 
     // Las escrituras van de a una, en orden: así dos celdas seguidas no compiten por la planilla.
@@ -3715,7 +3779,7 @@ const PlanillaPedidos = {
         this._pendientes++;
         this._pintarGuardado();
         const fecha = AppState.currentDate;
-        const paso = this._cola.then(tarea).catch(error => {
+        const paso = this._cola.then(() => this._esperarSalida()).then(tarea).catch(error => {
             console.error('Error guardando la planilla:', error);
             Utils.showError('No se pudo guardar un cambio de la planilla: ' + (error && error.message || 'revisá la conexión') + '. Se vuelve a leer el día.');
             if (AppState.currentDate === fecha) {
@@ -3736,8 +3800,15 @@ const PlanillaPedidos = {
         return paso;
     },
 
+    pendientes() {
+        this._cargarSalida();
+        return this._salida.size;
+    },
+
     esperarGuardado() {
-        return this._cola.catch(() => {});
+        const limite = new Promise((_, rechazar) => setTimeout(() => rechazar(
+            new Error('Hay cambios de la planilla que todavía no se guardaron. Esperá unos segundos y volvé a intentar.')), 40000));
+        return Promise.race([this._esperarSalida(), limite]).then(() => this._cola.catch(() => {}));
     },
 
     _guardarCache(fecha) {
@@ -3794,32 +3865,203 @@ const PlanillaPedidos = {
         this._totales();
         Pedidos.renderEnvioResumen();
 
-        this._encolar(async () => {
-            const res = await API.request('pedidos/celda', 'POST', {
-                fecha,
-                cliente_id: clienteId,
-                producto_id: productoId,
-                cantidad,
-                tipo: producto?.tipo || '',
-                proveedor_id: proveedorId === PedidoProveedorService.SIN_PROVEEDOR_ID ? proveedorId : (proveedorId || undefined)
+        this._agregarALote({
+            fecha,
+            cliente_id: clienteId,
+            producto_id: productoId,
+            cantidad,
+            proveedor_id: proveedorId === PedidoProveedorService.SIN_PROVEEDOR_ID ? proveedorId : (proveedorId || undefined)
+        });
+    },
+
+    // ---- Cola de salida: ninguna celda escrita se pierde ----
+    // Cada celda que se escribe queda anotada en el navegador (sobrevive a recargar) y se manda al
+    // servidor en lotes. Si el servidor no responde o está ocupado, se reintenta sola con esperas
+    // cada vez más largas y lo escrito sigue a la vista. Nunca se vuelve a leer el día encima de
+    // lo que todavía no se guardó: al releer, las celdas pendientes se vuelven a poner arriba.
+    CLAVE_SALIDA: 'sg_cola_pedidos',
+    // Ventana fija desde la primera celda pendiente (no se reinicia con cada celda): lo que se escribe
+    // dentro de ella viaja junto, así varias personas cargando a la vez no saturan al servidor.
+    LOTE_ESPERA_MS: 4000,
+    LOTE_MAX: 20,
+    ESPERAS_MS: [2000, 4000, 8000, 15000, 30000],
+    _salida: null,
+    _seq: 0,
+    _enVuelo: false,
+    _reintentos: 0,
+    _timerEnvio: null,
+    _esperando: [],
+
+    _cargarSalida() {
+        if (this._salida) return;
+        this._salida = new Map();
+        try {
+            const guardado = JSON.parse(localStorage.getItem(this.CLAVE_SALIDA) || '[]');
+            (Array.isArray(guardado) ? guardado : []).forEach(c => {
+                if (!c || !c.fecha || !c.cliente_id || !c.producto_id) return;
+                this._seq = Math.max(this._seq, Number(c.seq) || 0);
+                this._salida.set(`${c.fecha}|${c.producto_id}|${c.cliente_id}`, c);
             });
-            if (AppState.currentDate !== fecha) return;
-            // Se reemplaza lo provisorio por lo que quedó guardado.
-            const eliminados = new Set((res?.eliminados || []).map(String));
+        } catch (error) { /* sin almacenamiento o dato roto: se empieza vacía */ }
+    },
+
+    _guardarSalida() {
+        try {
+            if (this._salida && this._salida.size) localStorage.setItem(this.CLAVE_SALIDA, JSON.stringify([...this._salida.values()]));
+            else localStorage.removeItem(this.CLAVE_SALIDA);
+        } catch (error) { /* sin almacenamiento: queda en memoria */ }
+    },
+
+    _agregarALote(celda) {
+        this._cargarSalida();
+        this._salida.set(`${celda.fecha}|${celda.producto_id}|${celda.cliente_id}`, { ...celda, seq: ++this._seq });
+        this._guardarSalida();
+        this._pintarGuardado();
+        if (!this._timerEnvio) this._programarEnvio(this.LOTE_ESPERA_MS);
+    },
+
+    _programarEnvio(ms) {
+        clearTimeout(this._timerEnvio);
+        this._timerEnvio = setTimeout(() => this._enviarSalida(), ms);
+    },
+
+    // Se llama al abrir la app: si quedaron celdas sin guardar (se cerró la pestaña, se cortó internet), se mandan.
+    reanudar() {
+        this._cargarSalida();
+        if (!window.__colaPedidosEnganchada) {
+            window.__colaPedidosEnganchada = true;
+            window.addEventListener('online', () => { if (this._salida && this._salida.size) this._programarEnvio(0); });
+            // Al cambiar de pestaña, bloquear el celular o salir de la app, no se espera la ventana: se manda ya.
+            const mandarYa = () => { if (this._salida && this._salida.size) this._programarEnvio(0); };
+            document.addEventListener('visibilitychange', () => { if (document.hidden) mandarYa(); });
+            window.addEventListener('pagehide', mandarYa);
+            window.addEventListener('beforeunload', (e) => {
+                if (this._salida && this._salida.size) { e.preventDefault(); e.returnValue = ''; }
+            });
+        }
+        if (this._salida.size) {
+            this._pintarGuardado();
+            this._programarEnvio(500);
+        }
+    },
+
+    // Pone encima de lo que vino del servidor las celdas que todavía no se guardaron.
+    superponerPendientes() {
+        this._cargarSalida();
+        if (!this._salida.size) return;
+        const fecha = AppState.currentDate;
+        this._salida.forEach(c => {
+            if (c.fecha === fecha) this._aplicarCelda(fecha, c.producto_id, c.cliente_id, c.cantidad, c.proveedor_id);
+        });
+    },
+
+    // Errores que el servidor contestó y que reintentar no arregla.
+    _esPermanente(error) {
+        return !!(error && error.servidor && /ya est[aá] cerrado|Falta el d[ií]a|No hay celdas|demasiadas celdas/i.test(String(error.message || '')));
+    },
+
+    async _enviarSalida() {
+        clearTimeout(this._timerEnvio);
+        this._timerEnvio = null;
+        this._cargarSalida();
+        if (this._enVuelo || !this._salida.size) {
+            if (!this._salida.size) this._avisarSalidaVacia();
+            return;
+        }
+        this._enVuelo = true;
+        try {
+            while (this._salida.size) {
+                const todas = [...this._salida.values()];
+                const fecha = todas[0].fecha;
+                const tanda = todas.filter(c => c.fecha === fecha).slice(0, this.LOTE_MAX);
+                const quitar = () => {
+                    tanda.forEach(c => {
+                        const k = `${c.fecha}|${c.producto_id}|${c.cliente_id}`;
+                        const actual = this._salida.get(k);
+                        // Si la celda se volvió a tocar mientras viajaba, lo nuevo sigue pendiente.
+                        if (actual && actual.seq === c.seq) this._salida.delete(k);
+                    });
+                    this._guardarSalida();
+                };
+                let res;
+                try {
+                    res = await API.request('pedidos/celdas', 'POST', {
+                        fecha,
+                        celdas: tanda.map(({ cliente_id, producto_id, cantidad, proveedor_id }) => ({ cliente_id, producto_id, cantidad, proveedor_id }))
+                    });
+                } catch (error) {
+                    if (!this._esPermanente(error)) throw error;
+                    quitar();
+                    Utils.showError('No se pudieron guardar ' + tanda.length + ' celda(s): ' + error.message);
+                    this._releerDia(fecha);
+                    continue;
+                }
+                this._reintentos = 0;
+                quitar();
+                const resultados = res?.resultados || [];
+                this._aplicarResultados(fecha, resultados);
+                const fallos = resultados.filter(r => r.error);
+                if (fallos.length) {
+                    Utils.showError('No se pudo guardar ' + fallos.length + ' celda(s): ' + fallos[0].error);
+                    this._releerDia(fecha);
+                }
+                this._pintarGuardado();
+            }
+            this._avisarSalidaVacia();
+            DiaOperativo.refreshSoon();
+            Pedidos.renderEnvioResumen();
+        } catch (error) {
+            // Sin conexión, servidor ocupado o error de Google: nada se pierde, se reintenta.
+            console.warn('Planilla: no se pudo guardar, se reintenta:', error);
+            this._reintentos++;
+            this._programarEnvio(this.ESPERAS_MS[Math.min(this._reintentos - 1, this.ESPERAS_MS.length - 1)]);
+        } finally {
+            this._enVuelo = false;
+            this._pintarGuardado();
+        }
+    },
+
+    _avisarSalidaVacia() {
+        this._esperando.splice(0).forEach(listo => listo());
+    },
+
+    // Resuelve cuando la cola de salida quedó vacía (todo guardado en el servidor).
+    _esperarSalida() {
+        this._cargarSalida();
+        if (!this._salida.size) return Promise.resolve();
+        this._programarEnvio(0);
+        return new Promise(listo => this._esperando.push(listo));
+    },
+
+    _releerDia(fecha) {
+        if (AppState.currentDate !== fecha) return;
+        CacheManager.invalidate(`pedidos:${fecha}`);
+        DataLoader.invalidateFlujo(fecha);
+        AppState.fechaCargada = null;
+        Pedidos.load().catch(() => {});
+    },
+
+    // Se reemplaza lo provisorio por lo que quedó guardado (sin pisar lo que todavía está pendiente).
+    _aplicarResultados(fecha, resultados) {
+        if (AppState.currentDate !== fecha) return;
+        resultados.forEach(r => {
+            if (r.error) return;
+            const eliminados = new Set((r.eliminados || []).map(String));
             AppState.pedidos = (AppState.pedidos || []).filter(p => {
                 if (eliminados.has(String(p.id))) return false;
-                return !(String(p.producto_id) === String(productoId) && String(p.cliente_id) === String(clienteId));
+                return !(String(p.producto_id) === String(r.producto_id) && String(p.cliente_id) === String(r.cliente_id));
             });
-            if (res?.pedido) {
+            if (r.pedido) {
                 AppState.pedidos.push({
-                    ...res.pedido,
-                    cliente_nombre: (AppState.clientes || []).find(c => String(c.id) === String(clienteId))?.nombre || '',
-                    producto_nombre: producto?.nombre || ''
+                    ...r.pedido,
+                    cliente_nombre: (AppState.clientes || []).find(c => String(c.id) === String(r.cliente_id))?.nombre || '',
+                    producto_nombre: (AppState.productos || []).find(p => String(p.id) === String(r.producto_id))?.nombre || ''
                 });
             }
-            this._guardarCache(fecha);
-            this._totales();
         });
+        this.superponerPendientes();
+        this._guardarCache(fecha);
+        this._totales();
     },
 
     _cambiarProveedor(select) {
@@ -13756,6 +13998,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     Navigation.aplicarPermisos();
     DiaOperativo.init();
     Sync.iniciar();
+    PlanillaPedidos.reanudar();
 
     const cachedDias = CacheManager.get('flujo:dias-pendientes');
     if (Array.isArray(cachedDias) && cachedDias.length) {

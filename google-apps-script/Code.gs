@@ -49,13 +49,56 @@ const LOCK_WAIT_MS = 20000;
  * si otra persona cambió algo y así refrescar lo que muestra.
  */
 function getDataVersion_() {
-  return Number(PropertiesService.getScriptProperties().getProperty('DATA_VERSION_' + tenantClave_())) || 0;
+  return parseInt(PropertiesService.getScriptProperties().getProperty('DATA_VERSION_' + tenantClave_()), 10) || 0;
 }
 
-function bumpDataVersion_() {
+// La propiedad guarda "versión|v:alcance,v:alcance…": además del contador, qué tocó cada una de las
+// últimas escrituras. Así el navegador de otra persona sabe si cambió solo un día de pedidos (y
+// recarga solo eso) o algo más (y recarga todo). Un valor viejo, solo con el número, también sirve.
+const LOG_CAMBIOS_MAX = 12;
+
+/** Sube el contador y anota el alcance. Devuelve la versión nueva. */
+function bumpDataVersion_(alcance) {
   var props = PropertiesService.getScriptProperties();
   var key = 'DATA_VERSION_' + tenantClave_();
-  props.setProperty(key, String((Number(props.getProperty(key)) || 0) + 1));
+  var raw = String(props.getProperty(key) || '');
+  var partes = raw.split('|');
+  var nueva = (parseInt(partes[0], 10) || 0) + 1;
+  var log = partes[1] ? partes[1].split(',') : [];
+  log.push(nueva + ':' + (alcance || 'todo'));
+  if (log.length > LOG_CAMBIOS_MAX) log = log.slice(log.length - LOG_CAMBIOS_MAX);
+  props.setProperty(key, nueva + '|' + log.join(','));
+  return nueva;
+}
+
+/** Versión actual y, si se puede saber, qué alcances cambiaron desde la versión "desde" (si no, null = todo). */
+function versionYCambios_(desde) {
+  var raw = String(PropertiesService.getScriptProperties().getProperty('DATA_VERSION_' + tenantClave_()) || '');
+  var partes = raw.split('|');
+  var ver = parseInt(partes[0], 10) || 0;
+  var base = parseInt(desde, 10);
+  if (!isFinite(base) || base >= ver) return { ver: ver, cambios: base === ver ? [] : null };
+  var log = (partes[1] ? partes[1].split(',') : []).map(function(e) {
+    var i = e.indexOf(':');
+    return { v: parseInt(e.substring(0, i), 10), a: e.substring(i + 1) };
+  });
+  var cubiertas = log.filter(function(e) { return e.v > base; });
+  // Si el registro no llega hasta la versión pedida (hubo más cambios de los que guarda), no se puede saber.
+  if (cubiertas.length !== ver - base) return { ver: ver, cambios: null };
+  var vistos = {};
+  cubiertas.forEach(function(e) { vistos[e.a] = true; });
+  return { ver: ver, cambios: Object.keys(vistos) };
+}
+
+/** Qué parte de los datos toca una escritura: un día de pedidos ('dia:AAAA-MM-DD') o todo. */
+function alcanceDeEscritura_(endpoint, data) {
+  if (endpoint === 'pedidos/celdas' || endpoint === 'pedidos/celda' || endpoint === 'pedidos/proveedor-producto' ||
+      endpoint === 'pedidos/eliminar-producto' || endpoint === 'pedidos/marcar-enviados' || endpoint === 'pedidos' ||
+      endpoint === 'pedidos/update' || endpoint === 'pedidos/delete' || endpoint === 'camiones') {
+    var f = data && data.fecha ? normalizeFecha(data.fecha) : null;
+    return 'dia:' + (f || '*');
+  }
+  return 'todo';
 }
 
 // ========== USUARIOS: cada uno con su hoja y su sesión firmada ==========
@@ -216,6 +259,7 @@ function handleRequest(e, method) {
   let actualMethod = method;
   let lock = null;
   let versionAvanzada = false;
+  const tiempos = { t0: new Date().getTime() };
   
   try {
     // Manejar caso cuando e es undefined o null
@@ -263,6 +307,7 @@ function handleRequest(e, method) {
       }
       setTenant_(emailSesion);
     }
+    tiempos.auth = new Date().getTime();
     
     // IMPORTANTE: Para JSONP, el método HTTP real siempre es GET
     // Pero el método lógico viene en el parámetro 'method' de la URL
@@ -334,6 +379,8 @@ function handleRequest(e, method) {
         }, 503, callback);
       }
     }
+
+    tiempos.turno = new Date().getTime();
 
     // Cada escritura trae un identificador propio (rid). Si el navegador (o la red) repite el mismo
     // pedido —pasa cuando Google tarda y la conexión se corta—, no se ejecuta de nuevo: se devuelve
@@ -425,6 +472,10 @@ function handleRequest(e, method) {
       // Planilla de pedidos (productos en filas, clientes en columnas)
       case 'pedidos/celda':
         result = guardarCeldaPedido(data);
+        break;
+
+      case 'pedidos/celdas':
+        result = guardarCeldasPedido(data);
         break;
 
       case 'pedidos/proveedor-producto':
@@ -542,7 +593,7 @@ function handleRequest(e, method) {
         break;
 
       case 'app/version':
-        result = { ver: getDataVersion_() };
+        result = versionYCambios_(data.desde);
         break;
 
       case 'app/bootstrap':
@@ -658,12 +709,18 @@ function handleRequest(e, method) {
         return createResponse({ success: false, error: 'Endpoint no encontrado' }, 404, callback);
     }
     
+    tiempos.trabajo = new Date().getTime();
+    var verNueva;
     if (lock) {
-      bumpDataVersion_();
+      verNueva = bumpDataVersion_(alcanceDeEscritura_(endpoint, data));
       versionAvanzada = true;
       if (rid) serverCacheSet('rid:' + rid, result === undefined ? null : result, 600);
     }
-    return createResponse({ success: true, data: result, ver: _tenant ? getDataVersion_() : undefined }, 200, callback);
+    tiempos.fin = new Date().getTime();
+    // tm: cuánto tardó cada paso en el servidor (ms): sesión, espera de turno, trabajo, cierre.
+    var tm = { auth: tiempos.auth - tiempos.t0, turno: (tiempos.turno || tiempos.auth) - tiempos.auth,
+      trabajo: tiempos.trabajo - (tiempos.turno || tiempos.auth), cierre: tiempos.fin - tiempos.trabajo, total: tiempos.fin - tiempos.t0 };
+    return createResponse({ success: true, data: result, ver: _tenant ? (verNueva !== undefined ? verNueva : getDataVersion_()) : undefined, tm: tm }, 200, callback);
     
   } catch (error) {
     Logger.log('❌ [ERROR] Error en handleRequest: ' + error.toString());
@@ -698,7 +755,7 @@ function handleRequest(e, method) {
     if (lock) {
       // Aunque la escritura haya fallado a medias, el resto tiene que volver a leer.
       if (!versionAvanzada) {
-        try { bumpDataVersion_(); } catch (versionError) {}
+        try { bumpDataVersion_('todo'); } catch (versionError) {}
       }
       lock.releaseLock();
     }
@@ -887,7 +944,12 @@ function serverCacheRemove(key) {
 }
 
 function serverCacheRemoveMany(keys) {
-  keys.forEach(function(k) { serverCacheRemove(k); });
+  try {
+    var prefijo = tenantClave_() + ':';
+    CacheService.getScriptCache().removeAll(keys.map(function(k) { return prefijo + k; }));
+  } catch (e) {
+    keys.forEach(function(k) { serverCacheRemove(k); });
+  }
 }
 
 function invalidateServerCacheForSheet(sheetName) {
@@ -2381,8 +2443,12 @@ function filasPedidosDia_(values, headers, fecha, productoId, clienteId) {
 
 function invalidarPedidosDia_(fecha) {
   invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
-  invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
-  invalidateServerCacheFecha(fecha);
+  var f = normalizeFecha(fecha);
+  // Lo mismo que invalidateServerCacheForSheet(PEDIDOS) + invalidateServerCacheFecha(f), en una sola llamada.
+  serverCacheRemoveMany([
+    'sc:dias', 'sc:boot:' + todayArgentina(),
+    'sc:pedidos:' + f, 'sc:recepcion:' + f, 'sc:precios:' + f, 'sc:flujo:' + f, 'sc:boot:' + f
+  ]);
 }
 
 /**
@@ -2452,6 +2518,141 @@ function guardarCeldaPedido(data) {
   headers.forEach(function(h, k) { pedido[h] = fila[k]; });
   pedido.fecha = fecha;
   return { pedido: pedido, eliminados: eliminados };
+}
+
+/**
+ * Guarda varias celdas de la planilla en una sola vuelta: una espera de turno, una lectura de la hoja,
+ * escrituras agrupadas y una sola limpieza de caché. Cada celda sigue las mismas reglas que
+ * guardarCeldaPedido. data: { fecha, celdas: [{ cliente_id, producto_id, cantidad, proveedor_id? }] }
+ * Devuelve { resultados: [{ cliente_id, producto_id, pedido, eliminados } | { ..., error }] }.
+ */
+function guardarCeldasPedido(data) {
+  if (!data || !data.fecha) throw new Error('Falta el día');
+  var celdas = data.celdas;
+  if (typeof celdas === 'string') celdas = JSON.parse(celdas);
+  if (!Array.isArray(celdas) || !celdas.length) throw new Error('No hay celdas para guardar');
+  if (celdas.length > 60) throw new Error('Son demasiadas celdas juntas');
+  // Si una misma celda viene dos veces, vale la última.
+  var ultima = {};
+  celdas.forEach(function(c, n) { ultima[String(c.cliente_id) + '|' + String(c.producto_id)] = n; });
+  celdas = celdas.filter(function(c, n) { return ultima[String(c.cliente_id) + '|' + String(c.producto_id)] === n; });
+  var fecha = normalizeFecha(data.fecha);
+  assertDiaAbierto_(fecha);
+
+  var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  var values = readUsedValues_(sheet);
+  // La columna del proveedor casi siempre existe: solo si falta se agrega y se vuelve a leer.
+  if (!values[0] || values[0].indexOf('proveedor_id') === -1) {
+    ensurePedidosProveedorColumn_(sheet);
+    values = readUsedValues_(sheet);
+  }
+  var headers = values[0] || [];
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var clienteIdx = headers.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var productoIdx = headers.indexOf('producto_id'); if (productoIdx < 0) productoIdx = 3;
+  var cantIdx = headers.indexOf('cantidad');
+  var enviadoIdx = headers.indexOf('enviado');
+  var provIdx = headers.indexOf('proveedor_id');
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+
+  // Filas del día por cliente + producto.
+  var filasPorCelda = {};
+  for (var i = 1; i < values.length; i++) {
+    if (normalizeFecha(values[i][fechaIdx]) !== fecha) continue;
+    var k = String(values[i][clienteIdx]) + '|' + String(values[i][productoIdx]);
+    if (!filasPorCelda[k]) filasPorCelda[k] = [];
+    filasPorCelda[k].push(i);
+  }
+
+  // Los catálogos solo se consultan si hay algún pedido nuevo que validar.
+  var clientesMap = null;
+  var productosMap = null;
+  var actualizar = {};   // índice de fila -> fila nueva
+  var borrar = {};       // índice de fila -> true
+  var agregar = [];
+  var resultados = [];
+
+  celdas.forEach(function(c) {
+    var res = { cliente_id: c.cliente_id, producto_id: c.producto_id };
+    try {
+      if (!c.cliente_id || !c.producto_id) throw new Error('Faltan datos de la celda (cliente y producto)');
+      var texto = String(c.cantidad === undefined || c.cantidad === null ? '' : c.cantidad).trim().replace(',', '.');
+      var cantidad = texto === '' ? 0 : Number(texto);
+      if (!isFinite(cantidad) || cantidad < 0) throw new Error('La cantidad tiene que ser un número');
+      cantidad = Math.round(cantidad * 100) / 100;
+
+      var key = String(c.cliente_id) + '|' + String(c.producto_id);
+      var filas = filasPorCelda[key] || [];
+      res.eliminados = [];
+
+      if (cantidad <= 0) {
+        filas.forEach(function(r) { borrar[r] = true; res.eliminados.push(values[r][idIdx]); });
+        filasPorCelda[key] = [];
+        res.pedido = null;
+      } else if (!filas.length) {
+        if (!clientesMap) { clientesMap = getClientesMap(); productosMap = getProductosMap(); }
+        if (!findInIdMap(clientesMap, c.cliente_id)) throw new Error('Ese cliente no está en el sistema. Actualizá la página y volvé a elegirlo.');
+        var producto = findInIdMap(productosMap, c.producto_id);
+        if (!producto) throw new Error('Ese producto no está en el sistema. Actualizá la página y volvé a elegirlo.');
+        var nueva = headers.map(function() { return ''; });
+        function poner(nombre, valor) { var x = headers.indexOf(nombre); if (x !== -1) nueva[x] = valor; }
+        poner('id', generateId());
+        poner('fecha', fecha);
+        poner('cliente_id', c.cliente_id);
+        poner('producto_id', c.producto_id);
+        poner('tipo', c.tipo || producto.tipo || '');
+        poner('cantidad', cantidad);
+        poner('enviado', false);
+        poner('proveedor_id', c.proveedor_id || '');
+        agregar.push(nueva);
+        var ped = {};
+        headers.forEach(function(h, x) { ped[h] = nueva[x]; });
+        ped.fecha = fecha;
+        res.pedido = ped;
+      } else {
+        var principal = filas[0];
+        var fila = (actualizar[principal] || values[principal]).slice();
+        var cambio = Number(fila[cantIdx]) !== cantidad || filas.length > 1;
+        fila[cantIdx] = cantidad;
+        if (cambio && enviadoIdx !== -1) fila[enviadoIdx] = false;
+        if (provIdx !== -1 && c.proveedor_id !== undefined && c.proveedor_id !== null) fila[provIdx] = c.proveedor_id;
+        actualizar[principal] = fila;
+        filas.slice(1).forEach(function(r) { borrar[r] = true; res.eliminados.push(values[r][idIdx]); });
+        filasPorCelda[key] = [principal];
+        var pedido = {};
+        headers.forEach(function(h, x) { pedido[h] = fila[x]; });
+        pedido.fecha = fecha;
+        res.pedido = pedido;
+      }
+    } catch (error) {
+      res.error = error.message || String(error);
+    }
+    resultados.push(res);
+  });
+
+  // Primero lo que se cambia y se agrega, y al final los borrados (de abajo hacia arriba, para no correr filas).
+  var filasCambiadas = Object.keys(actualizar).map(Number).filter(function(r) { return !borrar[r]; }).sort(function(a, b) { return a - b; });
+  if (filasCambiadas.length) {
+    var primera = filasCambiadas[0];
+    var ultimaFila = filasCambiadas[filasCambiadas.length - 1];
+    if (ultimaFila - primera <= 400) {
+      // Un solo bloque: una llamada a la hoja en vez de una por fila.
+      var ancho = values[0].length;
+      var bloque = [];
+      for (var r = primera; r <= ultimaFila; r++) bloque.push((actualizar[r] || values[r]).slice(0, ancho));
+      sheet.getRange(primera + 1, 1, bloque.length, ancho).setValues(bloque);
+    } else {
+      filasCambiadas.forEach(function(r) {
+        sheet.getRange(r + 1, 1, 1, actualizar[r].length).setValues([actualizar[r]]);
+      });
+    }
+  }
+  Object.keys(borrar).map(Number).sort(function(a, b) { return b - a; }).forEach(function(r) { sheet.deleteRow(r + 1); });
+  if (agregar.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, agregar.length, agregar[0].length).setValues(agregar);
+  }
+  invalidarPedidosDia_(fecha);
+  return { resultados: resultados };
 }
 
 /** Cambia el proveedor de todos los pedidos del día de un producto (vuelven a quedar pendientes). */

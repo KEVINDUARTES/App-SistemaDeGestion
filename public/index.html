@@ -909,7 +909,7 @@
     <script src="services/whatsapp.js?v=20261030ext2"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261102pagodia"></script>
+    <script src="app.js?v=20261103planilla"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {
@@ -933,10 +933,22 @@
                 // Manejar logout
                 const btnLogout = document.getElementById('btn-logout');
                 if (btnLogout) {
-                    btnLogout.addEventListener('click', () => {
-                        if (confirm('¿Deseas cerrar sesión?')) {
-                            Auth.logout();
+                    btnLogout.addEventListener('click', async () => {
+                        if (!confirm('¿Deseas cerrar sesión?')) return;
+                        // Lo que se cargó en la planilla y todavía no llegó al servidor se pierde al salir:
+                        // primero se termina de guardar.
+                        try {
+                            if (typeof PlanillaPedidos !== 'undefined' && PlanillaPedidos.pendientes() > 0) {
+                                btnLogout.disabled = true;
+                                await PlanillaPedidos.esperarGuardado();
+                            }
+                        } catch (error) {
+                            if (!confirm('Todavía hay cambios de la planilla sin guardar y se perderían al cerrar sesión. ¿Cerrar igual?')) {
+                                btnLogout.disabled = false;
+                                return;
+                            }
                         }
+                        Auth.logout();
                     });
                 }
             });
