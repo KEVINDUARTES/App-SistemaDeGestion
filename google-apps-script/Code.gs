@@ -1154,7 +1154,7 @@ function initializeSheet(sheet, sheetName) {
     'Productos': ['id', 'nombre', 'tipo', 'unidad', 'proveedor_default', 'comision_tipo', 'comision_valor', 'por_kilo'],
     'Pedidos': ['id', 'fecha', 'cliente_id', 'producto_id', 'tipo', 'cantidad', 'enviado', 'proveedor_id'],
     'Camiones': ['id', 'fecha', 'nombre', 'orden', 'clientes'],
-    'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado', 'reparto'],
+    'Recepcion': ['id', 'fecha', 'producto_id', 'proveedor_id', 'pedido_total', 'llego', 'precio_real', 'confirmado', 'reparto', 'extra'],
     'PreciosCliente': ['id', 'fecha', 'cliente_id', 'producto_id', 'cantidad', 'precio_cliente', 'comision_unitaria', 'precio_real', 'comision_pct'],
     'CierreDia': ['id', 'fecha', 'estado', 'notas'],
     'Cobranzas': ['id', 'fecha', 'cliente_id', 'total', 'pagado', 'saldo', 'estado', 'medios', 'depositos', 'origen', 'nota'],
@@ -1485,7 +1485,9 @@ function ensureClientesSchema(sheet) {
     sheet.getRange(1, sheet.getLastColumn() + 1).setValue('activo');
   }
 
-  ensureTextColumns_(sheet, CONFIG.SHEETS.CLIENTES, ['nombre', 'telefono']);
+  // Titular: a nombre de quién va la cuenta (varias listas de una misma persona suman en una sola).
+  ensureColumn(sheet, 'titular');
+  ensureTextColumns_(sheet, CONFIG.SHEETS.CLIENTES, ['nombre', 'telefono', 'titular']);
 }
 
 function createCliente(data) {
@@ -1509,17 +1511,15 @@ function createCliente(data) {
   ensureClientesSchema(sheet);
   const id = generateId();
   
-  const newRow = [
-    id,
-    nombre,
-    limpiarTexto_(data.telefono),
-    true
-  ];
+  const headersNuevo = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const titular = limpiarTexto_(data.titular);
+  const valoresNuevo = { id: id, nombre: nombre, telefono: limpiarTexto_(data.telefono), activo: true, titular: titular };
+  const newRow = headersNuevo.map(function(h) { return valoresNuevo[h] !== undefined ? valoresNuevo[h] : ''; });
   
-  escribirFilaTexto_(sheet, sheet.getLastRow() + 1, newRow, ['nombre', 'telefono']);
+  escribirFilaTexto_(sheet, sheet.getLastRow() + 1, newRow, ['nombre', 'telefono', 'titular']);
   invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
   invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
-  return { id: id, nombre: nombre, telefono: limpiarTexto_(data.telefono), activo: true };
+  return { id: id, nombre: nombre, telefono: limpiarTexto_(data.telefono), activo: true, titular: titular };
 }
 
 function updateCliente(data) {
@@ -1535,6 +1535,7 @@ function updateCliente(data) {
   const nombreIdx = headers.indexOf('nombre');
   const telIdx = headers.indexOf('telefono');
   const activoIdx = headers.indexOf('activo');
+  const titularIdx = headers.indexOf('titular');
   // Solo se cambia lo que llega: desactivar no debe pisar un nombre editado por otra persona.
   const traeActivo = data.activo !== undefined && data.activo !== null && data.activo !== '';
   const activoValue = traeActivo ? parseActivoValue(data.activo) : undefined;
@@ -1549,8 +1550,9 @@ function updateCliente(data) {
       row[nombreIdx] = nombreLimpio;
     }
     if (telIdx !== -1 && data.telefono !== undefined) row[telIdx] = limpiarTexto_(data.telefono);
+    if (titularIdx !== -1 && data.titular !== undefined) row[titularIdx] = limpiarTexto_(data.titular);
     if (activoIdx !== -1 && traeActivo) row[activoIdx] = activoValue;
-    escribirFilaTexto_(sheet, i + 1, row, ['nombre', 'telefono']);
+    escribirFilaTexto_(sheet, i + 1, row, ['nombre', 'telefono', 'titular']);
 
     invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
     invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
@@ -1919,11 +1921,11 @@ function calcularSaldoProveedor(proveedorId) {
   return saldos[proveedorId] || 0;
 }
 
-var METODOS_CLIENTE_ = ['efectivo', 'transferencia', 'cheque', 'tarjeta'];
+var METODOS_CLIENTE_ = ['efectivo', 'transferencia', 'cheque', 'tarjeta', 'descuento', 'adelanto'];
 var METODOS_PROVEEDOR_ = ['efectivo', 'transferencia'];
 
 function mediosVacios_() {
-  return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0 };
+  return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0, descuento: 0, adelanto: 0 };
 }
 
 function parseMedios_(valor) {
@@ -1950,7 +1952,9 @@ function etiquetaMedio_(metodo) {
     efectivo: 'Efectivo',
     transferencia: 'Transferencia',
     cheque: 'Cheque',
-    tarjeta: 'Tarjeta'
+    tarjeta: 'Tarjeta',
+    descuento: 'Descuento',
+    adelanto: 'Pago por adelantado'
   };
   return labels[metodo] || metodo;
 }
@@ -1986,6 +1990,7 @@ function registrarCajaMedios_(fecha, tipo, medios, notaBase, referencia) {
   METODOS_CLIENTE_.forEach(function(m) {
     var monto = normalizeAmount(medios[m]);
     if (monto <= 0.009) return;
+    if (m === 'descuento' || m === 'adelanto') return; // no es plata que entra a la caja hoy
     caja.appendRow([
       generateId(),
       fecha,
@@ -2070,7 +2075,7 @@ function validarDepositos_(depositos, montoTransferencia) {
   if (monto <= 0.009) return [];
   var lista = parseDepositos_(depositos);
   if (!lista.length) {
-    throw new Error('En la transferencia poné el nombre de la cuenta y a qué proveedor va');
+    throw new Error('En la transferencia poné la fecha del depósito y a qué proveedor va');
   }
   var suma = 0;
   lista.forEach(function(item) { suma += item.monto; });
@@ -2696,6 +2701,7 @@ function actualizarProveedorRecepcion_(fecha, productoId, proveedorId) {
   var primera = -1;
   for (var i = 1; i < values.length; i++) {
     if (normalizeFecha(values[i][cols.fecha]) !== fechaNorm || !idsMatch(values[i][cols.producto], productoId)) continue;
+    if (cols.extra !== -1 && esExtra_(values[i][cols.extra])) continue;
     if (String(values[i][cols.prov] || '') === String(proveedorId)) return;
     if (primera === -1) primera = i;
   }
@@ -3065,7 +3071,9 @@ function buscarFilaRecepcion_(values, cols, fecha, productoId, proveedorId, requ
     if (normalizeFecha(values[i][cols.fecha]) !== fecha || !idsMatch(values[i][cols.producto], productoId)) continue;
     var prov = String(values[i][cols.prov] || '');
     if (prov === buscado) return i;
-    if (huerfana === -1 && posibles.indexOf(prov) === -1) huerfana = i;
+    // Una fila agregada a mano para otro proveedor (extra) nunca se toma como la de otro.
+    var esExtra = cols.extra !== -1 && esExtra_(values[i][cols.extra]);
+    if (!esExtra && huerfana === -1 && posibles.indexOf(prov) === -1) huerfana = i;
   }
   return posibles.length <= 1 ? huerfana : -1;
 }
@@ -3075,7 +3083,12 @@ function columnasRecepcion_(headers) {
     var i = headers.indexOf(nombre);
     return i !== -1 ? i : porDefecto;
   }
-  return { fecha: col('fecha', 1), producto: col('producto_id', 2), prov: col('proveedor_id', 3) };
+  return { fecha: col('fecha', 1), producto: col('producto_id', 2), prov: col('proveedor_id', 3), extra: col('extra', -1) };
+}
+
+/** Fila de recepción agregada a mano para otro proveedor (la mercadería de un producto vino de más de uno). */
+function esExtra_(valor) {
+  return valor === true || valor === 'true' || valor === 1 || valor === '1';
 }
 
 /**
@@ -3097,12 +3110,16 @@ function agregarRecepcionProducto_(filas, requeridos) {
       });
       if (idx === -1 && req.length === 1) {
         (filas || []).forEach(function(f, i) {
-          if (idx === -1 && usadas.indexOf(i) === -1 && req.indexOf(String(f.proveedor_id || '')) === -1) idx = i;
+          if (idx === -1 && usadas.indexOf(i) === -1 && !esExtra_(f.extra) && req.indexOf(String(f.proveedor_id || '')) === -1) idx = i;
         });
       }
       if (idx === -1) { faltan = true; return; }
       usadas.push(idx);
       asignadas.push(filas[idx]);
+    });
+    // Los proveedores agregados a mano también suman.
+    (filas || []).forEach(function(f, i) {
+      if (usadas.indexOf(i) === -1 && esExtra_(f.extra)) { usadas.push(i); asignadas.push(f); }
     });
   }
   var llego = 0;
@@ -3152,11 +3169,14 @@ function saveRecepcion(data) {
   const precioCol    = headers.indexOf('precio_real') !== -1 ? headers.indexOf('precio_real') : 6;
   const provCol      = headers.indexOf('proveedor_id') !== -1 ? headers.indexOf('proveedor_id') : 3;
   var traeReparto = (data.items || []).some(function(item) { return item.reparto !== undefined; });
+  var traeExtra = (data.items || []).some(function(item) { return esExtra_(item.extra); });
   if (traeReparto) ensureColumn(sheet, 'reparto');
-  var headersRep = traeReparto ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] : headers;
+  if (traeExtra) ensureColumn(sheet, 'extra');
+  var headersRep = (traeReparto || traeExtra) ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] : headers;
   var repartoCol = headersRep.indexOf('reparto');
+  var extraCol = headersRep.indexOf('extra');
 
-  const colsRec = columnasRecepcion_(headers);
+  const colsRec = columnasRecepcion_(headersRep);
   var requeridosDia = null;
 
   var rowsToAppend = [];
@@ -3203,6 +3223,10 @@ function saveRecepcion(data) {
         if (repartoItem !== undefined && repartoCol !== -1) {
           while (filaNueva.length <= repartoCol) filaNueva.push('');
           filaNueva[repartoCol] = repartoItem;
+        }
+        if (esExtra_(item.extra) && extraCol !== -1) {
+          while (filaNueva.length <= extraCol) filaNueva.push('');
+          filaNueva[extraCol] = true;
         }
         rowsToAppend.push(filaNueva);
       }
@@ -3312,9 +3336,11 @@ function confirmarRecepcionItem(data) {
 
   var sheet = getSheet(CONFIG.SHEETS.RECEPCION);
   if (repartoTexto !== undefined) ensureColumn(sheet, 'reparto');
+  if (esExtra_(data.extra)) ensureColumn(sheet, 'extra');
   var values = readUsedValues_(sheet);
   var headers = values.length ? values[0] : [];
   var repartoCol = headers.indexOf('reparto');
+  var extraColConf = headers.indexOf('extra');
   var fechaCol = headers.indexOf('fecha');
   var productoCol = headers.indexOf('producto_id');
   var llegoCol = headers.indexOf('llego');
@@ -3349,6 +3375,7 @@ function confirmarRecepcionItem(data) {
     nueva[precioCol] = precioReal;
     nueva[confirmadoCol] = true;
     if (repartoTexto !== undefined && repartoCol !== -1) nueva[repartoCol] = repartoTexto;
+    if (esExtra_(data.extra) && extraColConf !== -1) nueva[extraColConf] = true;
     for (var c = 0; c < nueva.length; c++) {
       if (nueva[c] === undefined) nueva[c] = '';
     }
@@ -3794,6 +3821,7 @@ function generarCobranzas(fecha) {
       cobranza.total,
       'pendiente'
     ]);
+    consumirSaldoAFavor_(clienteId, id);
   });
 }
 
@@ -3950,6 +3978,12 @@ function getCierres() {
 
 // ========== COBRANZAS ==========
 
+/** Las deudas cargadas a mano y los saldos a favor no son la cobranza que se arma con los precios de un día. */
+function origenAparte_(origen) {
+  var o = String(origen || '');
+  return o === 'manual' || o === 'credito';
+}
+
 function getCobranzas(fecha = null, clienteId = null) {
   var cached = readSheetValues(CONFIG.SHEETS.COBRANZAS);
   var headers = cached.headers;
@@ -3968,7 +4002,7 @@ function getCobranzas(fecha = null, clienteId = null) {
     }
     // Una deuda cargada a mano es de antes de la app: no es la cobranza que se arma con los precios
     // de un día, así que las consultas "de un día" no la incluyen.
-    if (fechaBusqueda && origenIdx !== -1 && String(row[origenIdx] || '') === 'manual') {
+    if (fechaBusqueda && origenIdx !== -1 && origenAparte_(row[origenIdx])) {
       return;
     }
     if (clienteId && row[2] !== clienteId) {
@@ -3998,6 +4032,77 @@ function getCobranzas(fecha = null, clienteId = null) {
   return cobranzas;
 }
 
+/** Anota lo que un cliente pagó de más como una cobranza con saldo negativo (queda a favor). */
+function crearSaldoAFavor_(sheet, clienteId, fecha, monto) {
+  ensureCobranzasMediosColumn_(sheet);
+  ensureCobranzasColumna_(sheet, 'origen');
+  ensureCobranzasColumna_(sheet, 'nota');
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var valores = {
+    id: generateId(), fecha: normalizeFecha(fecha) || todayArgentina(), cliente_id: clienteId,
+    total: -monto, pagado: 0, saldo: -monto, estado: 'credito', origen: 'credito', nota: 'Saldo a favor'
+  };
+  sheet.appendRow(headers.map(function(h) { return valores[h] !== undefined ? valores[h] : ''; }));
+}
+
+/**
+ * Descuenta de una cobranza lo que el cliente tenía a favor (lo más viejo primero), como un pago por
+ * adelantado. El saldo a favor baja y la cobranza queda con ese pago. Devuelve cuánto se aplicó.
+ */
+function consumirSaldoAFavor_(clienteId, cobranzaId) {
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var clienteIdx = headers.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var totalIdx = headers.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+  var pagadoIdx = headers.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+  var saldoIdx = headers.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
+  var estadoIdx = headers.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
+  var mediosIdx = headers.indexOf('medios');
+  var origenIdx = headers.indexOf('origen');
+  if (origenIdx < 0 || mediosIdx < 0) return 0;
+
+  var destino = -1;
+  var creditos = [];
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][clienteIdx], clienteId)) continue;
+    if (idsMatch(values[i][idIdx], cobranzaId)) destino = i;
+    else if (String(values[i][origenIdx] || '') === 'credito' && normalizeAmount(values[i][saldoIdx]) < -0.01) creditos.push(i);
+  }
+  if (destino === -1 || !creditos.length) return 0;
+  var saldoDestino = normalizeAmount(values[destino][totalIdx]) - normalizeAmount(values[destino][pagadoIdx]);
+  if (saldoDestino <= 0.01) return 0;
+
+  var aplicado = 0;
+  creditos.forEach(function(i) {
+    var falta = Math.round((saldoDestino - aplicado) * 100) / 100;
+    if (falta <= 0.01) return;
+    var disponible = -Number(values[i][saldoIdx]);
+    var parte = Math.round(Math.min(disponible, falta) * 100) / 100;
+    if (parte <= 0) return;
+    aplicado = Math.round((aplicado + parte) * 100) / 100;
+    values[i][pagadoIdx] = Math.round(((Number(values[i][pagadoIdx]) || 0) - parte) * 100) / 100;
+    values[i][saldoIdx] = Math.round((Number(values[i][totalIdx]) - values[i][pagadoIdx]) * 100) / 100;
+    sheet.getRange(i + 1, pagadoIdx + 1).setValue(values[i][pagadoIdx]);
+    sheet.getRange(i + 1, saldoIdx + 1).setValue(values[i][saldoIdx]);
+    if (Math.abs(values[i][saldoIdx]) <= 0.01) sheet.getRange(i + 1, estadoIdx + 1).setValue('aplicado');
+  });
+  if (aplicado <= 0) return 0;
+
+  var pagadoNuevo = Math.round((normalizeAmount(values[destino][pagadoIdx]) + aplicado) * 100) / 100;
+  var saldoNuevo = Math.max(0, Math.round((normalizeAmount(values[destino][totalIdx]) - pagadoNuevo) * 100) / 100);
+  var medios = parseMedios_(values[destino][mediosIdx]);
+  medios.adelanto = Math.round((medios.adelanto + aplicado) * 100) / 100;
+  sheet.getRange(destino + 1, pagadoIdx + 1).setValue(pagadoNuevo);
+  sheet.getRange(destino + 1, saldoIdx + 1).setValue(saldoNuevo);
+  sheet.getRange(destino + 1, estadoIdx + 1).setValue(saldoNuevo <= 0.01 ? 'pagado' : 'parcial');
+  sheet.getRange(destino + 1, mediosIdx + 1).setValue(JSON.stringify(medios));
+  invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+  return aplicado;
+}
+
 function registrarCobro(data) {
   var parsed = normalizarMedios_(data, METODOS_CLIENTE_);
   var monto = parsed.total;
@@ -4019,9 +4124,14 @@ function registrarCobro(data) {
     var pagado = normalizeAmount(values[i][pagadoIdx]);
     var total = normalizeAmount(values[i][totalIdx]);
     var saldoActual = Math.max(0, total - pagado);
-    if (monto > saldoActual + 0.01) throw new Error('El monto supera el saldo pendiente');
+    var exceso = 0;
+    if (monto > saldoActual + 0.01) {
+      // Un cliente puede pagar de más: lo que sobra queda a favor y se descuenta de su próxima carga.
+      if (!(data.permitir_exceso === true || data.permitir_exceso === 'true')) throw new Error('El monto supera el saldo pendiente');
+      exceso = Math.round((monto - saldoActual) * 100) / 100;
+    }
 
-    var nuevoPagado = Math.round((pagado + monto) * 100) / 100;
+    var nuevoPagado = Math.round((pagado + (monto - exceso)) * 100) / 100;
     var nuevoSaldo = Math.max(0, Math.round((total - nuevoPagado) * 100) / 100);
     var estado = nuevoSaldo <= 0.01 ? 'pagado' : 'parcial';
     var previos = parseMedios_(mediosIdx >= 0 ? values[i][mediosIdx] : '');
@@ -4042,9 +4152,10 @@ function registrarCobro(data) {
     }
 
     registrarCajaMedios_(data.fecha, 'ingreso', parsed.medios, 'Cobranza', data.cobranza_id);
+    if (exceso > 0.01) crearSaldoAFavor_(sheet, values[i][headers.indexOf('cliente_id') >= 0 ? headers.indexOf('cliente_id') : 2], data.fecha, exceso);
     invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
     invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
-    return { success: true, pagado: nuevoPagado, saldo: nuevoSaldo, medios: previos };
+    return { success: true, pagado: nuevoPagado, saldo: nuevoSaldo, medios: previos, a_favor: exceso };
   }
 
   throw new Error('Cobranza no encontrada');
@@ -4135,7 +4246,7 @@ function sincronizarCobranzasConPrecios(fecha) {
 
   for (var i = 1; i < data.length; i++) {
     if (normalizeFecha(data[i][fechaCol]) !== fechaNorm) continue;
-    if (origenCol !== -1 && String(data[i][origenCol] || '') === 'manual') continue;
+    if (origenCol !== -1 && origenAparte_(data[i][origenCol])) continue;
     var cid = String(data[i][clienteCol]);
     if (totales[cid] === undefined) continue;
     var total = totales[cid];
@@ -4158,7 +4269,7 @@ function sincronizarCobranzasConPrecios(fecha) {
 
 /**
  * Crea la cobranza del día para un cliente (si no existe) y registra el cobro.
- * data: { fecha, cliente_id, medios } — medios reparte efectivo, transferencia, cheque y tarjeta.
+ * data: { fecha, cliente_id, medios } — medios reparte efectivo, transferencia, cheque y descuento.
  * Lo que no se carga queda como saldo adeudado.
  */
 function cobrarClienteHoy(data) {
@@ -4190,6 +4301,7 @@ function cobrarClienteHoy(data) {
     sheet.appendRow([cobranzaId, fechaNorm, data.cliente_id, total, 0, total, 'pendiente']);
     invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
     invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+    saldoDisponible = Math.max(0, total - consumirSaldoAFavor_(data.cliente_id, cobranzaId));
   } else {
     cobranzaId = cobranzasExistentes[0].id;
     var pagadoPrevio = normalizeAmount(cobranzasExistentes[0].pagado);
@@ -4209,7 +4321,8 @@ function cobrarClienteHoy(data) {
     }
   }
 
-  if (monto > saldoDisponible) {
+  var permitirExceso = data.permitir_exceso === true || data.permitir_exceso === 'true';
+  if (monto > saldoDisponible + 0.01 && !permitirExceso) {
     throw new Error('El monto supera el saldo pendiente');
   }
 
@@ -4218,7 +4331,8 @@ function cobrarClienteHoy(data) {
     cobranza_id: cobranzaId,
     medios: parsed.medios,
     fecha: fechaNorm,
-    depositos: data.depositos
+    depositos: data.depositos,
+    permitir_exceso: permitirExceso
   });
 
   return { success: true, cobranza_id: cobranzaId, total: total, monto: monto, medios: resultado.medios, saldo: resultado.saldo };
@@ -4301,7 +4415,7 @@ function ajustarCobroClienteHoy(data) {
   var origenIdxAjuste = headers.indexOf('origen');
   var rowIdx = -1;
   for (var i = 1; i < values.length; i++) {
-    if (origenIdxAjuste !== -1 && String(values[i][origenIdxAjuste] || '') === 'manual') continue;
+    if (origenIdxAjuste !== -1 && origenAparte_(values[i][origenIdxAjuste])) continue;
     if (normalizeFecha(values[i][fechaIdx]) === fechaNorm && idsMatch(values[i][clienteIdx], data.cliente_id)) {
       rowIdx = i;
       break;
@@ -4599,7 +4713,7 @@ function planCobroCliente_(clienteId, fechaCaja, monto) {
     return String(a.fecha || '').localeCompare(String(b.fecha || ''));
   });
 
-  var cubiertaHoy = cobranzas.some(function(c) { return c.fecha === fechaCaja && c.origen !== 'manual'; });
+  var cubiertaHoy = cobranzas.some(function(c) { return c.fecha === fechaCaja && !origenAparte_(c.origen); });
   var hoyExtra = 0;
   if (!cubiertaHoy) {
     getPreciosCliente(fechaCaja).forEach(function(p) {
@@ -4725,6 +4839,7 @@ function getDiasPendientes() {
   var recPrecioIdx = recHeaders.indexOf('precio_real');
   var recConfirmIdx = recHeaders.indexOf('confirmado');
   var recProvIdx = recHeaders.indexOf('proveedor_id');
+  var recExtraIdx = recHeaders.indexOf('extra');
   if (recProdIdx === -1) recProdIdx = 2;
 
   var recepcionPorFecha = {};
@@ -4739,7 +4854,8 @@ function getDiasPendientes() {
       proveedor_id: recProvIdx !== -1 ? row[recProvIdx] : '',
       llego: recLlegoIdx !== -1 ? row[recLlegoIdx] : null,
       precio_real: recPrecioIdx !== -1 ? row[recPrecioIdx] : 0,
-      confirmado: recConfirmIdx !== -1 ? row[recConfirmIdx] : false
+      confirmado: recConfirmIdx !== -1 ? row[recConfirmIdx] : false,
+      extra: recExtraIdx !== -1 ? row[recExtraIdx] : false
     });
   });
 

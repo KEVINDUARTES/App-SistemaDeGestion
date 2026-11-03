@@ -720,6 +720,22 @@ const Utils = {
         });
     },
 
+    /** A qué cuenta va un cliente: la de su titular (varias listas de una persona suman juntas) o la suya. */
+    cuentaDe(clienteId) {
+        const id = String(clienteId || '');
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === id);
+        const titular = String(cliente?.titular || '').trim();
+        return titular
+            ? { clave: 't:' + titular.toLowerCase(), titular, nombre: titular }
+            : { clave: 'c:' + id, titular: '', nombre: cliente?.nombre || '' };
+    },
+
+    clientesDeCuenta(clienteId) {
+        const clave = this.cuentaDe(clienteId).clave;
+        const ids = (AppState.clientes || []).filter(c => this.cuentaDe(c.id).clave === clave).map(c => String(c.id));
+        return ids.length ? ids : [String(clienteId)];
+    },
+
     getCobranzaSaldo(cobranza) {
         const saldo = Utils.parsePrice(cobranza.saldo);
         if (!isNaN(saldo)) return Math.max(0, saldo);
@@ -3041,12 +3057,18 @@ const Clientes = {
                 <input type="text" id="modal-cliente-telefono" class="form-control">
                 <small>Necesario para enviar precios por WhatsApp</small>
             </div>
+            <div class="form-group">
+                <label>Titular de la cuenta (opcional)</label>
+                <input type="text" id="modal-cliente-titular" class="form-control" placeholder="Ej: Raúl Ortiz">
+                <small>Si esta lista es de otra persona, poné su nombre: todas sus listas suman en una sola cuenta.</small>
+            </div>
         `;
         
         console.log('🔵 Mostrando modal...');
         Utils.showModal('Agregar cliente', content, async () => {
             const nombre = document.getElementById('modal-cliente-nombre').value.trim();
             const telefono = document.getElementById('modal-cliente-telefono').value.trim();
+            const titular = document.getElementById('modal-cliente-titular').value.trim();
             
             if (!nombre) {
                 Utils.showError('El nombre es obligatorio');
@@ -3056,7 +3078,8 @@ const Clientes = {
             try {
                 const result = await API.createCliente({
                     nombre: nombre,
-                    telefono: telefono
+                    telefono: telefono,
+                    titular: titular
                 });
                 
                 if (result && (result.success !== false)) {
@@ -3064,6 +3087,7 @@ const Clientes = {
                         id: result.id,
                         nombre,
                         telefono,
+                        titular,
                         activo: true,
                         ...result
                     };
@@ -3100,6 +3124,11 @@ const Clientes = {
                 <small>Necesario para enviar precios por WhatsApp</small>
             </div>
             <div class="form-group">
+                <label>Titular de la cuenta (opcional)</label>
+                <input type="text" id="modal-cliente-titular" class="form-control" placeholder="Ej: Raúl Ortiz" value="${Utils.esc(cliente.titular || '')}">
+                <small>Si esta lista es de otra persona, poné su nombre: todas sus listas suman en una sola cuenta.</small>
+            </div>
+            <div class="form-group">
                 <label>
                     <input type="checkbox" id="modal-cliente-activo" ${cliente.activo === true || cliente.activo === 'true' || cliente.activo === 1 ? 'checked' : ''}>
                     Activo
@@ -3111,6 +3140,7 @@ const Clientes = {
             const nombre = document.getElementById('modal-cliente-nombre').value.trim();
             const telefono = document.getElementById('modal-cliente-telefono').value.trim();
             const activo = document.getElementById('modal-cliente-activo').checked;
+            const titular = document.getElementById('modal-cliente-titular').value.trim();
             
             if (!nombre) {
                 Utils.showError('El nombre es obligatorio');
@@ -3118,7 +3148,7 @@ const Clientes = {
             }
 
             const anterior = { ...cliente };
-            const cambios = Utils.cambiosDe(anterior, { nombre, telefono, activo });
+            const cambios = Utils.cambiosDe({ ...anterior, titular: anterior.titular || '' }, { nombre, telefono, activo, titular });
             if (!Object.keys(cambios).length) return;
             const datos = { id, ...cambios };
             Utils.upsertInList(AppState.clientes, datos);
@@ -6620,7 +6650,13 @@ const Recepcion = {
         return Number(item.pedido_total) > 0;
     },
 
+    // Si el producto vino de más de un proveedor "a mano", lo que llegó se reparte entre todos los clientes juntos.
+    _tieneExtras(productoId) {
+        return (AppState.recepcion || []).some(r => String(r.producto_id) === String(productoId) && r.extra);
+    },
+
     _htmlReparto(item, confirmada) {
+        if (this._tieneExtras(item.producto_id)) return '';
         const clientes = this._clientesDe(this._claveDe(item));
         if (!clientes.length) return '';
         const sinCargar = this._sinCargar(item);
@@ -6758,6 +6794,20 @@ const Recepcion = {
                 if (productoId) {
                     await Utils.withButtonLoader(btnConfirmar, () => this.confirmarProducto(productoId), 'Confirmando...');
                 }
+                return;
+            }
+
+            const btnDividir = e.target.closest('.btn-dividir-proveedor');
+            if (btnDividir) {
+                e.preventDefault();
+                this.agregarProveedor(btnDividir.getAttribute('data-producto-id'));
+                return;
+            }
+
+            const btnQuitar = e.target.closest('.btn-quitar-proveedor-recepcion');
+            if (btnQuitar && !btnQuitar.disabled) {
+                e.preventDefault();
+                await Utils.withButtonLoader(btnQuitar, () => this.quitarProveedor(btnQuitar.getAttribute('data-producto-id')), 'Quitando...');
                 return;
             }
 
@@ -6921,7 +6971,8 @@ const Recepcion = {
                 precio_real: map[clave].precio,
                 reparto: map[clave].reparto || null,
                 pedido_total: item?.pedido_total || 0,
-                proveedor_id: item?.proveedor_id || this._partesClave(clave).proveedorId || ''
+                proveedor_id: item?.proveedor_id || this._partesClave(clave).proveedorId || '',
+                ...(item?.extra ? { extra: true } : {})
             };
         }).filter(Boolean);
         if (!items.length) return;
@@ -7052,13 +7103,20 @@ const Recepcion = {
                 const proveedoresDelProducto = Object.keys(pedidoInfo.porProveedor)
                     .sort((a, b) => pedidoInfo.porProveedor[b] - pedidoInfo.porProveedor[a]);
                 const filasGuardadas = recepciones.filter(r => String(r.producto_id) === String(productoId));
-                const asignadas = this._asignarFilas(filasGuardadas, proveedoresDelProducto);
-                const variosProveedores = proveedoresDelProducto.length > 1;
+                const esExtra = r => r.extra === true || r.extra === 'true';
+                const asignadas = this._asignarFilas(filasGuardadas.filter(r => !esExtra(r)), proveedoresDelProducto);
+                // Proveedores agregados a mano para este producto (la mercadería vino de más de uno).
+                const extras = filasGuardadas.filter(esExtra)
+                    .filter(r => !proveedoresDelProducto.includes(String(r.proveedor_id || '')));
+                const variosProveedores = proveedoresDelProducto.length + extras.length > 1;
+                const entradas = proveedoresDelProducto.map(prov => ({ prov, extra: false }))
+                    .concat(extras.map(fila => ({ prov: String(fila.proveedor_id || ''), extra: true, fila })));
 
-                proveedoresDelProducto.forEach(proveedorPedidoId => {
+                entradas.forEach(entrada => {
+                    const proveedorPedidoId = entrada.prov;
                     const clave = variosProveedores ? `${productoId}::${proveedorPedidoId}` : String(productoId);
                     const proveedor = proveedorPedidoId ? this.findById(proveedores, proveedorPedidoId) : null;
-                    const rec = asignadas[proveedorPedidoId] || null;
+                    const rec = entrada.extra ? entrada.fila : (asignadas[proveedorPedidoId] || null);
                     const local = (AppState.recepcion || []).find(r => this._claveDe(r) === clave);
                     const confirmado = rec?.confirmado === true || rec?.confirmado === 'true';
                     const edicion = ediciones[clave];
@@ -7087,7 +7145,7 @@ const Recepcion = {
                     }
 
                     // La fila guardada sigue al proveedor de los pedidos: si quedó con otro, se corrige.
-                    if (rec && proveedorPedidoId && String(rec.proveedor_id || '') !== proveedorPedidoId) {
+                    if (!entrada.extra && rec && proveedorPedidoId && String(rec.proveedor_id || '') !== proveedorPedidoId) {
                         correcciones.push({ producto_id: productoId, proveedor_id: proveedorPedidoId, solo_proveedor: true });
                     }
 
@@ -7096,7 +7154,8 @@ const Recepcion = {
                         clave,
                         producto_id: productoId,
                         producto_nombre: producto?.nombre || pedidoInfo.producto_nombre || 'Sin nombre',
-                        pedido_total: pedidoInfo.porProveedor[proveedorPedidoId],
+                        pedido_total: entrada.extra ? 0 : pedidoInfo.porProveedor[proveedorPedidoId],
+                        extra: entrada.extra,
                         llego,
                         precio_real: precioReal,
                         reparto,
@@ -7150,7 +7209,8 @@ const Recepcion = {
                     <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${this._claveDe(item)}">Editar</button>
                     <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${this._claveDe(item)}">Eliminar</button>
                    </div>`
-                : `<button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${this._claveDe(item)}">Confirmar</button>`;
+                : `<button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${this._claveDe(item)}">Confirmar</button>`
+                    + (item.extra ? ` <button type="button" class="btn btn-danger btn-sm btn-quitar-proveedor-recepcion" data-producto-id="${this._claveDe(item)}">Quitar</button>` : '');
 
             // Sin confirmar y sin cargar, los campos quedan vacíos (el 0 es solo de ayuda): así se escribe
             // directo, sin borrar un 0 en cada producto. Vacío vale lo mismo que 0 al confirmar.
@@ -7160,8 +7220,8 @@ const Recepcion = {
             const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
             rowsHtml += `
                 <tr${rowClass} data-nombre="${Utils.esc(this._normalizarBusqueda(item.producto_nombre))}">
-                    <td>${Utils.esc(item.producto_nombre || '')}</td>
-                    <td>${item.pedido_total || 0}</td>
+                    <td>${Utils.esc(item.producto_nombre || '')}${!confirmada && !item.extra ? ` <button type="button" class="btn btn-secondary btn-sm btn-dividir-proveedor" data-producto-id="${this._claveDe(item)}" title="Agregar otro proveedor de este producto">+ Proveedor</button>` : ''}</td>
+                    <td>${item.extra ? '—' : (item.pedido_total || 0)}</td>
                     <td><input type="number" step="any" class="recepcion-llego" data-id="${item.id}" data-producto-id="${this._claveDe(item)}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
                     <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${this._claveDe(item)}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
                     <td>${Utils.esc(item.proveedor_nombre || '')}</td>
@@ -7191,6 +7251,7 @@ const Recepcion = {
             items.push({
                 producto_id: fila?.producto_id || this._partesClave(productoId).productoId,
                 proveedor_id: fila?.proveedor_id || '',
+                ...(fila?.extra ? { extra: true } : {}),
                 llego: llego,
                 precio_real: precio,
                 reparto: this._repartoDeLaPantalla(productoId, llego)
@@ -7279,7 +7340,8 @@ const Recepcion = {
                     precio_real: entrada.precio,
                     reparto: entrada.reparto || null,
                     proveedor_id: entrada.item.proveedor_id,
-                    pedido_total: entrada.item.pedido_total
+                    pedido_total: entrada.item.pedido_total,
+                    ...(entrada.item.extra ? { extra: true } : {})
                 });
             }
             this._armarListaPrecios();
@@ -7360,7 +7422,8 @@ const Recepcion = {
                 precio_real: precio,
                 reparto: reparto || null,
                 proveedor_id: item.proveedor_id,
-                pedido_total: item.pedido_total
+                pedido_total: item.pedido_total,
+                ...(item.extra ? { extra: true } : {})
             });
             this._armarListaPrecios();
         }, () => {
@@ -7498,6 +7561,54 @@ const Recepcion = {
             listaModal.addEventListener('input', () => {
                 totalModal.value = this._sumarReparto(productoId, cuerpo);
             });
+        }
+    },
+
+    // La mercadería de un producto puede venir de más de un proveedor sin que coincida con lo pedido
+    // por cada cliente: se agrega una fila por proveedor con lo que llegó de cada uno.
+    agregarProveedor(clave) {
+        const item = this._item(clave);
+        if (!item) return;
+        const usados = new Set((AppState.recepcion || [])
+            .filter(r => String(r.producto_id) === String(item.producto_id))
+            .map(r => String(r.proveedor_id || '')));
+        const disponibles = Pedidos.getProveedoresActivos(AppState.proveedores || []).filter(p => !usados.has(String(p.id)));
+        if (!disponibles.length) {
+            Utils.showInfo('Ya están todos los proveedores de este producto.');
+            return;
+        }
+        const content = `
+            <p class="modal-hint">Agregá otro proveedor de "${Utils.esc(item.producto_nombre || '')}". Después cargá cuánto llegó de cada uno y a qué precio.</p>
+            <div class="form-group">
+                <label for="modal-recepcion-proveedor-extra">Proveedor</label>
+                <select id="modal-recepcion-proveedor-extra" class="form-control">
+                    ${disponibles.map(p => `<option value="${Utils.esc(p.id)}">${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+            </div>`;
+        Utils.showModal('Agregar proveedor', content, async () => {
+            const proveedorId = document.getElementById('modal-recepcion-proveedor-extra').value;
+            if (!proveedorId) return true;
+            await API.saveRecepcion({
+                fecha: AppState.currentDate,
+                items: [{ producto_id: item.producto_id, proveedor_id: proveedorId, pedido_total: 0, llego: 0, precio_real: 0, extra: true }]
+            });
+            await this.load();
+        }, 'Agregar');
+    },
+
+    async quitarProveedor(clave) {
+        const item = this._item(clave);
+        if (!item || !item.extra) return;
+        try {
+            await API.deleteRecepcionItem({
+                fecha: AppState.currentDate,
+                producto_id: item.producto_id,
+                proveedor_id: item.proveedor_id || ''
+            });
+            this._quitarBorrador(AppState.currentDate, clave);
+            await this.load();
+        } catch (error) {
+            Utils.showError('No se pudo quitar el proveedor: ' + error.message);
         }
     },
 
@@ -8632,17 +8743,28 @@ const Precios = {
 
             // Un producto puede venir de más de un proveedor: lo que llegó de cada uno se reparte entre
             // los clientes que le pidieron a ese proveedor, y la línea de cada cliente suma todo.
-            const porProveedor = {};
+            let porProveedor = {};
             porProducto[productoId].forEach(pedido => {
                 const prov = Recepcion._proveedorDePedido(pedido, producto);
                 if (!porProveedor[prov]) porProveedor[prov] = [];
                 porProveedor[prov].push(pedido);
             });
-            const proveedoresDelProducto = Object.keys(porProveedor);
-            const asignadas = Recepcion._asignarFilas(
-                (recepciones || []).filter(r => String(r.producto_id) === String(productoId)),
-                proveedoresDelProducto
-            );
+            let proveedoresDelProducto = Object.keys(porProveedor);
+            const filasProducto = (recepciones || []).filter(r => String(r.producto_id) === String(productoId));
+            const esExtra = r => r.extra === true || r.extra === 'true';
+            let asignadas;
+            if (filasProducto.some(esExtra)) {
+                // Vino de varios proveedores cargados a mano: lo que llegó en total se reparte entre todos los clientes.
+                const propias = Recepcion._asignarFilas(filasProducto.filter(r => !esExtra(r)), proveedoresDelProducto);
+                const completo = proveedoresDelProducto.every(prov => propias[prov]);
+                const agregada = Recepcion.agregadoDe(filasProducto, productoId);
+                const juntos = [].concat(...proveedoresDelProducto.map(prov => porProveedor[prov]));
+                porProveedor = { todos: juntos };
+                proveedoresDelProducto = ['todos'];
+                asignadas = { todos: completo && agregada ? { ...agregada, proveedor_nombre: '', reparto: null } : null };
+            } else {
+                asignadas = Recepcion._asignarFilas(filasProducto, proveedoresDelProducto);
+            }
 
             const acumulado = {};
             proveedoresDelProducto.forEach(prov => {
@@ -9565,11 +9687,24 @@ const CuentaCorriente = {
             }
             // Pagos: los movimientos de caja de esta cobranza (con su fecha y medio).
             let pagadoCaja = 0;
+            // Un cobro que se corrigió no deja rastro: de cada medio con correcciones queda un solo pago, por lo neto.
+            const pagos = [];
             (caja || []).filter(m => String(m.referencia) === String(c.id)).forEach(m => {
                 const monto = (Utils.parsePrice(m.monto) || 0) * (String(m.tipo) === 'egreso' ? -1 : 1);
                 if (!monto) return;
                 pagadoCaja += monto;
-                movs.push({ fecha: Utils.fechaIso(m.fecha) || fecha, orden: 1, producto: monto < 0 ? 'Corrección de cobro' : 'Pago', cantidad: '', precio: '', total: 0, pago: monto, medio: this._medio(m.nota) });
+                pagos.push({ fecha: Utils.fechaIso(m.fecha) || fecha, monto, medio: this._medio(m.nota) });
+            });
+            const corregidos = new Set(pagos.filter(x => x.monto < 0).map(x => x.medio));
+            pagos.filter(x => !corregidos.has(x.medio)).forEach(x => {
+                movs.push({ fecha: x.fecha, orden: 1, producto: 'Pago', cantidad: '', precio: '', total: 0, pago: x.monto, medio: x.medio });
+            });
+            corregidos.forEach(medio => {
+                const delMedio = pagos.filter(x => x.medio === medio);
+                const neto = delMedio.reduce((suma, x) => suma + x.monto, 0);
+                if (Math.abs(neto) < 0.01) return;
+                const ultima = delMedio.reduce((f, x) => (x.fecha > f ? x.fecha : f), '');
+                movs.push({ fecha: ultima || fecha, orden: 1, producto: neto < 0 ? 'Corrección de cobro' : 'Pago', cantidad: '', precio: '', total: 0, pago: neto, medio });
             });
             const pagado = Utils.parsePrice(c.pagado) || 0;
             if (pagado !== pagadoCaja) {
@@ -9593,7 +9728,7 @@ const CuentaCorriente = {
         id = String(id);
         const esCliente = tipo === 'cliente';
         const lista = esCliente ? AppState.clientes : AppState.proveedores;
-        const nombre = (lista || []).find(x => String(x.id) === id)?.nombre || (esCliente ? 'Cliente' : 'Proveedor');
+        const nombre = (esCliente && Utils.cuentaDe(id).titular) || (lista || []).find(x => String(x.id) === id)?.nombre || (esCliente ? 'Cliente' : 'Proveedor');
         Utils.showLoader();
         try {
             let movs;
@@ -9603,7 +9738,9 @@ const CuentaCorriente = {
                     API.request('precios-cliente', 'GET'),
                     API.request('caja', 'GET')
                 ]);
-                movs = this._movimientosCliente(id, cobranzas, precios, caja);
+                const ids = Utils.clientesDeCuenta(id);
+                movs = ids.flatMap(cid => this._movimientosCliente(cid, cobranzas, precios, caja));
+                this._resumenCliente = this._filasResumenCliente(ids, cobranzas);
             } else {
                 const [recepcion, pagos, deudas] = await Promise.all([
                     API.request('recepcion', 'GET'),
@@ -9614,13 +9751,73 @@ const CuentaCorriente = {
             }
             const filas = this._conSaldo(movs);
             this._ultima = { tipo, id, nombre, filas };
-            this._mostrar(esCliente, nombre, filas);
+            if (esCliente) this._mostrarResumenCliente(nombre, this._resumenCliente);
+            else this._mostrar(esCliente, nombre, filas);
         } catch (error) {
             console.error('Error armando la cuenta corriente:', error);
             Utils.showError('No se pudo armar la cuenta corriente: ' + error.message);
         } finally {
             Utils.hideLoader();
         }
+    },
+
+    // Una fila por fecha: lo cargado, lo cobrado en efectivo y por transferencia (y a qué proveedor fue) y el saldo.
+    _filasResumenCliente(ids, cobranzas) {
+        const porFecha = {};
+        (cobranzas || []).filter(c => ids.includes(String(c.cliente_id))).forEach(c => {
+            const fecha = Utils.fechaIso(c.fecha);
+            const fila = porFecha[fecha] || (porFecha[fecha] = { fecha, total: 0, pagado: 0, efectivo: 0, transferencia: 0, depositos: [] });
+            const medios = MediosPago.parse(c.medios);
+            fila.total += Utils.parsePrice(c.total) || 0;
+            fila.pagado += Utils.parsePrice(c.pagado) || 0;
+            fila.efectivo += medios.efectivo;
+            fila.transferencia += medios.transferencia;
+            fila.depositos = fila.depositos.concat(Depositos.deCobranza(c) || []);
+        });
+        let saldo = 0;
+        return Object.values(porFecha).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')).map(f => {
+            saldo += f.total - f.pagado;
+            return { ...f, saldo };
+        });
+    },
+
+    _mostrarResumenCliente(nombre, filas) {
+        const saldo = filas.length ? filas[filas.length - 1].saldo : 0;
+        const plata = n => (n ? Utils.formatCurrency(n) : '');
+        const fecha = iso => (iso ? new Date(iso + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric' }) : '');
+        const cuerpo = filas.length
+            ? filas.map(f => `
+                <tr>
+                    <td data-label="Fecha">${Utils.esc(fecha(f.fecha))}</td>
+                    <td data-label="Total de carga" class="cc-num">${plata(f.total)}</td>
+                    <td data-label="Pago en efectivo" class="cc-num">${plata(f.efectivo)}</td>
+                    <td data-label="Pago en transferencia" class="cc-num">${plata(f.transferencia)}</td>
+                    <td data-label="A quién corresponde">${Utils.esc(f.depositos.map(d => `${Depositos._nombreProveedor(d.proveedor_id)} ${Utils.formatCurrency(d.monto)}`).join(' · '))}</td>
+                    <td data-label="Saldo" class="cc-num cc-saldo">${Utils.formatCurrency(f.saldo)}</td>
+                </tr>`).join('')
+            : `<tr><td colspan="6" style="text-align:center;padding:24px;color:#666;">Todavía no hay movimientos con ${Utils.esc(nombre)}.</td></tr>`;
+        const content = `
+            <div class="cuenta-corriente">
+                <div class="cc-resumen">
+                    <span>Saldo total</span>
+                    <strong class="${saldo > 0 ? 'cc-deuda' : ''}">${Utils.formatCurrency(saldo)}</strong>
+                    <button type="button" class="btn btn-whatsapp btn-sm" id="cc-whatsapp">Enviar WhatsApp</button>
+                </div>
+                <div class="table-container cc-scroll">
+                    <table class="data-table cc-tabla">
+                        <thead>
+                            <tr><th>Fecha</th><th>Total de carga</th><th>Pago en efectivo</th><th>Pago en transferencia</th><th>A quién corresponde</th><th>Saldo</th></tr>
+                        </thead>
+                        <tbody>${cuerpo}</tbody>
+                    </table>
+                </div>
+                <p class="modal-hint">Figuran los días ya cerrados o con algún cobro. Lo de hoy aparece cuando se cobra o se cierra el día.</p>
+            </div>
+        `;
+        Utils.showModal(`Cuenta corriente · ${nombre}`, content, null);
+        document.getElementById('cc-whatsapp')?.addEventListener('click', () => this.enviarWhatsApp());
+        const scroll = document.querySelector('.cc-scroll');
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
     },
 
     _mostrar(esCliente, nombre, filas) {
@@ -10226,13 +10423,24 @@ const Depositos = {
         ).join('');
     },
 
+    _hoy() {
+        const d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    },
+
+    // La fecha se guarda como AAAA-MM-DD; los depósitos viejos traen un nombre de cuenta y se muestran tal cual.
+    _fecha(valor) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(valor || ''));
+        return m ? `${m[3]}/${m[2]}/${m[1]}` : String(valor || '');
+    },
+
     html() {
         return `
             <div id="deposito-box" class="deposito-box" hidden>
-                <p class="modal-hint">Identificá el depósito: el nombre de la cuenta como figura en el banco, y a qué proveedor va. Si se reparte, sumá una línea por proveedor.</p>
+                <p class="modal-hint">Identificá el depósito: la fecha en que se hace y a qué proveedor va. Si se reparte, sumá una línea por proveedor.</p>
                 <div class="form-group">
-                    <label for="deposito-cuenta">Nombre de la cuenta</label>
-                    <input type="text" id="deposito-cuenta" class="form-control" placeholder="Como figura en el banco">
+                    <label for="deposito-cuenta">Fecha del depósito</label>
+                    <input type="date" id="deposito-cuenta" class="form-control" value="${this._hoy()}">
                 </div>
                 <div id="deposito-lineas"></div>
                 <button type="button" class="btn btn-secondary btn-sm" id="deposito-agregar">Otra línea</button>
@@ -10293,7 +10501,7 @@ const Depositos = {
         const cuenta = document.getElementById('deposito-cuenta');
         const caja = document.getElementById('deposito-lineas');
         if (!caja) return;
-        if (cuenta) cuenta.value = lista[0]?.cuenta || '';
+        if (cuenta) cuenta.value = lista[0]?.cuenta || this._hoy();
         caja.innerHTML = '';
         lista.forEach(item => this.agregarLinea(item.monto, item.proveedor_id));
     },
@@ -10311,7 +10519,7 @@ const Depositos = {
             lineas.push({ cuenta, proveedor_id: proveedorId, monto: parte });
         });
         if (!cuenta || !lineas.length || lineas.some(item => !item.proveedor_id || item.monto <= 0)) {
-            return { lineas: [], error: 'En la transferencia poné el nombre de la cuenta y a qué proveedor va.' };
+            return { lineas: [], error: 'En la transferencia poné la fecha del depósito y a qué proveedor va.' };
         }
         const suma = Math.round(lineas.reduce((total, item) => total + item.monto, 0) * 100) / 100;
         if (Math.abs(suma - monto) > 0.05) {
@@ -10337,7 +10545,7 @@ const Depositos = {
         const lista = Array.isArray(depositos) ? depositos : [];
         if (!lista.length) return '';
         return lista.map(item =>
-            `${item.cuenta} → ${this._nombreProveedor(item.proveedor_id)} ${Utils.formatCurrency(item.monto)}`
+            `${this._fecha(item.cuenta)} → ${this._nombreProveedor(item.proveedor_id)} ${Utils.formatCurrency(item.monto)}`
         ).join(' · ');
     },
 
@@ -10441,7 +10649,7 @@ const Depositos = {
         caja.innerHTML = `
             <strong>Depósitos identificados</strong>
             <ul>
-                ${lista.map(item => `<li>${this._esc(item.cuenta)} · ${this._esc(item.cliente)} → ${this._esc(item.proveedor)} · ${Utils.formatCurrency(item.monto)}</li>`).join('')}
+                ${lista.map(item => `<li>${this._esc(this._fecha(item.cuenta))} · ${this._esc(item.cliente)} → ${this._esc(item.proveedor)} · ${Utils.formatCurrency(item.monto)}</li>`).join('')}
             </ul>
         `;
     },
@@ -10456,15 +10664,17 @@ const MediosPago = {
         ['efectivo', 'Efectivo'],
         ['transferencia', 'Transferencia'],
         ['cheque', 'Cheque'],
-        ['tarjeta', 'Tarjeta de crédito']
+        ['descuento', 'Descuento']
     ],
+    // Cobros viejos con tarjeta: ya no se ofrece, pero se sigue mostrando.
+    historicos: [['tarjeta', 'Tarjeta de crédito'], ['adelanto', 'Pago por adelantado']],
     deProveedor: [
         ['efectivo', 'Efectivo'],
         ['transferencia', 'Transferencia']
     ],
 
     vacio() {
-        return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0 };
+        return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0, descuento: 0, adelanto: 0 };
     },
 
     parse(valor) {
@@ -10495,7 +10705,7 @@ const MediosPago = {
 
     texto(medios) {
         const datos = this.parse(medios);
-        const partes = this.deCliente
+        const partes = this.deCliente.concat(this.historicos)
             .filter(([id]) => datos[id] > 0)
             .map(([id, label]) => `${label} ${Utils.formatCurrency(datos[id])}`);
         return partes.length ? partes.join(' · ') : '—';
@@ -10566,6 +10776,11 @@ const MediosPago = {
             if (tope && total > saldo + 0.01) {
                 aviso.hidden = false;
                 aviso.textContent = 'La suma supera lo adeudado (' + Utils.formatCurrency(saldo) + ').';
+                return;
+            }
+            if (!tope && total > saldo + 0.01) {
+                aviso.hidden = false;
+                aviso.textContent = 'Paga de más: ' + Utils.formatCurrency(total - saldo) + ' le quedan a favor para la próxima carga.';
                 return;
             }
             if (total > 0 && !opciones.ocultarAdeudado && queda > 0.01) {
@@ -10688,7 +10903,7 @@ const SaldoCliente = {
     _pagos(carga) {
         if (carga.pagado <= 0.01) return [];
         const medios = MediosPago.parse(carga.medios);
-        const lineas = MediosPago.deCliente
+        const lineas = MediosPago.deCliente.concat(MediosPago.historicos)
             .filter(([medio]) => medios[medio] > 0.01)
             .map(([medio, etiqueta]) => ({ texto: etiqueta, monto: medios[medio] }));
         const suma = lineas.reduce((sum, linea) => sum + linea.monto, 0);
@@ -10951,7 +11166,7 @@ const Cobranzas = {
         // Una tarjeta por cliente, con cada deuda en su fecha (no se suman entre sí).
         const porCliente = new Map();
         AppState.cobranzas.forEach(cobranza => {
-            const clave = String(cobranza.cliente_id || '');
+            const clave = Utils.cuentaDe(cobranza.cliente_id).clave;
             if (!porCliente.has(clave)) porCliente.set(clave, []);
             porCliente.get(clave).push(cobranza);
         });
@@ -10959,18 +11174,19 @@ const Cobranzas = {
             cobranzas.sort((a, b) => String(Utils.fechaIso(a.fecha) || '').localeCompare(String(Utils.fechaIso(b.fecha) || '')));
             const tr = document.createElement('tr');
             const cliente = this._clienteDe(cobranzas[0]);
+            const cuenta = Utils.cuentaDe(cobranzas[0].cliente_id);
             const total = cobranzas.reduce((suma, c) => suma + Utils.getCobranzaSaldo(c), 0);
             tr.dataset.clienteId = String(cobranzas[0].cliente_id || '');
             tr.dataset.cobranzaIds = cobranzas.map(c => String(c.id || '')).join(' ');
             const lineas = cobranzas.map(c => ({
                 fecha: c.fecha,
                 saldo: Utils.getCobranzaSaldo(c),
-                nota: c.origen === 'manual' ? 'Deuda anterior' + (c.nota ? ' · ' + c.nota : '') : '',
+                nota: [cuenta.titular ? this._clienteDe(c).nombre : '', c.origen === 'manual' ? 'Deuda anterior' + (c.nota ? ' · ' + c.nota : '') : ''].filter(Boolean).join(' · '),
                 onclick: `Cobranzas.cobrar('${c.id}')`,
                 boton: 'Cobrar'
             }));
             tr.innerHTML = `
-                <td data-label="Cliente">${Utils.esc(cliente.nombre || '')}</td>
+                <td data-label="Cliente">${Utils.esc(cuenta.titular || cliente.nombre || '')}</td>
                 <td data-label="Te debe">${DeudasPorFecha.html(lineas, total, 0, '')}</td>
                 <td data-label="Fecha">${Utils.formatDate(cobranzas[0].fecha)}${cobranzas.length > 1 ? `<small class="fila-nota">y ${cobranzas.length - 1} más</small>` : ''}</td>
                 <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span></td>
@@ -11134,10 +11350,6 @@ const Cobranzas = {
                 Utils.showError('Poné cuánto te paga.');
                 throw new Error('Monto inválido');
             }
-            if (leido.total > saldo + 0.01) {
-                Utils.showError('La suma supera lo que te debe (' + Utils.formatCurrency(saldo) + ').');
-                throw new Error('Monto mayor al saldo');
-            }
             const deposito = leido.depositos;
             if (deposito.error) {
                 Utils.showError(deposito.error);
@@ -11150,12 +11362,14 @@ const Cobranzas = {
             const depositosAnteriores = Array.isArray(cobranza.depositos) ? cobranza.depositos.slice() : [];
             cobranza.medios = MediosPago.sumar(mediosAnteriores, leido.medios);
             cobranza.depositos = depositosAnteriores.concat(deposito.lineas);
-            cobranza.pagado = (Utils.parsePrice(cobranza.pagado) || 0) + leido.total;
+            cobranza.pagado = (Utils.parsePrice(cobranza.pagado) || 0) + Math.min(leido.total, saldo);
             cobranza.saldo = Math.max(0, saldo - leido.total);
             cobranza.estado = cobranza.saldo > 0.01 ? 'pendiente' : 'pagado';
             CacheManager.set('cobranzas:all:all', AppState.cobranzas);
             this.render();
-            Utils.avisar(leido.total >= saldo
+            Utils.avisar(leido.total > saldo + 0.01
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado. ${Utils.formatCurrency(leido.total - saldo)} quedan a favor`
+                : leido.total >= saldo
                 ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
                 : `Cobro registrado. Queda ${Utils.formatCurrency(cobranza.saldo)}`);
 
@@ -11176,7 +11390,8 @@ const Cobranzas = {
                 medios: leido.lista,
                 // El cobro de una deuda cargada a mano entra a la caja de hoy, no del día de la deuda.
                 fecha: cobranza.origen === 'manual' ? fechaHoyAR() : (cobranza.fecha || AppState.currentDate),
-                depositos: deposito.lineas
+                depositos: deposito.lineas,
+                permitir_exceso: true
             }), () => {
                 cobranza.saldo = saldoAnterior;
                 cobranza.pagado = pagadoAnterior;
@@ -11189,7 +11404,7 @@ const Cobranzas = {
             });
         }, 'Cobrar');
 
-        MediosPago.enganchar(saldo);
+        MediosPago.enganchar(saldo, { tope: false });
     },
     
     async registrar() {
@@ -11547,7 +11762,7 @@ const CobranzasHoy = {
             return;
         }
         if (hint) {
-            hint.textContent = 'Cobrás en efectivo, transferencia, cheque o tarjeta. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).';
+            hint.textContent = 'Cobrás en efectivo, transferencia o cheque, o le hacés un descuento. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).';
         }
 
         if (totales.length === 0) {
@@ -11882,10 +12097,6 @@ const CobranzasHoy = {
                 Utils.showError('Poné cuánto te paga.');
                 throw new Error('Monto inválido');
             }
-            if (leido.total > saldoActual + 0.01) {
-                Utils.showError('La suma supera el saldo pendiente (' + Utils.formatCurrency(saldoActual) + ').');
-                throw new Error('Monto mayor al saldo');
-            }
             if (leido.depositos.error) {
                 Utils.showError(leido.depositos.error);
                 throw new Error(leido.depositos.error);
@@ -11901,13 +12112,14 @@ const CobranzasHoy = {
                 fecha: AppState.currentDate,
                 cliente_id: clienteId,
                 medios: leido.lista,
-                depositos: leido.depositos.lineas
+                depositos: leido.depositos.lineas,
+                permitir_exceso: true
             }), () => {
                 this._aplicarMediosLocal(clienteId, mediosPrevios, depositosPrevios);
                 Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
             });
         }, 'Cobrar');
-        MediosPago.enganchar(saldoActual);
+        MediosPago.enganchar(saldoActual, { tope: false });
     }
 };
 
