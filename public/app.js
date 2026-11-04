@@ -3598,11 +3598,26 @@ const PlanillaPedidos = {
                 : el.value.replace(/\D/g, '');
         });
         tabla.addEventListener('keydown', e => {
-            if (e.key !== 'Enter' || !e.target.classList.contains('planilla-celda')) return;
-            e.preventDefault();
+            if (!e.target.classList.contains('planilla-celda')) return;
             const celdas = [...tabla.querySelectorAll('tbody tr:not([hidden]) .planilla-celda')];
-            const sig = celdas[celdas.indexOf(e.target) + this._clientes().length];
-            if (sig) sig.focus(); else e.target.blur();
+            const i = celdas.indexOf(e.target);
+            const ir = (destino) => { if (destino) { e.preventDefault(); destino.focus(); destino.select(); } };
+            const paso = this._clientes().length;
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const sig = celdas[i + paso];
+                if (sig) sig.focus(); else e.target.blur();
+            } else if (e.key === 'ArrowDown') {
+                ir(celdas[i + paso]);
+            } else if (e.key === 'ArrowUp') {
+                ir(celdas[i - paso]);
+            } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                const t = e.target;
+                const alBorde = e.key === 'ArrowRight'
+                    ? t.selectionStart === t.value.length && t.selectionEnd === t.value.length
+                    : t.selectionStart === 0 && t.selectionEnd === 0;
+                if (alBorde) ir(celdas[i + (e.key === 'ArrowRight' ? 1 : -1)]);
+            }
         });
         tabla.addEventListener('click', e => {
             const ed = e.target.closest('[data-planilla-editar]');
@@ -6849,6 +6864,16 @@ const Recepcion = {
         };
         tbody.addEventListener('input', guardarCampo);
         tbody.addEventListener('change', guardarCampo);
+        // Flechas arriba/abajo: pasan al mismo campo (llegó, precio o reparto) de la fila siguiente/anterior.
+        tbody.addEventListener('keydown', (e) => {
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            const clase = ['recepcion-llego', 'recepcion-precio', 'recepcion-reparto'].find(c => e.target.classList?.contains(c));
+            if (!clase) return;
+            e.preventDefault();
+            const campos = [...tbody.querySelectorAll('.' + clase)].filter(c => !c.disabled && c.offsetParent !== null);
+            const destino = campos[campos.indexOf(e.target) + (e.key === 'ArrowDown' ? 1 : -1)];
+            if (destino) { destino.focus(); destino.select(); }
+        });
 
         if (!this._salidaEnganchada) {
             this._salidaEnganchada = true;
