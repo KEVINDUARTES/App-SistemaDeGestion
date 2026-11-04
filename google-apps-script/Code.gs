@@ -3573,7 +3573,10 @@ function savePreciosCliente(data) {
     if (pct > 0 && !traeComision) comision = Math.round(comisionDia * pct) / 100;
 
     if (rowIdx !== undefined) {
-      if (!soloComision) values[rowIdx][precioIdx] = precioCliente;
+      // Armar la lista manda el precio que leyó antes: si ya hay uno cargado, no lo pisa.
+      var conservar = item.conservar_precio === true || item.conservar_precio === 'true';
+      var precioActual = normalizeAmount(values[rowIdx][precioIdx]);
+      if (!soloComision && !(conservar && precioActual > 0)) values[rowIdx][precioIdx] = precioCliente;
       if (cantidadIdx !== -1 && item.cantidad !== undefined && !soloComision) values[rowIdx][cantidadIdx] = item.cantidad || 0;
       if (comisionIdx !== -1) values[rowIdx][comisionIdx] = comision;
       if (pctIdx !== -1 && traePct) values[rowIdx][pctIdx] = pct || '';

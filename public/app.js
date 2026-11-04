@@ -7702,13 +7702,21 @@ const Recepcion = {
         });
     },
 
-    async _armarListaPrecios() {
+    // Una por vez: si se confirma de seguido, las corridas superpuestas se pisaban entre sí
+    // (cada una guardaba lo que había leído antes de que terminara la otra).
+    _armarListaPrecios() {
+        const corrida = (this._colaLista || Promise.resolve()).then(() => this._armarListaPreciosAhora());
+        this._colaLista = corrida.catch(() => {});
+        return corrida;
+    },
+
+    async _armarListaPreciosAhora() {
         try {
             return await Precios.armarLista({ silencioso: true, ajustarNoConfirmados: true });
         } catch (error) {
             // Un producto de varios proveedores no cuenta como confirmado hasta que lo está cada uno:
             // mientras falten filas la lista todavía no se puede armar, y no es un error.
-            if (/No se encontraron productos con recepción confirmada/.test(String(error && error.message))) return null;
+            if (/No se encontraron productos con recepción confirmada|No hay recepciones confirmadas|No hay pedidos para armar/.test(String(error && error.message))) return null;
             console.error('Error armando lista de precios:', error);
             Utils.showWarning('La recepción quedó guardada, pero no se pudo armar la lista de precios. Podés usar Armar lista en Precios al cliente.');
             return null;
@@ -8862,6 +8870,7 @@ const Precios = {
                     producto_id: linea.producto_id,
                     cantidad: linea.cantidad,
                     precio_cliente: precioCliente,
+                    conservar_precio: true,
                     ...Comisiones.deLinea(linea.producto_id, precioCliente, this.comisionPorUnidad)
                 });
             });
@@ -8877,6 +8886,7 @@ const Precios = {
                     producto_id: precio.producto_id,
                     cantidad: 0,
                     precio_cliente: Utils.parsePrice(precio.precio_cliente) || 0,
+                    conservar_precio: true,
                     ...Comisiones.deLinea(precio.producto_id, precio.precio_cliente, this.comisionPorUnidad)
                 });
             });
