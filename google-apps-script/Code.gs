@@ -3201,6 +3201,13 @@ function saveRecepcion(data) {
       // El proveedor de la recepción es el de los pedidos del día: si cambió, la fila guardada se corrige.
       if (rowIdx !== undefined && proveedorItem && provCol !== -1) values[rowIdx][provCol] = proveedorItem;
       if (soloProveedor) return;
+      // Un borrador (autoguardado) nunca pisa una fila que otra persona ya confirmó.
+      if (rowIdx !== undefined && (item.solo_si_pendiente === true || item.solo_si_pendiente === 'true')) {
+        var colConf = headers.indexOf('confirmado');
+        if (colConf === -1) colConf = 7;
+        var yaConf = values[rowIdx][colConf];
+        if (yaConf === true || yaConf === 'true' || yaConf === 1 || yaConf === '1') return;
+      }
       var repartoItem = item.reparto !== undefined ? normalizarReparto_(item.reparto, item.llego || 0, false) : undefined;
       if (rowIdx !== undefined) {
         values[rowIdx][llegoCol]  = item.llego || 0;

@@ -6972,6 +6972,7 @@ const Recepcion = {
                 reparto: map[clave].reparto || null,
                 pedido_total: item?.pedido_total || 0,
                 proveedor_id: item?.proveedor_id || this._partesClave(clave).proveedorId || '',
+                solo_si_pendiente: true,
                 ...(item?.extra ? { extra: true } : {})
             };
         }).filter(Boolean);
@@ -7033,8 +7034,13 @@ const Recepcion = {
         if (cambioDia) AppState.recepcion = [];
         const fecha = AppState.currentDate;
         const token = DataLoader._flujoToken;
+        // Lo que hay en pantalla y en memoria es de _fechaPantalla: si se cambió de día, no se
+        // arrastra nada (cantidades, precios ni "confirmado") a las filas del día nuevo.
+        const mismoDia = this._fechaPantalla === fecha;
+        if (!mismoDia) AppState.recepcion = [];
         if (DiaOperativo.diaSinPedidos(fecha)) {
             AppState.recepcion = [];
+            this._fechaPantalla = fecha;
             AppState.fechaCargada = fecha;
             this.render();
             return;
@@ -7064,7 +7070,7 @@ const Recepcion = {
 
             const flujo = await DataLoader.getFlujo(fecha);
             if (token !== DataLoader._flujoToken) return;
-            const ediciones = this._capturarEdiciones();
+            const ediciones = mismoDia ? this._capturarEdiciones() : {};
             const recepciones = flujo.recepcion || [];
             const pedidos = flujo.pedidos || [];
             this._pedidosDia = pedidos;
@@ -7167,6 +7173,7 @@ const Recepcion = {
             });
 
             AppState.recepcion = recepcionesFinales;
+            this._fechaPantalla = fecha;
             this._reflejarEnCache(fecha);
             this.render();
             if (pendiente) this._programarGuardado();
@@ -7251,6 +7258,7 @@ const Recepcion = {
             items.push({
                 producto_id: fila?.producto_id || this._partesClave(productoId).productoId,
                 proveedor_id: fila?.proveedor_id || '',
+                solo_si_pendiente: true,
                 ...(fila?.extra ? { extra: true } : {}),
                 llego: llego,
                 precio_real: precio,
