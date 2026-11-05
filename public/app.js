@@ -9008,7 +9008,9 @@ const Precios = {
             await API.savePreciosCliente({
                 fecha: AppState.currentDate,
                 comision_por_unidad: this.comisionPorUnidad,
-                items: items
+                // La cantidad no se edita acá: la fija el armado de la lista. Mandar la de esta pantalla
+                // pisaba la cantidad nueva con la que tenía una pantalla vieja.
+                items: items.map(({ cantidad, ...resto }) => resto)
             });
             CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
         }, async (error) => {
