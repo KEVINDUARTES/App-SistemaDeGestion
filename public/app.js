@@ -6753,6 +6753,21 @@ const Recepcion = {
         return asignadas;
     },
 
+    // Una fila agregada con "+ Proveedor" queda escondida si después los pedidos pasan a ese mismo
+    // proveedor, y la lista de precios dejaba de contar ese producto (no se le cobraba al cliente).
+    // Si para un proveedor de los pedidos solo hay una fila "extra", esa fila pasa a ser la suya.
+    _extrasComoPropias(filas, proveedores) {
+        const esExtra = r => r.extra === true || r.extra === 'true';
+        return filas.map(f => {
+            if (!esExtra(f)) return f;
+            const prov = String(f.proveedor_id || '');
+            if (!proveedores.includes(prov)) return f;
+            const hayPropia = filas.some(o => o !== f && !esExtra(o) && String(o.proveedor_id || '') === prov);
+            const otraExtraAntes = filas.some(o => o !== f && esExtra(o) && String(o.proveedor_id || '') === prov && filas.indexOf(o) < filas.indexOf(f));
+            return hayPropia || otraExtraAntes ? f : { ...f, extra: false };
+        });
+    },
+
     // Todas las filas de un producto juntas (para las pantallas que miran el producto entero):
     // lo que llegó se suma, el precio es el promedio ponderado y está confirmado si lo están todas.
     agregadoDe(filas, productoId) {
@@ -7137,7 +7152,7 @@ const Recepcion = {
                 const producto = this.findById(productos, productoId);
                 const proveedoresDelProducto = Object.keys(pedidoInfo.porProveedor)
                     .sort((a, b) => pedidoInfo.porProveedor[b] - pedidoInfo.porProveedor[a]);
-                const filasGuardadas = recepciones.filter(r => String(r.producto_id) === String(productoId));
+                const filasGuardadas = this._extrasComoPropias(recepciones.filter(r => String(r.producto_id) === String(productoId)), proveedoresDelProducto);
                 const esExtra = r => r.extra === true || r.extra === 'true';
                 const asignadas = this._asignarFilas(filasGuardadas.filter(r => !esExtra(r)), proveedoresDelProducto);
                 // Proveedores agregados a mano para este producto (la mercadería vino de más de uno).
@@ -8804,7 +8819,7 @@ const Precios = {
                 porProveedor[prov].push(pedido);
             });
             let proveedoresDelProducto = Object.keys(porProveedor);
-            const filasProducto = (recepciones || []).filter(r => String(r.producto_id) === String(productoId));
+            const filasProducto = Recepcion._extrasComoPropias((recepciones || []).filter(r => String(r.producto_id) === String(productoId)), proveedoresDelProducto);
             const esExtra = r => r.extra === true || r.extra === 'true';
             let asignadas;
             if (filasProducto.some(esExtra)) {
