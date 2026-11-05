@@ -2528,6 +2528,7 @@ const Navigation = {
             historial: 'Historial de días',
             reparto: 'Repartir efectivo',
             caja: 'Caja',
+            'links-clientes': 'Links para clientes',
             mantenimiento: 'Limpiar datos'
         };
         document.getElementById('page-title').textContent = titles[requested] || 'Dashboard';
@@ -2596,6 +2597,9 @@ const Navigation = {
                     break;
                 case 'reparto':
                     await Reparto.load();
+                    break;
+                case 'links-clientes':
+                    await LinksClientes.load();
                     break;
             }
         } catch (error) {
@@ -13215,6 +13219,149 @@ const Stock = {
 };
 
 // Historial
+// Links para clientes — cada cliente pide desde su propio link (pedir.html), sin usuario ni contraseña.
+const LinksClientes = {
+    datos: null,
+
+    urlDe(token) {
+        return `${location.origin}/pedir.html?l=${encodeURIComponent(token)}`;
+    },
+
+    async load() {
+        const tbody = document.getElementById('links-clientes-tbody');
+        if (!tbody) return;
+        if (!this._listo) {
+            this._listo = true;
+            document.getElementById('links-clientes').addEventListener('click', e => this._click(e));
+        }
+        if (!this.datos) Utils.showTableLoader(tbody);
+        try {
+            this._aplicar(await API.request('links-clientes', 'GET'));
+        } catch (error) {
+            console.error('Error cargando links de clientes:', error);
+            Utils.hideTableLoader(tbody);
+            Utils.showError('No se pudieron cargar los links: ' + (error && error.message || ''));
+        }
+    },
+
+    _aplicar(datos) {
+        this.datos = datos;
+        this.render();
+    },
+
+    render() {
+        const tbody = document.getElementById('links-clientes-tbody');
+        const config = document.getElementById('links-config');
+        if (!tbody || !config || !this.datos) return;
+        Utils.hideTableLoader(tbody);
+        const c = this.datos.config;
+        config.innerHTML = `
+            <label class="links-check"><input type="checkbox" id="links-activo"${c.activo ? ' checked' : ''}> Recibir pedidos por link</label>
+            <label>Hora de corte<input type="time" id="links-corte" value="${Utils.esc(c.corte)}"></label>
+            <label>Los clientes piden para
+                <select id="links-dia">
+                    <option value="manana"${c.dia === 'manana' ? ' selected' : ''}>mañana</option>
+                    <option value="hoy"${c.dia === 'hoy' ? ' selected' : ''}>hoy</option>
+                </select>
+            </label>
+            <button type="button" class="btn btn-primary" data-links="config">Guardar</button>`;
+
+        const clientes = this.datos.clientes || [];
+        if (!clientes.length) {
+            tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No hay clientes cargados</td></tr>';
+            return;
+        }
+        tbody.innerHTML = clientes.map(cli => {
+            const id = Utils.esc(cli.id);
+            if (!cli.token) {
+                return `<tr><td>${Utils.esc(cli.nombre)}</td><td class="links-sin">Todavía no tiene link</td>
+                    <td><button type="button" class="btn btn-primary btn-sm" data-links="generar" data-id="${id}">Generar link</button></td></tr>`;
+            }
+            return `<tr><td>${Utils.esc(cli.nombre)}</td>
+                <td class="links-url">${Utils.esc(this.urlDe(cli.token))}</td>
+                <td><div class="links-botones">
+                    <button type="button" class="btn btn-primary btn-sm" data-links="copiar" data-id="${id}">Copiar</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-links="whatsapp" data-id="${id}">WhatsApp</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-links="nuevo" data-id="${id}">Link nuevo</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-links="quitar" data-id="${id}">Desactivar</button>
+                </div></td></tr>`;
+        }).join('');
+    },
+
+    _cliente(id) {
+        return (this.datos?.clientes || []).find(c => String(c.id) === String(id));
+    },
+
+    async _click(e) {
+        const boton = e.target.closest('[data-links], #btn-links-generar-todos');
+        if (!boton || boton.disabled) return;
+        const accion = boton.id === 'btn-links-generar-todos' ? 'todos' : boton.dataset.links;
+        const cli = this._cliente(boton.dataset.id);
+        try {
+            if (accion === 'copiar') return await this._copiar(cli);
+            if (accion === 'whatsapp') return this._whatsapp(cli);
+            if (accion === 'config') {
+                const activo = document.getElementById('links-activo').checked;
+                const corte = document.getElementById('links-corte').value;
+                if (!corte) return Utils.showError('Poné la hora de corte.');
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/config', 'POST', {
+                        activo, corte, dia: document.getElementById('links-dia').value
+                    }));
+                }, 'Guardando...');
+                return Utils.avisar('Configuración guardada');
+            }
+            if (accion === 'todos') {
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/generar-todos', 'POST', {}));
+                }, 'Generando...');
+                return Utils.avisar('Links generados');
+            }
+            if (!cli) return;
+            if (accion === 'generar') {
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/generar', 'POST', { cliente_id: cli.id }));
+                }, 'Generando...');
+                return;
+            }
+            if (accion === 'nuevo') {
+                if (!await Utils.showConfirm(`¿Generar un link nuevo para "${cli.nombre}"?\n\nEl link anterior deja de funcionar y hay que pasarle el nuevo.`)) return;
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/generar', 'POST', { cliente_id: cli.id, regenerar: true }));
+                }, 'Generando...');
+                return Utils.avisar('Link nuevo generado');
+            }
+            if (accion === 'quitar') {
+                if (!await Utils.showConfirm(`¿Desactivar el link de "${cli.nombre}"?\n\nDeja de funcionar. Podés generar otro cuando quieras.`)) return;
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/desactivar', 'POST', { cliente_id: cli.id }));
+                }, 'Desactivando...');
+            }
+        } catch (error) {
+            Utils.showError('No se pudo completar: ' + (error && error.message || ''));
+        }
+    },
+
+    async _copiar(cli) {
+        if (!cli || !cli.token) return;
+        const url = this.urlDe(cli.token);
+        try {
+            await navigator.clipboard.writeText(url);
+            Utils.avisar(`Link de ${cli.nombre} copiado`);
+        } catch (error) {
+            window.prompt('Copiá el link:', url);
+        }
+    },
+
+    _whatsapp(cli) {
+        if (!cli || !cli.token) return;
+        const texto = `Hola ${cli.nombre}! Este es tu link para hacer el pedido: ${this.urlDe(cli.token)}`;
+        let tel = String(cli.telefono || '').replace(/\D/g, '').replace(/^00/, '').replace(/^0/, '');
+        if (tel && tel.length >= 10 && tel.length <= 11 && !tel.startsWith('54')) tel = '54' + tel;
+        window.open(`https://wa.me/${tel}?text=${encodeURIComponent(texto)}`, '_blank', 'noopener');
+    }
+};
+
 // Mantenimiento — reset completo de datos
 const Mantenimiento = {
     CONFIRM_PHRASE: 'BORRAR TODO',

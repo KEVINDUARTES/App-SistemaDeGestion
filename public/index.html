@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261102preciosperm">
+    <link rel="stylesheet" href="styles.css?v=20261104links">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -152,6 +152,7 @@
                     <li><a href="#" data-page="proveedores" class="nav-link">Proveedores</a></li>
                     <li><a href="#" data-page="productos" class="nav-link">Productos</a></li>
                     <li><a href="#" data-page="stock" class="nav-link">Stock</a></li>
+                    <li><a href="#" data-page="links-clientes" class="nav-link">Links para clientes</a></li>
                     <li><a href="#" data-page="mantenimiento" class="nav-link nav-link-danger">Limpiar datos</a></li>
                 </ul>
             </li>
@@ -749,6 +750,30 @@
             </div>
         </div>
 
+        <!-- Links para clientes -->
+        <div id="links-clientes" class="page">
+            <div class="page-header">
+                <h2>Links para clientes</h2>
+            </div>
+            <p class="links-ayuda">Cada cliente tiene un link propio: lo abre en el celular, elige lo que necesita y el pedido entra solo en la planilla de Pedidos. No ve precios ni a otros clientes.</p>
+            <div class="links-config" id="links-config"></div>
+            <div class="page-actions links-acciones">
+                <button class="btn btn-primary" id="btn-links-generar-todos">Generar links de todos</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Link</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="links-clientes-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+
         <!-- Mantenimiento / Limpiar datos -->
         <div id="mantenimiento" class="page">
             <div class="page-header">
@@ -909,7 +934,7 @@
     <script src="services/whatsapp.js?v=20261030ext2"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261103planilla"></script>
+    <script src="app.js?v=20261104links"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

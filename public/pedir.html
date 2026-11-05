@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Hacer pedido</title>
+    <style>
+        :root {
+            --bg: #E9EDF5; --surface: #FFFFFF; --soft: #F1F4FA; --ink: #101A2E; --muted: #55627A; --line: #D0D8E6;
+            --brand: #1B2F5E; --on-brand: #FFFFFF; --warn: #B4531A; --warn-bg: #FBEBDD; --ok-bg: #DDE5F5;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0A1020; --surface: #121B30; --soft: #18233D; --ink: #E5EAF5; --muted: #9AA8C4; --line: #27355A;
+                --brand: #6C8CE0; --on-brand: #08102A; --warn: #EE9559; --warn-bg: #3A2616; --ok-bg: #1B2A52;
+            }
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; height: 100%; }
+        body {
+            background: var(--bg); color: var(--ink);
+            font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .app { max-width: 520px; margin: 0 auto; min-height: 100%; display: flex; flex-direction: column; background: var(--surface); }
+        header { padding: 18px 16px 12px; }
+        .marca { font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--brand); }
+        h1 { font-size: 24px; margin: 2px 0 0; line-height: 1.2; }
+        .dia { margin: 12px 0 0; background: var(--soft); border-radius: 12px; padding: 10px 12px; }
+        .dia b { display: block; }
+        .dia em { font-style: normal; color: var(--warn); font-size: 14px; font-weight: 600; }
+        .aviso { margin: 12px 0 0; padding: 10px 12px; border-radius: 12px; background: var(--warn-bg); color: var(--warn); font-weight: 600; }
+        .buscar {
+            width: 100%; margin-top: 12px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 12px;
+            background: var(--surface); color: var(--ink); font: inherit;
+        }
+        main { flex: 1; padding: 0 16px 8px; }
+        .grupo { font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 18px 0 4px; }
+        .fila { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+        .fila .nombre { min-width: 0; }
+        .fila .nombre b { display: block; font-weight: 600; overflow-wrap: anywhere; }
+        .fila .nombre span { color: var(--muted); font-size: 12px; }
+        .cant { display: flex; align-items: center; gap: 6px; flex: none; }
+        .cant button {
+            width: 38px; height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface);
+            color: var(--ink); font-size: 20px; line-height: 1; cursor: pointer;
+        }
+        .cant button:disabled { opacity: .4; cursor: default; }
+        .cant input {
+            width: 56px; height: 38px; text-align: center; border: 1px solid var(--line); border-radius: 10px;
+            background: var(--surface); color: var(--ink); font: 700 16px inherit; font-variant-numeric: tabular-nums;
+        }
+        .cant input:disabled { background: var(--soft); }
+        .cant.tiene input { color: var(--brand); border-color: var(--brand); }
+        footer {
+            position: sticky; bottom: 0; padding: 10px 16px calc(14px + env(safe-area-inset-bottom, 0px));
+            background: var(--surface); border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px;
+        }
+        footer small { text-align: center; color: var(--muted); }
+        .boton {
+            width: 100%; padding: 13px; border-radius: 12px; border: 1px solid var(--brand); background: var(--brand);
+            color: var(--on-brand); font: 700 16px inherit; cursor: pointer;
+        }
+        .boton:disabled { opacity: .5; cursor: default; }
+        .boton.suave { background: var(--surface); color: var(--ink); border-color: var(--line); }
+        .centro { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 28px; text-align: center; }
+        .centro .tilde { width: 64px; height: 64px; border-radius: 50%; background: var(--ok-bg); color: var(--brand); display: grid; place-items: center; font: 700 32px inherit; }
+        .centro h2 { margin: 0; font-size: 24px; }
+        .centro p { margin: 0; color: var(--muted); }
+        .centro .boton { max-width: 320px; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+<div class="app">
+    <div class="centro" id="cargando"><p>Cargando…</p></div>
+
+    <div class="centro" id="error" hidden>
+        <h2>No se pudo abrir</h2>
+        <p id="error-texto"></p>
+        <button class="boton suave" id="reintentar" type="button">Reintentar</button>
+    </div>
+
+    <div id="pedido" hidden style="display:flex;flex-direction:column;flex:1">
+        <header>
+            <div class="marca">Luciano Cargas</div>
+            <h1 id="titulo"></h1>
+            <div class="dia"><span>Para</span><b id="fecha"></b><em id="corte"></em></div>
+            <div class="aviso" id="aviso" hidden></div>
+            <input class="buscar" id="buscar" type="search" placeholder="Buscar producto" aria-label="Buscar producto" autocomplete="off">
+        </header>
+        <main id="lista"></main>
+        <footer>
+            <button class="boton" id="enviar" type="button" disabled>Elegí lo que necesitás</button>
+            <small id="pie"></small>
+        </footer>
+    </div>
+
+    <div class="centro" id="hecho" hidden>
+        <div class="tilde" aria-hidden="true">✓</div>
+        <h2>Pedido enviado</h2>
+        <p id="hecho-texto"></p>
+        <button class="boton suave" id="modificar" type="button">Modificar pedido</button>
+    </div>
+</div>
+<script src="pedir.js"></script>
+</body>
+</html>

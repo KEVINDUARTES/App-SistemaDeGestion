@@ -92,6 +92,7 @@ function versionYCambios_(desde) {
 
 /** Qué parte de los datos toca una escritura: un día de pedidos ('dia:AAAA-MM-DD') o todo. */
 function alcanceDeEscritura_(endpoint, data) {
+  if (endpoint === 'pedido-link/guardar') return 'dia:' + (_alcanceLink || '*');
   if (endpoint === 'pedidos/celdas' || endpoint === 'pedidos/celda' || endpoint === 'pedidos/proveedor-producto' ||
       endpoint === 'pedidos/eliminar-producto' || endpoint === 'pedidos/marcar-enviados' || endpoint === 'pedidos' ||
       endpoint === 'pedidos/update' || endpoint === 'pedidos/delete' || endpoint === 'camiones') {
@@ -107,6 +108,9 @@ const SESION_DURACION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Usuario y hoja con los que corre esta ejecución. */
 let _tenant = null;
+/** Cliente al que pertenece el link con el que entró esta ejecución (pedidos por link) y día que tocó. */
+let _linkActual = null;
+let _alcanceLink = null;
 
 function usuarioConfig_(email) {
   var u = CONFIG.USERS[email];
@@ -295,8 +299,11 @@ function handleRequest(e, method) {
       return createResponse({ success: false, error: 'Endpoint no especificado' }, 400, callback);
     }
 
-    // Todo, salvo el login, es de un usuario identificado: cada uno ve solo su hoja.
-    if (endpoint !== 'login') {
+    // Los pedidos por link entran con el código del link del cliente (no hay sesión): ese código dice
+    // de qué hoja y de qué cliente es, y solo permite ver y cambiar el pedido de ese cliente.
+    if (endpoint.indexOf('pedido-link/') === 0) {
+      _linkActual = resolverLinkCliente_(e.parameter['link']);
+    } else if (endpoint !== 'login') {
       let tokenSesion = e.parameter['token'];
       if (!tokenSesion && e.postData) {
         try { tokenSesion = JSON.parse(e.postData.contents).token; } catch (err) { /* sin token */ }
@@ -492,6 +499,36 @@ function handleRequest(e, method) {
       
       case 'pedidos/marcar-enviados-por-ids':
         result = marcarPedidosEnviadosPorIds(data.pedidosIds);
+        break;
+
+      // Links para clientes (administración: con sesión)
+      case 'links-clientes':
+        result = linksClientesListar_();
+        break;
+
+      case 'links-clientes/generar':
+        result = linksClientesGenerar_(data);
+        break;
+
+      case 'links-clientes/generar-todos':
+        result = linksClientesGenerarTodos_();
+        break;
+
+      case 'links-clientes/desactivar':
+        result = linksClientesDesactivar_(data);
+        break;
+
+      case 'links-clientes/config':
+        result = linksClientesGuardarConfig_(data);
+        break;
+
+      // Pedidos por link (el cliente, sin sesión)
+      case 'pedido-link/info':
+        result = pedidoLinkInfo_();
+        break;
+
+      case 'pedido-link/guardar':
+        result = pedidoLinkGuardar_(data);
         break;
 
       case 'camiones':
@@ -2545,6 +2582,8 @@ function guardarCeldasPedido(data) {
   assertDiaAbierto_(fecha);
 
   var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  // De dónde vino el pedido ('link' = lo cargó el cliente por su link); solo se agrega la columna si hace falta.
+  if (celdas.some(function(c) { return c.origen; })) ensureColumn(sheet, 'origen');
   var values = readUsedValues_(sheet);
   // La columna del proveedor casi siempre existe: solo si falta se agrega y se vuelve a leer.
   if (!values[0] || values[0].indexOf('proveedor_id') === -1) {
@@ -2609,6 +2648,7 @@ function guardarCeldasPedido(data) {
         poner('cantidad', cantidad);
         poner('enviado', false);
         poner('proveedor_id', c.proveedor_id || '');
+        if (c.origen) poner('origen', c.origen);
         agregar.push(nueva);
         var ped = {};
         headers.forEach(function(h, x) { ped[h] = nueva[x]; });
@@ -5897,6 +5937,262 @@ function getTopProductosVendidos(dias = 7, limite = 5) {
     Logger.log('❌ Error en getTopProductosVendidos: ' + error.toString());
     throw error;
   }
+}
+
+// ========== LINKS PARA CLIENTES ==========
+// Cada cliente tiene un link propio con un código largo que no se puede adivinar: "<hoja>.<código>".
+// El código se guarda en la columna link_token de Clientes; borrarlo (o generar otro) deja sin efecto el
+// link anterior. Sin sesión, ese código es lo único que identifica a quien abre el link: solo permite
+// ver los productos, y ver y cambiar el pedido de ESE cliente (nunca precios, saldos ni otros clientes).
+
+var MENSAJE_LINK_INVALIDO_ = 'Este link ya no es válido. Pedile uno nuevo al equipo.';
+
+function configLinkClientes_() {
+  var c = getConfiguracionNotificaciones();
+  var min = parseInt(c.link_clientes_corte_min, 10);
+  if (!isFinite(min) || min < 0 || min > 1439) min = 18 * 60;
+  return {
+    activo: c.link_clientes_activo === true,
+    corte_min: min,
+    dia: c.link_clientes_dia === 'hoy' ? 'hoy' : 'manana'
+  };
+}
+
+function horaTexto_(min) {
+  return ('0' + Math.floor(min / 60)).slice(-2) + ':' + ('0' + (min % 60)).slice(-2);
+}
+
+function minutosAhoraAR_() {
+  var hm = Utilities.formatDate(new Date(), 'America/Argentina/Buenos_Aires', 'HH:mm').split(':');
+  return Number(hm[0]) * 60 + Number(hm[1]);
+}
+
+/** Día para el que piden los clientes: hoy o mañana (fecha de Argentina). */
+function fechaDiaLink_(dia) {
+  var hoy = todayArgentina();
+  if (dia === 'hoy') return hoy;
+  var p = hoy.split('-');
+  return Utilities.formatDate(new Date(Date.UTC(Number(p[0]), Number(p[1]) - 1, Number(p[2]) + 1)), 'UTC', 'yyyy-MM-dd');
+}
+
+/** Si el link está recibiendo pedidos ahora y para qué día. */
+function estadoLinkClientes_() {
+  var cfg = configLinkClientes_();
+  var fecha = fechaDiaLink_(cfg.dia);
+  var estado = { fecha: fecha, corte: horaTexto_(cfg.corte_min), abierto: true, motivo: '' };
+  if (!cfg.activo) {
+    estado.abierto = false;
+    estado.motivo = 'apagado';
+  } else {
+    var cierre = findCierreRow(fecha);
+    if (cierre.row && cierre.estado === 'cerrado') {
+      estado.abierto = false;
+      estado.motivo = 'dia_cerrado';
+    } else if (minutosAhoraAR_() >= cfg.corte_min) {
+      estado.abierto = false;
+      estado.motivo = 'corte';
+    }
+  }
+  estado.mensaje = mensajeEstadoLink_(estado);
+  return estado;
+}
+
+function mensajeEstadoLink_(estado) {
+  if (estado.motivo === 'apagado') return 'Por ahora no se reciben pedidos por este link.';
+  if (estado.motivo === 'dia_cerrado') return 'Ese día ya está cerrado.';
+  if (estado.motivo === 'corte') return 'Ya pasó la hora de corte (' + estado.corte + ').';
+  return '';
+}
+
+/** Email de un usuario cuya hoja empieza con esa clave (sin crear hojas nuevas). */
+function emailDeHoja_(clave) {
+  var props = PropertiesService.getScriptProperties();
+  var emails = Object.keys(CONFIG.USERS);
+  for (var i = 0; i < emails.length; i++) {
+    var cfg = usuarioConfig_(emails[i]);
+    var id = (cfg && cfg.spreadsheetId) || props.getProperty('SS_ID_' + emails[i]);
+    if (id && String(id).substring(0, 16) === clave) return emails[i];
+  }
+  return null;
+}
+
+/** Deja la ejecución trabajando para la hoja del link y devuelve { cliente }; si no vale, falla. */
+function resolverLinkCliente_(link) {
+  var texto = String(link === undefined || link === null ? '' : link);
+  var punto = texto.indexOf('.');
+  var codigo = punto > 0 ? texto.substring(punto + 1) : '';
+  if (!/^k[0-9a-f]{31}$/.test(codigo)) throw new Error(MENSAJE_LINK_INVALIDO_);
+  var email = emailDeHoja_(texto.substring(0, punto));
+  if (!email) throw new Error(MENSAJE_LINK_INVALIDO_);
+  setTenant_(email);
+  var cliente = getClientes().filter(function(c) { return String(c.link_token || '') === codigo; })[0];
+  if (!cliente || parseActivoValue(cliente.activo) === false) throw new Error(MENSAJE_LINK_INVALIDO_);
+  return { cliente: cliente };
+}
+
+function nuevoCodigoLink_() {
+  return 'k' + (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '').substring(0, 31);
+}
+
+function invalidarClientes_() {
+  invalidateSheetCache(CONFIG.SHEETS.CLIENTES);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.CLIENTES);
+}
+
+/** Config y clientes con su link (si ya lo tienen). Es lo que ve el equipo en Configuración. */
+function linksClientesListar_() {
+  var cfg = configLinkClientes_();
+  var clave = tenantClave_();
+  var clientes = getClientes().filter(function(c) { return parseActivoValue(c.activo) !== false; }).map(function(c) {
+    return {
+      id: c.id,
+      nombre: c.nombre,
+      telefono: c.telefono || '',
+      token: c.link_token ? clave + '.' + c.link_token : ''
+    };
+  });
+  return { config: { activo: cfg.activo, corte: horaTexto_(cfg.corte_min), dia: cfg.dia }, clientes: clientes };
+}
+
+/** Pone el código en la columna link_token de los clientes indicados: { id: código o '' }. */
+function escribirCodigosLink_(codigos) {
+  var sheet = getSheet(CONFIG.SHEETS.CLIENTES);
+  ensureColumn(sheet, 'link_token');
+  var values = readUsedValues_(sheet);
+  var headers = values[0] || [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var tokenIdx = headers.indexOf('link_token');
+  var columna = [];
+  var cambios = 0;
+  for (var i = 1; i < values.length; i++) {
+    var id = String(values[i][idIdx]);
+    var actual = values[i].length > tokenIdx ? values[i][tokenIdx] : '';
+    if (Object.prototype.hasOwnProperty.call(codigos, id)) {
+      actual = codigos[id];
+      cambios++;
+    }
+    columna.push([actual]);
+  }
+  if (!columna.length || !cambios) return 0;
+  sheet.getRange(2, tokenIdx + 1, columna.length, 1).setNumberFormat('@').setValues(columna);
+  invalidarClientes_();
+  return cambios;
+}
+
+function clienteExiste_(id) {
+  var cliente = findInIdMap(getClientesMap(), id);
+  if (!cliente) throw new Error('Ese cliente no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  return cliente;
+}
+
+/** Genera el link de un cliente. Si ya tenía y no se pide uno nuevo, queda el mismo. */
+function linksClientesGenerar_(data) {
+  if (!data || !data.cliente_id) throw new Error('Elegí el cliente');
+  var cliente = clienteExiste_(data.cliente_id);
+  var nuevo = data.regenerar === true || !cliente.link_token;
+  if (nuevo) {
+    var codigos = {};
+    codigos[String(cliente.id)] = nuevoCodigoLink_();
+    escribirCodigosLink_(codigos);
+  }
+  return linksClientesListar_();
+}
+
+function linksClientesGenerarTodos_() {
+  var codigos = {};
+  getClientes().forEach(function(c) {
+    if (parseActivoValue(c.activo) === false || c.link_token) return;
+    codigos[String(c.id)] = nuevoCodigoLink_();
+  });
+  escribirCodigosLink_(codigos);
+  return linksClientesListar_();
+}
+
+function linksClientesDesactivar_(data) {
+  if (!data || !data.cliente_id) throw new Error('Elegí el cliente');
+  var cliente = clienteExiste_(data.cliente_id);
+  var codigos = {};
+  codigos[String(cliente.id)] = '';
+  escribirCodigosLink_(codigos);
+  return linksClientesListar_();
+}
+
+function linksClientesGuardarConfig_(data) {
+  var cambios = {};
+  if (data.activo !== undefined) cambios.link_clientes_activo = data.activo === true;
+  if (data.corte !== undefined) {
+    var m = /^(\d{1,2}):(\d{2})$/.exec(String(data.corte).trim());
+    if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) throw new Error('La hora de corte tiene que ser como 18:00');
+    cambios.link_clientes_corte_min = Number(m[1]) * 60 + Number(m[2]);
+  }
+  if (data.dia !== undefined) {
+    if (data.dia !== 'hoy' && data.dia !== 'manana') throw new Error('El día de los pedidos tiene que ser hoy o mañana');
+    cambios.link_clientes_dia = data.dia;
+  }
+  if (Object.keys(cambios).length) saveConfiguracionNotificaciones(cambios);
+  return linksClientesListar_();
+}
+
+/** Lo que ve el cliente al abrir su link: sus datos mínimos, los productos y lo que ya pidió. */
+function pedidoLinkInfo_() {
+  var cliente = _linkActual.cliente;
+  var estado = estadoLinkClientes_();
+  var cantidades = {};
+  getPedidos(estado.fecha).forEach(function(p) {
+    if (!idsMatch(p.cliente_id, cliente.id)) return;
+    cantidades[p.producto_id] = Math.round(((cantidades[p.producto_id] || 0) + (Number(p.cantidad) || 0)) * 100) / 100;
+  });
+  var productos = getProductos().map(function(p) {
+    return {
+      id: p.id,
+      nombre: p.nombre,
+      tipo: p.tipo || '',
+      unidad: p.unidad || '',
+      por_kilo: p.por_kilo === true || p.por_kilo === 'true'
+    };
+  });
+  return {
+    cliente: { nombre: cliente.nombre },
+    fecha: estado.fecha,
+    abierto: estado.abierto,
+    motivo: estado.motivo,
+    mensaje: estado.mensaje,
+    corte: estado.corte,
+    productos: productos,
+    cantidades: cantidades
+  };
+}
+
+/** Guarda lo que el cliente cambió: solo las cantidades de SU pedido, y solo mientras el link está abierto. */
+function pedidoLinkGuardar_(data) {
+  var estado = estadoLinkClientes_();
+  if (!estado.abierto) throw new Error(estado.mensaje);
+  var items = data.items;
+  if (typeof items === 'string') items = JSON.parse(items);
+  if (!Array.isArray(items) || !items.length) throw new Error('No hay nada para guardar');
+  if (items.length > 60) throw new Error('Son demasiados productos juntos');
+
+  var productos = getProductosMap();
+  var celdas = items.map(function(item) {
+    var producto = findInIdMap(productos, item && item.producto_id);
+    if (!producto) throw new Error('Un producto ya no está disponible. Actualizá la página.');
+    var n = Number(String(item.cantidad === undefined || item.cantidad === null ? '' : item.cantidad).replace(',', '.'));
+    if (!isFinite(n) || n < 0 || n > 9999) throw new Error('Una cantidad no es válida');
+    var porKilo = producto.por_kilo === true || producto.por_kilo === 'true';
+    return {
+      cliente_id: _linkActual.cliente.id,
+      producto_id: producto.id,
+      cantidad: porKilo ? Math.round(n * 100) / 100 : Math.round(n),
+      tipo: producto.tipo || '',
+      proveedor_id: producto.proveedor_default || '',
+      origen: 'link'
+    };
+  });
+  var res = guardarCeldasPedido({ fecha: estado.fecha, celdas: celdas });
+  _alcanceLink = estado.fecha;
+  var falla = (res.resultados || []).filter(function(r) { return r.error; })[0];
+  if (falla) throw new Error(falla.error);
+  return { fecha: estado.fecha, guardados: celdas.length };
 }
 
 /**

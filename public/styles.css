@@ -4097,3 +4097,15 @@ html {
 
 .filtro-tabla { margin: 0 0 12px; }
 .filtro-tabla input { width: 100%; max-width: 360px; }
+
+
+/* Links para clientes */
+.links-ayuda { color: #56665c; margin: 0 0 14px; max-width: 70ch; }
+.links-config { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-end; background: #fff; border: 1px solid #d9dee3; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.links-config label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #56665c; }
+.links-config label.links-check { flex-direction: row; align-items: center; gap: 8px; font-size: 15px; color: inherit; font-weight: 600; }
+.links-config input[type="time"], .links-config select { padding: 7px 9px; border: 1px solid #ccd3d9; border-radius: 8px; font: inherit; }
+.links-acciones { margin-bottom: 12px; }
+.links-url { font-size: 12px; color: #56665c; word-break: break-all; max-width: 380px; }
+.links-sin { color: #8a949c; }
+.links-botones { display: flex; flex-wrap: wrap; gap: 6px; }
