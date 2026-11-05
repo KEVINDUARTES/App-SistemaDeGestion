@@ -8258,7 +8258,11 @@ const Precios = {
         const realesInputs = {};
         document.querySelectorAll('.precio-real').forEach(input => {
             const id = input.getAttribute('data-id');
-            if (id) realesInputs[id] = Utils.parsePrice((input.value || '').trim()) || 0;
+            if (!id) return;
+            const valor = Utils.parsePrice((input.value || '').trim()) || 0;
+            // Si sigue el costo que se rellenó solo (data-auto), no es un cambio a mano: así, si la
+            // recepción se corrigió después, la línea toma el costo nuevo en vez de congelar el viejo.
+            realesInputs[id] = valor === (Number(input.dataset.auto) || 0) ? 0 : valor;
         });
         const preciosInputs = {};
         document.querySelectorAll('.precio-cliente').forEach(input => {
@@ -8663,7 +8667,9 @@ const Precios = {
             const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
             const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
             const inputReal = tr.querySelector('.precio-real');
-            const precioRealLinea = inputReal ? (Utils.parsePrice(inputReal.value) || 0) : 0;
+            const valorReal = inputReal ? (Utils.parsePrice(inputReal.value) || 0) : 0;
+            // El costo rellenado solo no cuenta como cambio a mano (ver render).
+            const precioRealLinea = inputReal && valorReal === (Number(inputReal.dataset.auto) || 0) ? 0 : valorReal;
             const precioRealEditado = precioRealLinea > 0 && precioRealLinea !== precioRealRecepcion;
             precio.precio_real = precioRealEditado ? precioRealLinea : 0;
             if (inputReal) inputReal.classList.toggle('precio-real-editado', precioRealEditado);
