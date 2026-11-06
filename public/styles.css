@@ -4082,8 +4082,8 @@ html {
 .recepcion-cli-nombre { font-weight: 600; color: #1e293b; }
 .recepcion-cli-pidio { color: #64748b; font-size: 12px; }
 .recepcion-cli input { width: 72px; padding: 4px 6px; text-align: center; }
-.recepcion-corto,
-.recepcion-corto:disabled { border-color: #dc2626 !important; background: #fee2e2 !important; color: #991b1b !important; font-weight: 700; }
+.recepcion-distinto,
+.recepcion-distinto:disabled { border-color: #dc2626 !important; background: #fee2e2 !important; color: #991b1b !important; font-weight: 700; }
 .recepcion-cli-modal { display: flex; flex-direction: column; gap: 6px; }
 .recepcion-cli-modal .recepcion-cli { justify-content: space-between; }
 
