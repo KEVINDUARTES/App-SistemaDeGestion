@@ -612,6 +612,10 @@ function handleRequest(e, method) {
         result = cobrarClienteHoy(data);
         break;
 
+      case 'cobranzas/deshacer-pago':
+        result = deshacerPagoCobranza(data);
+        break;
+
       case 'cobranzas/ajustar-cobro':
         result = ajustarCobroClienteHoy(data);
         break;
@@ -4206,6 +4210,81 @@ function registrarCobro(data) {
     invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
     invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
     return { success: true, pagado: nuevoPagado, saldo: nuevoSaldo, medios: previos, a_favor: exceso };
+  }
+
+  throw new Error('Cobranza no encontrada');
+}
+
+/**
+ * Deshace (todo o una parte de) lo cobrado sobre una cobranza, por medio de pago.
+ * data: { cobranza_id, medios: { efectivo, transferencia, ... } con lo que se quiere deshacer }
+ * La plata que salió de la caja queda anotada como egreso de hoy ("Pago deshecho"); no se borra nada del historial.
+ */
+function deshacerPagoCobranza(data) {
+  if (!data || !data.cobranza_id) throw new Error('cobranza_id es requerido');
+  var parsed = normalizarMedios_(data, METODOS_CLIENTE_);
+  if (parsed.total <= 0) throw new Error('Poné cuánto querés deshacer');
+
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  ensureCobranzasMediosColumn_(sheet);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var totalIdx = headers.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+  var pagadoIdx = headers.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+  var saldoIdx = headers.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
+  var estadoIdx = headers.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
+  var mediosIdx = headers.indexOf('medios');
+
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][idIdx], data.cobranza_id)) continue;
+    var pagado = normalizeAmount(values[i][pagadoIdx]);
+    var total = normalizeAmount(values[i][totalIdx]);
+    if (pagado <= 0.009) throw new Error('Esta cobranza no tiene pagos para deshacer');
+
+    var previos = parseMedios_(mediosIdx >= 0 ? values[i][mediosIdx] : '');
+    if (sumaMedios_(previos) <= 0.009) previos.efectivo = pagado;
+    METODOS_CLIENTE_.forEach(function(m) {
+      if (parsed.medios[m] > previos[m] + 0.01) {
+        throw new Error('No se puede deshacer más de lo que se pagó en ' + etiquetaMedio_(m).toLowerCase() + ' (' + formatPesos_(previos[m]) + ')');
+      }
+    });
+
+    var quitado = Math.min(parsed.total, pagado);
+    var nuevosMedios = mediosVacios_();
+    METODOS_CLIENTE_.forEach(function(m) {
+      nuevosMedios[m] = Math.max(0, Math.round((previos[m] - parsed.medios[m]) * 100) / 100);
+    });
+    var nuevoPagado = Math.max(0, Math.round((pagado - quitado) * 100) / 100);
+    var nuevoSaldo = Math.max(0, Math.round((total - nuevoPagado) * 100) / 100);
+    var estado = nuevoPagado <= 0.009 ? 'pendiente' : (nuevoSaldo <= 0.01 ? 'pagado' : 'parcial');
+
+    sheet.getRange(i + 1, pagadoIdx + 1).setValue(nuevoPagado);
+    sheet.getRange(i + 1, saldoIdx + 1).setValue(nuevoSaldo);
+    sheet.getRange(i + 1, estadoIdx + 1).setValue(estado);
+    if (mediosIdx >= 0) sheet.getRange(i + 1, mediosIdx + 1).setValue(JSON.stringify(nuevosMedios));
+
+    // Los depósitos cargados en la transferencia se descuentan desde el último.
+    var quitaTransf = parsed.medios.transferencia;
+    if (quitaTransf > 0.009) {
+      var depIdx = headers.indexOf('depositos');
+      if (depIdx >= 0 && values[i].length > depIdx) {
+        var deps = parseDepositos_(values[i][depIdx]);
+        var restante = quitaTransf;
+        for (var d = deps.length - 1; d >= 0 && restante > 0.009; d--) {
+          var sacar = Math.min(deps[d].monto, restante);
+          deps[d].monto = Math.round((deps[d].monto - sacar) * 100) / 100;
+          restante = Math.round((restante - sacar) * 100) / 100;
+        }
+        deps = deps.filter(function(dep) { return dep.monto > 0.009; });
+        sheet.getRange(i + 1, depIdx + 1).setValue(JSON.stringify(deps));
+      }
+    }
+
+    registrarCajaMedios_(todayArgentina(), 'egreso', parsed.medios, 'Pago deshecho', data.cobranza_id);
+    invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+    return { success: true, pagado: nuevoPagado, saldo: nuevoSaldo, estado: estado, medios: nuevosMedios };
   }
 
   throw new Error('Cobranza no encontrada');

@@ -2241,6 +2241,14 @@ const API = {
         return result;
     },
 
+    async deshacerPagoCobranza(data) {
+        const result = await this.request('cobranzas/deshacer-pago', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        return result;
+    },
+
     async cobrarClienteHoy(data) {
         const result = await this.request('cobranzas/cobrar-cliente', 'POST', data);
         CacheManager.invalidatePattern('cobranzas');
@@ -11184,11 +11192,14 @@ const DeudasPorFecha = {
             const boton = onclick
                 ? `<button class="btn btn-primary btn-sm" type="button" onclick="${onclick}">${Utils.esc(d.boton || 'Pagar')}</button>`
                 : '';
+            const deshacer = d.onclick2
+                ? `<button class="btn btn-secondary btn-sm" type="button" onclick="${d.onclick2}">${Utils.esc(d.boton2 || 'Deshacer')}</button>`
+                : '';
             const nota = d.nota ? `<small class="fila-nota">${Utils.esc(d.nota)}</small>` : '';
             return `<div class="deuda-fecha">
                 <span class="deuda-fecha-dia">${Utils.esc(rotulo)}${nota}</span>
                 <strong class="deuda-fecha-monto">${Utils.formatCurrency(Utils.parsePrice(d.saldo) || 0)}</strong>
-                ${boton}
+                ${boton}${deshacer}
             </div>`;
         }).join('');
         const favor = aFavor > 0.009 ? `<div class="deuda-total-ref">A favor: ${Utils.formatCurrency(aFavor)}</div>` : '';
@@ -11269,7 +11280,9 @@ const Cobranzas = {
                 saldo: Utils.getCobranzaSaldo(c),
                 nota: [cuenta.titular ? this._clienteDe(c).nombre : '', c.origen === 'manual' ? 'Deuda anterior' + (c.nota ? ' · ' + c.nota : '') : ''].filter(Boolean).join(' · '),
                 onclick: `Cobranzas.cobrar('${c.id}')`,
-                boton: 'Cobrar'
+                boton: 'Cobrar',
+                onclick2: (Utils.parsePrice(c.pagado) || 0) > 0.009 ? `Cobranzas.deshacerPago('${c.id}')` : '',
+                boton2: 'Deshacer pago'
             }));
             tr.innerHTML = `
                 <td data-label="Cliente">${Utils.esc(cuenta.titular || cliente.nombre || '')}</td>
@@ -11493,6 +11506,71 @@ const Cobranzas = {
         MediosPago.enganchar(saldo, { tope: false });
     },
     
+    // Saca lo cobrado por error: se elige cuánto deshacer en cada medio (por defecto, todo).
+    deshacerPago(cobranzaId) {
+        const cobranza = AppState.cobranzas.find(c => c.id === cobranzaId);
+        if (!cobranza) {
+            Utils.showError('Cobranza no encontrada');
+            return;
+        }
+        const nombre = this._clienteDe(cobranza).nombre || 'este cliente';
+        const pagadoTotal = Utils.parsePrice(cobranza.pagado) || 0;
+        let pagado = MediosPago.parse(cobranza.medios);
+        if (MediosPago.total(pagado) <= 0.009) pagado = Object.assign(MediosPago.vacio(), { efectivo: pagadoTotal });
+        const campos = MediosPago.deCliente.concat(MediosPago.historicos).filter(([id]) => pagado[id] > 0.009);
+        if (!campos.length) {
+            Utils.showInfo('Esta deuda no tiene pagos para deshacer.');
+            return;
+        }
+        const filas = campos.map(([id, label]) => `
+            <div class="form-group medios-campo">
+                <label for="deshacer-${id}">${label} (pagó ${Utils.formatCurrency(pagado[id])})</label>
+                <input type="text" id="deshacer-${id}" class="form-control deshacer-monto" data-medio="${id}" data-price-input="true" value="${Utils.formatPrice(pagado[id])}" placeholder="0" inputmode="numeric">
+            </div>`).join('');
+        const content = `
+            <p class="modal-hint">Deuda${cobranza.fecha ? ' del ' + Utils.formatDate(cobranza.fecha) : ''}: ya pagó <strong>${Utils.formatCurrency(pagadoTotal)}</strong>.
+            Poné cuánto querés deshacer en cada medio. Esa plata vuelve a figurar como deuda y en la Caja queda un egreso de hoy.</p>
+            ${filas}
+        `;
+        Utils.showModal('Deshacer pago de ' + nombre, content, async () => {
+            const medios = MediosPago.vacio();
+            let total = 0;
+            document.querySelectorAll('.deshacer-monto').forEach(input => {
+                const id = input.dataset.medio;
+                const monto = Utils.parsePrice(input.value) || 0;
+                if (monto - pagado[id] > 0.01) {
+                    Utils.showError('No podés deshacer más de lo que pagó en ' + id + '.');
+                    throw new Error('Monto mayor al pagado');
+                }
+                medios[id] = monto;
+                total += monto;
+            });
+            if (total <= 0.009) {
+                Utils.showError('Poné cuánto querés deshacer.');
+                throw new Error('Monto inválido');
+            }
+            const respaldo = {
+                pagado: cobranza.pagado, saldo: cobranza.saldo, estado: cobranza.estado,
+                medios: cobranza.medios, depositos: Array.isArray(cobranza.depositos) ? cobranza.depositos.slice() : []
+            };
+            const nuevoPagado = Math.max(0, Math.round((pagadoTotal - Math.min(total, pagadoTotal)) * 100) / 100);
+            cobranza.medios = MediosPago.vacio();
+            Object.keys(medios).forEach(id => { cobranza.medios[id] = Math.max(0, Math.round((pagado[id] - medios[id]) * 100) / 100); });
+            cobranza.pagado = nuevoPagado;
+            cobranza.saldo = Math.max(0, Math.round(((Utils.parsePrice(cobranza.total) || 0) - nuevoPagado) * 100) / 100);
+            cobranza.estado = nuevoPagado <= 0.009 ? 'pendiente' : 'parcial';
+            CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+            this.render();
+            Utils.avisar('Pago deshecho');
+            Utils.enSegundoPlano(() => API.deshacerPagoCobranza({ cobranza_id: cobranza.id, medios }), () => {
+                Object.assign(cobranza, respaldo);
+                CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+                this.render();
+                Utils.showError('No se pudo deshacer el pago. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Deshacer pago');
+    },
+
     async registrar() {
         const cobranzas = AppState.cobranzas.filter(c => Utils.isCobranzaPendiente(c));
         
@@ -11928,6 +12006,7 @@ const CobranzasHoy = {
             botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.editarCobro('${clienteId}')">Editar lo cobrado</button>`);
             botones.push(`<button type="button" class="btn btn-danger" onclick="CobranzasHoy.anularCobro('${clienteId}')">Eliminar cobro</button>`);
         }
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.deshacerPago('${clienteId}')">Deshacer pago</button>`);
 
         const content = `
             <div class="pedido-acciones-resumen">
@@ -12064,6 +12143,41 @@ const CobranzasHoy = {
         MediosPago.enganchar(total);
         Depositos.precargar(fila.depositos);
         if ((parseFloat(MediosPago.leer().medios.transferencia) || 0) > 0) Depositos.sync(MediosPago.leer().medios.transferencia);
+    },
+
+    // Deshace pagos hechos sobre las deudas que el cliente tiene pendientes (Cobranzas a clientes).
+    async deshacerPago(clienteId) {
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        let pendientes = [];
+        try {
+            const todas = await API.getCobranzas();
+            AppState.cobranzas = (Array.isArray(todas) ? todas : []).filter(c => Utils.isCobranzaPendiente(c));
+            const clave = Utils.cuentaDe(clienteId).clave;
+            pendientes = AppState.cobranzas
+                .filter(c => Utils.cuentaDe(c.cliente_id).clave === clave && (Utils.parsePrice(c.pagado) || 0) > 0.009)
+                .sort((a, b) => String(Utils.fechaIso(a.fecha) || '').localeCompare(String(Utils.fechaIso(b.fecha) || '')));
+        } catch (error) {
+            Utils.showError('No se pudieron cargar los pagos de este cliente. Probá de nuevo.');
+            return;
+        }
+        if (!pendientes.length) {
+            const fila = this._fila(clienteId);
+            Utils.showInfo((parseFloat(fila?.pagado) || 0) > 0
+                ? 'No hay pagos sobre deudas anteriores. Lo cobrado en este día se saca con "Eliminar cobro" o "Editar lo cobrado".'
+                : 'Este cliente no tiene pagos para deshacer en sus deudas pendientes.');
+            return;
+        }
+        if (pendientes.length === 1) {
+            Cobranzas.deshacerPago(pendientes[0].id);
+            return;
+        }
+        const nombre = Utils.nombreCatalogo(this._fila(clienteId) || {}, 'cliente') || 'este cliente';
+        const lista = pendientes.map(c => `
+            <div class="deuda-fecha">
+                <span class="deuda-fecha-dia">${Utils.esc(Utils.formatDate(c.fecha))}<small class="fila-nota">Ya pagó ${Utils.formatCurrency(Utils.parsePrice(c.pagado) || 0)}</small></span>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('modal-overlay')?.classList.remove('active'); Cobranzas.deshacerPago('${c.id}')">Deshacer pago</button>
+            </div>`).join('');
+        Utils.showModal('Deshacer pago de ' + nombre, `<p class="modal-hint">Elegí la deuda donde se cargó el pago.</p><div class="deuda-fechas">${lista}</div>`, null);
     },
 
     async anularCobro(clienteId) {
