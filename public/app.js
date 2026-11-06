@@ -6682,6 +6682,27 @@ const Recepcion = {
         return (AppState.recepcion || []).some(r => String(r.producto_id) === String(productoId) && r.extra);
     },
 
+    // En rojo lo que quedó por debajo de lo pedido (se repartió por porcentaje), para verlo sin revisar uno por uno.
+    _esCorto(valor, pedida) {
+        if (valor === '' || valor === null || valor === undefined) return false;
+        const n = typeof valor === 'number' ? valor : Utils.parseCantidad(valor);
+        return !isNaN(n) && n >= 0 && n < (Number(pedida) || 0) - 0.005;
+    },
+
+    _marcarCortos(productoId) {
+        const clientes = this._clientesDe(productoId);
+        if (!clientes.length) return;
+        const pedidas = Object.fromEntries(clientes.map(c => [String(c.cliente_id), Number(c.cantidadPedida) || 0]));
+        this._inputsReparto(productoId).forEach(input => {
+            input.classList.toggle('recepcion-corto', this._esCorto(input.value, pedidas[input.getAttribute('data-cliente-id')]));
+        });
+        const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${productoId}"]`);
+        if (llegoInput) {
+            const pedidoTotal = clientes.reduce((t, c) => t + (Number(c.cantidadPedida) || 0), 0);
+            llegoInput.classList.toggle('recepcion-corto', this._esCorto(llegoInput.value, pedidoTotal));
+        }
+    },
+
     _htmlReparto(item, confirmada) {
         if (this._tieneExtras(item.producto_id)) return '';
         const clientes = this._clientesDe(this._claveDe(item));
@@ -6695,7 +6716,7 @@ const Recepcion = {
             <label class="recepcion-cli">
                 <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
                 <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
-                <input type="number" step="any" min="0" class="recepcion-reparto" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${mostrar ? Utils.formatCantidadInput(reparto[c.cliente_id] || 0) : ''}" placeholder="0"${confirmada ? ' disabled' : ''} title="Cuánto le toca de lo que llegó">
+                <input type="number" step="any" min="0" class="recepcion-reparto${mostrar && this._esCorto(reparto[c.cliente_id] || 0, c.cantidadPedida) ? ' recepcion-corto' : ''}" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${mostrar ? Utils.formatCantidadInput(reparto[c.cliente_id] || 0) : ''}" placeholder="0"${confirmada ? ' disabled' : ''} title="Cuánto le toca de lo que llegó">
             </label>`).join('');
         return `<tr class="recepcion-detalle${confirmada ? ' recepcion-row-confirmada' : ''}"><td colspan="6"><div class="recepcion-cli-lista"><span class="recepcion-cli-titulo">Para cada cliente:</span>${filas}</div></td></tr>`;
     },
@@ -6886,6 +6907,7 @@ const Recepcion = {
                 const n = Utils.parseCantidad(input.value);
                 this._rellenarReparto(productoId, isNaN(n) ? 0 : Math.max(0, n));
             }
+            this._marcarCortos(productoId);
             const { llego, precio, reparto } = this.getValoresProducto(productoId);
             this._aplicarCambio(productoId, llego, precio, reparto);
         };
@@ -7292,6 +7314,7 @@ const Recepcion = {
         
         tbody.innerHTML = rowsHtml;
         Utils.enablePriceInputs(tbody);
+        tbody.querySelectorAll('.recepcion-llego').forEach(input => this._marcarCortos(input.getAttribute('data-producto-id')));
         this._aplicarFiltroProducto();
     },
     
