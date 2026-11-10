@@ -50,7 +50,8 @@ const WhatsAppService = {
         return digits;
     },
 
-    buildUrl(telefono, mensaje) {
+    // opciones.app: abre la aplicación de WhatsApp (en la computadora, la de escritorio) y no WhatsApp Web.
+    buildUrl(telefono, mensaje, opciones = {}) {
         const phone = this.normalizePhone(telefono);
 
         if (!phone) {
@@ -62,7 +63,7 @@ const WhatsAppService = {
 
         const encodedMessage = encodeURIComponent(mensaje);
 
-        if (this.isMobile()) {
+        if (this.isMobile() || opciones.app) {
             return `whatsapp://send?phone=${phone}&text=${encodedMessage}`;
         }
 
@@ -71,12 +72,12 @@ const WhatsAppService = {
         return `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
     },
 
-    openChat(telefono, mensaje) {
-        const url = this.buildUrl(telefono, mensaje);
+    openChat(telefono, mensaje, opciones = {}) {
+        const url = this.buildUrl(telefono, mensaje, opciones);
 
         // Usar un nombre de ventana fijo para reutilizar la misma pestaña
         // en vez de abrir una nueva cada vez que se envía un mensaje
-        if (this.isMobile()) {
+        if (this.isMobile() || opciones.app) {
             window.location.href = url;
         } else if (this._extensionLista) {
             // La extensión usa la pestaña de WhatsApp Web que ya está abierta.

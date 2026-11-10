@@ -4321,6 +4321,7 @@ const ProveedoresGestion = {
                     <option value="Verdura">Verdura</option>
                     <option value="Bebida">Bebida</option>
                     <option value="Mixto">Mixto</option>
+                    <option value="Anexos">Anexos</option>
                     <option value="Otro">Otro</option>
                 </select>
             </div>
@@ -4387,6 +4388,7 @@ const ProveedoresGestion = {
                     <option value="Verdura" ${proveedor.rubro === 'Verdura' ? 'selected' : ''}>Verdura</option>
                     <option value="Bebida" ${proveedor.rubro === 'Bebida' ? 'selected' : ''}>Bebida</option>
                     <option value="Mixto" ${proveedor.rubro === 'Mixto' ? 'selected' : ''}>Mixto</option>
+                    <option value="Anexos" ${proveedor.rubro === 'Anexos' ? 'selected' : ''}>Anexos</option>
                     <option value="Otro" ${proveedor.rubro === 'Otro' ? 'selected' : ''}>Otro</option>
                 </select>
             </div>
@@ -9489,6 +9491,135 @@ const Precios = {
         }
     },
 
+    // Lista de precios del cliente como Excel (es lo que reciben los clientes por WhatsApp desde el paso 4).
+    // Mismo diseño que el Excel de la hoja de carga: banda azul con el título, fecha, tabla y total en azul.
+    async _construirExcelPrecios(datos) {
+        const ExcelJS = await Camiones._cargarExcelJS();
+        const libro = new ExcelJS.Workbook();
+        libro.creator = 'Luciano Cargas';
+        const AZUL = 'FF1A73E8', AZUL_CLARO = 'FFE8F1FD', GRIS = 'FFF1F5F9', BORDE = 'FFCBD5E1', BLANCO = 'FFFFFFFF';
+        const relleno = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+        const borde = { bottom: { style: 'thin', color: { argb: BORDE } } };
+        const moneda = '"$" #,##0';
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        const nombreHoja = 'Lista de precios';
+
+        const hoja = libro.addWorksheet(nombreHoja, {
+            views: [{ state: 'frozen', ySplit: 4, showGridLines: false }],
+            pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 } }
+        });
+        const ultima = 4;
+        hoja.getColumn(1).width = 14;
+        hoja.getColumn(2).width = 44;
+        hoja.getColumn(3).width = 18;
+        hoja.getColumn(4).width = 20;
+
+        // Título
+        hoja.mergeCells(1, 1, 1, ultima);
+        const titulo = hoja.getCell(1, 1);
+        titulo.value = `Luciano Cargas · Lista de precios · ${datos.clienteNombre || ''}`;
+        titulo.font = { name: 'Calibri', size: 18, bold: true, color: { argb: BLANCO } };
+        titulo.fill = relleno(AZUL);
+        titulo.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+        hoja.getRow(1).height = 32;
+
+        hoja.mergeCells(2, 1, 2, ultima);
+        const fechaCelda = hoja.getCell(2, 1);
+        fechaCelda.value = `Fecha: ${fecha || ''}`;
+        fechaCelda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF475569' } };
+        fechaCelda.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+        hoja.getRow(2).height = 22;
+        hoja.getRow(3).height = 6;
+
+        // Encabezado de la tabla
+        const cabecera = hoja.getRow(4);
+        cabecera.values = ['Cant.', 'Producto', 'Precio', 'Total'];
+        cabecera.height = 34;
+        cabecera.eachCell((celda, col) => {
+            celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: BLANCO } };
+            celda.fill = relleno(AZUL);
+            celda.alignment = { vertical: 'middle', horizontal: col === 2 ? 'left' : (col === 1 ? 'center' : 'right'), indent: col === 2 ? 1 : (col >= 3 ? 1 : 0) };
+        });
+
+        // Filas: productos y, al final, la comisión de reparto
+        const lineas = (datos.filas || []).map(f => {
+            const unitario = parseFloat(f.precioUnitario) || 0;
+            const cantidad = parseFloat(f.cantidad) || 0;
+            return { cantidad, texto: false, producto: String(f.producto || ''), precio: unitario, total: Math.round(unitario * cantidad * 100) / 100 };
+        }).concat((datos.comisiones || []).map(c => ({
+            cantidad: Comisiones.bultosTexto(c.bultos), texto: true, producto: 'Comisión de reparto', precio: Number(c.tarifa) || 0, total: Number(c.total) || 0
+        })));
+        lineas.forEach((linea, k) => {
+            const fila = hoja.getRow(5 + k);
+            fila.values = [linea.cantidad, linea.producto, linea.precio, linea.total];
+            fila.height = 24;
+            fila.eachCell({ includeEmpty: true }, (celda, col) => {
+                if (col > ultima) return;
+                celda.fill = relleno(k % 2 ? GRIS : BLANCO);
+                celda.border = borde;
+                celda.font = { name: 'Calibri', size: 13, bold: col === 1 || col === 2, color: { argb: 'FF0F172A' } };
+                celda.alignment = { vertical: 'middle', horizontal: col === 2 ? 'left' : (col === 1 ? 'center' : 'right'), indent: col === 2 ? 1 : (col >= 3 ? 1 : 0) };
+                if (col === 1 && !linea.texto) celda.numFmt = '0.##';
+                if (col >= 3) celda.numFmt = moneda;
+                if (col === 4) { celda.fill = relleno(AZUL_CLARO); celda.font = { name: 'Calibri', size: 13, bold: true, color: { argb: AZUL } }; }
+            });
+        });
+
+        // Total a pagar
+        const filaTotal = hoja.getRow(5 + Math.max(lineas.length, 1) + 1);
+        filaTotal.height = 28;
+        hoja.mergeCells(filaTotal.number, 1, filaTotal.number, 3);
+        const etiqueta = hoja.getCell(filaTotal.number, 1);
+        etiqueta.value = 'Total a pagar';
+        etiqueta.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+        etiqueta.fill = relleno(AZUL);
+        etiqueta.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+        const valor = hoja.getCell(filaTotal.number, 4);
+        valor.value = Number(datos.saldoTotal) || 0;
+        valor.numFmt = moneda;
+        valor.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+        valor.fill = relleno(AZUL);
+        valor.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+
+        // Al imprimir, el encabezado se repite en cada hoja.
+        hoja.pageSetup.printTitlesRow = '4:4';
+        hoja.headerFooter.oddFooter = '&CLuciano Cargas · &P de &N';
+
+        const buffer = await libro.xlsx.writeBuffer();
+        return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    },
+
+    // "WhatsApp Excel": arma el Excel con la lista del cliente elegido y lo manda por la aplicación de WhatsApp.
+    async enviarExcel() {
+        if (!this.selectedClienteId) {
+            Utils.showError('Por favor, seleccioná un cliente para enviarle la lista');
+            return;
+        }
+        const datos = this._obtenerDatosClienteParaExportar();
+        if (!datos) {
+            Utils.showError('No hay datos para enviar');
+            return;
+        }
+        try {
+            await this.ensureDatosWhatsApp();
+            const cliente = (AppState.clientes || []).find(c => String(c.id) === String(this.selectedClienteId));
+            PrecioClienteService.validarEnvio(cliente, datos);
+            const blob = await this._construirExcelPrecios(datos);
+            const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.xlsx`;
+            await EnvioPdf.enviarExcel({
+                telefono: cliente.telefono,
+                texto: `Hola ${cliente.nombre}, te envío la lista de precios.`,
+                blob,
+                nombre,
+                destinatario: cliente.nombre
+            });
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            console.error('Error enviando la lista en Excel:', error);
+            this.handleWhatsAppError(error);
+        }
+    },
+
     async exportarPDF() {
         if (!this.selectedClienteId) {
             Utils.showError('Por favor, selecciona un cliente para exportar');
@@ -10113,6 +10244,32 @@ const EnvioPdf = {
 
     _puedeCopiarImagen() {
         return !!(navigator.clipboard && navigator.clipboard.write && window.ClipboardItem);
+    },
+
+    // Excel por la aplicación de WhatsApp. En el celular, el menú Compartir; en la computadora se descarga
+    // el archivo y se abre el chat en la aplicación de escritorio (WhatsApp no deja adjuntar desde una página).
+    async enviarExcel({ telefono, texto, blob, nombre, destinatario }) {
+        const archivo = new File([blob], nombre, { type: blob.type });
+        if (WhatsAppService.isMobile()) {
+            try {
+                if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                    await navigator.share({ files: [archivo], title: nombre, text: texto });
+                    return;
+                }
+            } catch (error) {
+                if (error && error.name === 'AbortError') return;
+            }
+        }
+        const url = URL.createObjectURL(blob);
+        const enlace = document.createElement('a');
+        enlace.href = url;
+        enlace.download = nombre;
+        document.body.appendChild(enlace);
+        enlace.click();
+        enlace.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        setTimeout(() => WhatsAppService.openChat(telefono, texto, { app: true }), 400);
+        Utils.avisar(`Se descargó el Excel y se abre WhatsApp. Arrastralo (o adjuntalo con el clip) al chat de ${destinatario}.`);
     },
 
     // { telefono, texto, doc, nombre, destinatario }
@@ -14626,7 +14783,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-generar-lista-precios', () => Precios.generarLista(), 'Generando...');
     addButtonListener('btn-guardar-precios', () => Precios.save(), 'Guardando...');
     addButtonListener('btn-limpiar-filtro', () => Precios.limpiarFiltro(), 'Limpiando...');
-    addButtonListener('btn-exportar-pdf-precios', () => Precios.exportarPDF(), 'Preparando...');
+    addButtonListener('btn-exportar-pdf-precios', () => Precios.enviarExcel(), 'Preparando...');
     addButtonListener('btn-reset-todos-datos', () => Mantenimiento.solicitarReset(), 'Eliminando...', { useButtonLoader: false });
     
     // Event listeners para filtros de precios
