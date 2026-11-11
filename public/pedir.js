@@ -123,9 +123,19 @@ function pintarLista() {
         const mas = document.createElement('button');
         mas.type = 'button'; mas.textContent = '+'; mas.setAttribute('aria-label', 'Más ' + p.nombre);
         if (!info.abierto) { menos.disabled = mas.disabled = campo.disabled = true; }
+        // Sin stock: no se puede sumar; si ya lo había pedido, solo bajarlo o sacarlo.
+        if (p.sin_stock) {
+            const tope = estado.inicial[p.id] || 0;
+            fila.classList.add('sin-stock');
+            const aviso = document.createElement('span');
+            aviso.className = 'sin-stock-txt';
+            aviso.textContent = 'Sin stock por ahora';
+            nombre.appendChild(aviso);
+            if (!tope) { menos.disabled = mas.disabled = campo.disabled = true; }
+        }
 
         const poner = valor => {
-            estado.actual[p.id] = Math.max(0, valor);
+            estado.actual[p.id] = Math.max(0, p.sin_stock ? Math.min(valor, estado.inicial[p.id] || 0) : valor);
             campo.value = estado.actual[p.id] > 0 ? fmt(estado.actual[p.id]) : '';
             cant.classList.toggle('tiene', estado.actual[p.id] > 0);
             resumenBoton();

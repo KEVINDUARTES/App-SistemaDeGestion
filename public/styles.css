@@ -4107,6 +4107,13 @@ html {
 .links-config label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #56665c; }
 .links-config label.links-check { flex-direction: row; align-items: center; gap: 8px; font-size: 15px; color: inherit; font-weight: 600; }
 .links-config input[type="time"], .links-config select { padding: 7px 9px; border: 1px solid #ccd3d9; border-radius: 8px; font: inherit; }
+.links-stock { background: #fff; border: 1px solid #d9dee3; border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; }
+.links-stock summary { cursor: pointer; font-weight: 600; }
+.links-stock summary span { font-weight: 400; color: #56665c; margin-left: 8px; font-size: 13px; }
+.links-stock input[type="search"] { width: 100%; max-width: 320px; padding: 7px 9px; border: 1px solid #ccd3d9; border-radius: 8px; font: inherit; margin-bottom: 10px; }
+.links-prods { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 14px; max-height: 320px; overflow-y: auto; }
+.links-prod { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.links-prod.sin { color: #b91c1c; font-weight: 600; }
 .links-acciones { margin-bottom: 12px; }
 .links-url { font-size: 12px; color: #56665c; word-break: break-all; max-width: 380px; }
 .links-sin { color: #8a949c; }

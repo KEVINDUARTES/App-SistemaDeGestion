@@ -287,6 +287,7 @@
                 <h2>Productos</h2>
                 <button class="btn btn-primary" id="btn-agregar-producto">Agregar producto</button>
             </div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar producto…" aria-label="Buscar producto…" autocomplete="off" data-filtro-tabla="#productos-tbody"></div>
             <div class="table-container">
                 <table class="data-table">
                     <thead>
@@ -757,6 +758,12 @@
             </div>
             <p class="links-ayuda">Cada cliente tiene un link propio: lo abre en el celular, elige lo que necesita y el pedido entra solo en la planilla de Pedidos. No ve precios ni a otros clientes.</p>
             <div class="links-config" id="links-config"></div>
+            <details class="links-stock">
+                <summary>Productos sin stock <span id="links-sin-stock-cuenta"></span></summary>
+                <p class="links-ayuda">Los que marques aparecen avisados en el link y los clientes no pueden sumarlos. Se guarda al tildar.</p>
+                <input type="search" id="links-sin-stock-buscar" placeholder="Buscar producto" autocomplete="off">
+                <div class="links-prods" id="links-sin-stock"></div>
+            </details>
             <div class="page-actions links-acciones">
                 <button class="btn btn-primary" id="btn-links-generar-todos">Generar links de todos</button>
             </div>
@@ -934,7 +941,7 @@
     <script src="services/whatsapp.js?v=20261110app"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261110excel2"></script>
+    <script src="app.js?v=20261111stock2"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

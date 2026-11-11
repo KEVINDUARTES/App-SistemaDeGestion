@@ -13542,6 +13542,10 @@ const LinksClientes = {
         if (!this._listo) {
             this._listo = true;
             document.getElementById('links-clientes').addEventListener('click', e => this._click(e));
+            document.getElementById('links-clientes').addEventListener('change', e => {
+                if (e.target.matches('[data-sin-stock]')) this._marcarSinStock(e.target);
+            });
+            document.getElementById('links-sin-stock-buscar').addEventListener('input', () => this._renderSinStock());
         }
         if (!this.datos) Utils.showTableLoader(tbody);
         try {
@@ -13575,6 +13579,8 @@ const LinksClientes = {
             </label>
             <button type="button" class="btn btn-primary" data-links="config">Guardar</button>`;
 
+        this._renderSinStock();
+
         const clientes = this.datos.clientes || [];
         if (!clientes.length) {
             tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No hay clientes cargados</td></tr>';
@@ -13595,6 +13601,35 @@ const LinksClientes = {
                     <button type="button" class="btn btn-secondary btn-sm" data-links="quitar" data-id="${id}">Desactivar</button>
                 </div></td></tr>`;
         }).join('');
+    },
+
+    // Productos sin stock: el cliente los ve marcados y no puede sumarlos.
+    _renderSinStock() {
+        const cont = document.getElementById('links-sin-stock');
+        if (!cont) return;
+        const q = (document.getElementById('links-sin-stock-buscar')?.value || '').trim().toLowerCase();
+        const productos = (this.datos.productos || []).slice()
+            .sort((a, b) => Number(b.sin_stock) - Number(a.sin_stock) || String(a.nombre).localeCompare(String(b.nombre), 'es'));
+        const cuantos = productos.filter(p => p.sin_stock).length;
+        document.getElementById('links-sin-stock-cuenta').textContent = cuantos ? `${cuantos} sin stock` : 'Todos con stock';
+        const visibles = productos.filter(p => !q || String(p.nombre).toLowerCase().includes(q));
+        cont.innerHTML = visibles.length ? visibles.map(p => `
+            <label class="links-prod${p.sin_stock ? ' sin' : ''}">
+                <input type="checkbox" data-sin-stock="${Utils.esc(p.id)}"${p.sin_stock ? ' checked' : ''}>
+                <span>${Utils.esc(p.nombre)}</span>
+            </label>`).join('') : '<p class="links-sin">No hay productos con ese nombre.</p>';
+    },
+
+    async _marcarSinStock(check) {
+        const sinStock = check.checked;
+        check.disabled = true;
+        try {
+            this._aplicar(await API.request('links-clientes/sin-stock', 'POST', { producto_id: check.dataset.sinStock, sin_stock: sinStock }));
+        } catch (error) {
+            check.checked = !sinStock;
+            check.disabled = false;
+            Utils.showError('No se pudo guardar: ' + (error && error.message || ''));
+        }
     },
 
     _cliente(id) {

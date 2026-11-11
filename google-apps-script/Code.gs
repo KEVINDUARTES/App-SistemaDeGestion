@@ -518,6 +518,10 @@ function handleRequest(e, method) {
         result = linksClientesDesactivar_(data);
         break;
 
+      case 'links-clientes/sin-stock':
+        result = linksClientesSinStock_(data);
+        break;
+
       case 'links-clientes/config':
         result = linksClientesGuardarConfig_(data);
         break;
@@ -6037,6 +6041,15 @@ function configLinkClientes_() {
   };
 }
 
+/** Ids de productos que el equipo marcó sin stock: los clientes no pueden sumarlos por el link. */
+function productosSinStockLink_() {
+  var c = getConfiguracionNotificaciones();
+  var lista = {};
+  String(c.link_clientes_sin_stock === undefined || c.link_clientes_sin_stock === null ? '' : c.link_clientes_sin_stock)
+    .split(',').forEach(function(id) { id = id.trim(); if (id) lista[id] = true; });
+  return lista;
+}
+
 function horaTexto_(min) {
   return ('0' + Math.floor(min / 60)).slice(-2) + ':' + ('0' + (min % 60)).slice(-2);
 }
@@ -6130,7 +6143,11 @@ function linksClientesListar_() {
       token: c.link_token ? clave + '.' + c.link_token : ''
     };
   });
-  return { config: { activo: cfg.activo, corte: horaTexto_(cfg.corte_min), dia: cfg.dia }, clientes: clientes };
+  var sinStock = productosSinStockLink_();
+  var productos = getProductos().map(function(p) {
+    return { id: p.id, nombre: p.nombre, tipo: p.tipo || '', sin_stock: sinStock[String(p.id)] === true };
+  });
+  return { config: { activo: cfg.activo, corte: horaTexto_(cfg.corte_min), dia: cfg.dia }, clientes: clientes, productos: productos };
 }
 
 /** Pone el código en la columna link_token de los clientes indicados: { id: código o '' }. */
@@ -6212,6 +6229,18 @@ function linksClientesGuardarConfig_(data) {
   return linksClientesListar_();
 }
 
+/** Marca o desmarca un producto sin stock (de a uno, así dos personas no se pisan la lista). */
+function linksClientesSinStock_(data) {
+  if (!data || !data.producto_id) throw new Error('Elegí el producto');
+  var producto = findInIdMap(getProductosMap(), data.producto_id);
+  if (!producto) throw new Error('Ese producto no está en el sistema. Actualizá la página.');
+  var lista = productosSinStockLink_();
+  if (data.sin_stock === true || data.sin_stock === 'true') lista[String(producto.id)] = true;
+  else delete lista[String(producto.id)];
+  saveConfiguracionNotificaciones({ link_clientes_sin_stock: Object.keys(lista).join(',') });
+  return linksClientesListar_();
+}
+
 /** Lo que ve el cliente al abrir su link: sus datos mínimos, los productos y lo que ya pidió. */
 function pedidoLinkInfo_() {
   var cliente = _linkActual.cliente;
@@ -6221,13 +6250,15 @@ function pedidoLinkInfo_() {
     if (!idsMatch(p.cliente_id, cliente.id)) return;
     cantidades[p.producto_id] = Math.round(((cantidades[p.producto_id] || 0) + (Number(p.cantidad) || 0)) * 100) / 100;
   });
+  var sinStock = productosSinStockLink_();
   var productos = getProductos().map(function(p) {
     return {
       id: p.id,
       nombre: p.nombre,
       tipo: p.tipo || '',
       unidad: p.unidad || '',
-      por_kilo: p.por_kilo === true || p.por_kilo === 'true'
+      por_kilo: p.por_kilo === true || p.por_kilo === 'true',
+      sin_stock: sinStock[String(p.id)] === true
     };
   });
   return {
@@ -6252,11 +6283,20 @@ function pedidoLinkGuardar_(data) {
   if (items.length > 60) throw new Error('Son demasiados productos juntos');
 
   var productos = getProductosMap();
+  var sinStock = productosSinStockLink_();
+  var yaPedido = {};
+  getPedidos(estado.fecha).forEach(function(p) {
+    if (!idsMatch(p.cliente_id, _linkActual.cliente.id)) return;
+    yaPedido[p.producto_id] = (yaPedido[p.producto_id] || 0) + (Number(p.cantidad) || 0);
+  });
   var celdas = items.map(function(item) {
     var producto = findInIdMap(productos, item && item.producto_id);
     if (!producto) throw new Error('Un producto ya no está disponible. Actualizá la página.');
     var n = Number(String(item.cantidad === undefined || item.cantidad === null ? '' : item.cantidad).replace(',', '.'));
     if (!isFinite(n) || n < 0 || n > 9999) throw new Error('Una cantidad no es válida');
+    if (sinStock[String(producto.id)] && n > (yaPedido[producto.id] || 0) + 0.001) {
+      throw new Error('"' + producto.nombre + '" está sin stock por ahora. Sacalo del pedido y volvé a enviar.');
+    }
     var porKilo = producto.por_kilo === true || producto.por_kilo === 'true';
     return {
       cliente_id: _linkActual.cliente.id,
