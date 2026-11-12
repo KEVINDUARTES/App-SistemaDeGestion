@@ -177,11 +177,10 @@ function armar(info) {
 
     $('titulo').textContent = 'Pedido de ' + info.cliente.nombre;
     $('fecha').textContent = fechaLarga(info.fecha);
-    $('corte').textContent = info.abierto ? 'Podés pedir hasta las ' + info.corte : '';
-    $('corte').hidden = !info.abierto;
+    $('corte').hidden = true;
     $('aviso').hidden = info.abierto;
     $('aviso').textContent = info.mensaje || '';
-    $('pie').textContent = info.abierto ? 'Podés cambiarlo hasta las ' + info.corte : 'Lo que pediste queda como está';
+    $('pie').textContent = info.abierto ? 'Podés cambiarlo cuando quieras' : 'Lo que pediste queda como está';
     $('buscar').value = '';
     estado.busqueda = '';
     mostrar('pedido');
@@ -224,7 +223,7 @@ async function enviar() {
     }
     const pedidos = estado.info.productos.filter(p => (estado.actual[p.id] || 0) > 0).length;
     $('hecho-texto').textContent = pedidos
-        ? `Recibimos ${pedidos} ${pedidos === 1 ? 'producto' : 'productos'} para el ${fechaLarga(estado.info.fecha).toLowerCase()}. Podés cambiarlo hasta las ${estado.info.corte}.`
+        ? `Recibimos ${pedidos} ${pedidos === 1 ? 'producto' : 'productos'} para el ${fechaLarga(estado.info.fecha).toLowerCase()}. Podés cambiarlo cuando quieras.`
         : 'Tu pedido quedó vacío.';
     mostrar('hecho');
 }

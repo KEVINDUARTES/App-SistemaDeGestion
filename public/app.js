@@ -13570,7 +13570,6 @@ const LinksClientes = {
         const c = this.datos.config;
         config.innerHTML = `
             <label class="links-check"><input type="checkbox" id="links-activo"${c.activo ? ' checked' : ''}> Recibir pedidos por link</label>
-            <label>Hora de corte<input type="time" id="links-corte" value="${Utils.esc(c.corte)}"></label>
             <label>Los clientes piden para
                 <select id="links-dia">
                     <option value="manana"${c.dia === 'manana' ? ' selected' : ''}>mañana</option>
@@ -13646,11 +13645,9 @@ const LinksClientes = {
             if (accion === 'whatsapp') return this._whatsapp(cli);
             if (accion === 'config') {
                 const activo = document.getElementById('links-activo').checked;
-                const corte = document.getElementById('links-corte').value;
-                if (!corte) return Utils.showError('Poné la hora de corte.');
                 await Utils.withButtonLoader(boton, async () => {
                     this._aplicar(await API.request('links-clientes/config', 'POST', {
-                        activo, corte, dia: document.getElementById('links-dia').value
+                        activo, dia: document.getElementById('links-dia').value
                     }));
                 }, 'Guardando...');
                 return Utils.avisar('Configuración guardada');

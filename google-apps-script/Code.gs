@@ -6080,9 +6080,6 @@ function estadoLinkClientes_() {
     if (cierre.row && cierre.estado === 'cerrado') {
       estado.abierto = false;
       estado.motivo = 'dia_cerrado';
-    } else if (minutosAhoraAR_() >= cfg.corte_min) {
-      estado.abierto = false;
-      estado.motivo = 'corte';
     }
   }
   estado.mensaje = mensajeEstadoLink_(estado);
@@ -6092,7 +6089,6 @@ function estadoLinkClientes_() {
 function mensajeEstadoLink_(estado) {
   if (estado.motivo === 'apagado') return 'Por ahora no se reciben pedidos por este link.';
   if (estado.motivo === 'dia_cerrado') return 'Ese día ya está cerrado.';
-  if (estado.motivo === 'corte') return 'Ya pasó la hora de corte (' + estado.corte + ').';
   return '';
 }
 
