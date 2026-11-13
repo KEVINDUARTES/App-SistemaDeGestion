@@ -7525,7 +7525,7 @@ const Recepcion = {
         }).join('');
         return `
             <tr${confirmada ? ' class="recepcion-row-confirmada"' : ''} data-nombre="${Utils.esc(this._normalizarBusqueda(item.producto_nombre))}">
-                <td class="rp-prod">${item.extra ? `<span class="rp-sub">↳</span> ${Utils.esc(item.producto_nombre || '')}` : Utils.esc(item.producto_nombre || '')}${!confirmada && !item.extra ? ` <button type="button" class="btn btn-secondary btn-sm btn-dividir-proveedor" data-producto-id="${clave}" title="Agregar otro proveedor de este producto">+ Proveedor</button>` : ''}</td>
+                <td class="rp-prod"><div class="rp-prod-celda"><span class="rp-prod-nombre">${item.extra ? `<span class="rp-sub">↳</span> ${Utils.esc(item.producto_nombre || '')}` : Utils.esc(item.producto_nombre || '')}</span>${!confirmada && !item.extra ? `<button type="button" class="btn btn-secondary btn-sm btn-dividir-proveedor" data-producto-id="${clave}" title="Agregar otro proveedor de este producto">+ Proveedor</button>` : ''}</div></td>
                 <td>${Utils.esc(item.proveedor_nombre || '')}</td>
                 <td>${item.extra ? '—' : Utils.formatCantidad(item.pedido_total || 0)}</td>
                 <td><input type="number" step="any" class="recepcion-llego rp-total" data-id="${item.id}" data-producto-id="${clave}" value="${llegoValor}" placeholder="0" readonly tabindex="-1" title="Es la suma de lo que le toca a cada cliente"></td>

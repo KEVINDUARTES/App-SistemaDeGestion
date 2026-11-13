@@ -4149,3 +4149,9 @@ html {
 #recepcion-tabla.recepcion-planilla tr.recepcion-row-confirmada td.rp-acc { background: #f0fdf4; }
 #recepcion-tabla.recepcion-planilla .rp-acc .recepcion-acciones-group { flex-wrap: nowrap; gap: 4px; }
 #recepcion-tabla.recepcion-planilla .rp-acc .btn-sm { padding: 5px 9px; font-size: 12px; }
+
+/* El botón "+ Proveedor" queda siempre en el mismo lugar, sin importar el largo del nombre. */
+#recepcion-tabla.recepcion-planilla td.rp-prod { min-width: 260px; }
+.rp-prod-celda { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.rp-prod-nombre { min-width: 0; }
+.rp-prod-celda .btn-dividir-proveedor { flex: none; white-space: nowrap; }
