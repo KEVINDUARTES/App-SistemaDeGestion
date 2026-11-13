@@ -2290,6 +2290,16 @@ const API = {
         return result;
     },
     
+    async anularPagoProveedor(data) {
+        const result = await this.request('pagos-proveedores/anular', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
     // Stock
     async getStock() {
         const cacheKey = 'stock';
@@ -13020,7 +13030,7 @@ const Pagos = {
                 <td data-label="Proveedor">${Utils.esc(proveedor.nombre || '')}${vino}</td>
                 <td data-label="Le debés" style="${saldo > 0 && !porFecha ? 'color:#dc3545;font-weight:700;' : ''}">${celdaDebes}${btnPagar}</td>
                 <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
-                <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span></td>
+                <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span>${soloPendientes ? `<div class="pagos-acciones"><button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.historial('${proveedor.id}')">Ver pagos / anular</button></div>` : ''}</td>
             `;
             tbody.appendChild(tr);
         });
@@ -13271,9 +13281,13 @@ const Pagos = {
                 Utils.showError('Poné cuánto le pagás.');
                 throw new Error('Monto inválido');
             }
-            if (!anticipo && leido.total > saldoPendiente + 0.01) {
-                Utils.showError('La suma supera lo que le debés (' + Utils.formatCurrency(saldoPendiente) + ').');
-                throw new Error('Monto mayor al saldo');
+            const deMas = !anticipo && leido.total > saldoPendiente + 0.01;
+            if (deMas) {
+                const aceptado = await Utils.showConfirm(
+                    `Le debés ${Utils.formatCurrency(saldoPendiente)} y le vas a pagar ${Utils.formatCurrency(leido.total)}. Los ${Utils.formatCurrency(leido.total - saldoPendiente)} que sobran quedan a favor y se descuentan de la próxima carga. ¿Confirmás?`,
+                    null, null, { title: 'Pagás de más', accept: 'Sí, pagar' }
+                );
+                if (!aceptado) throw new Error('Pago de más cancelado');
             }
 
             const saldoRestante = Math.max(0, saldoTotal - leido.total);
@@ -13315,6 +13329,7 @@ const Pagos = {
                 medios: leido.lista,
                 fecha: AppState.currentDate,
                 anticipo: anticipo,
+                permitir_exceso: deMas,
                 aplica_fecha: fechaDeuda,
                 nota: anticipo ? 'Pago al hacer el pedido' : ''
             }), () => {
@@ -13334,13 +13349,87 @@ const Pagos = {
             });
         }, 'Pagar');
 
-        const actualizar = MediosPago.enganchar(saldoPendiente, { tope: !anticipo, ocultarAdeudado: anticipo });
+        const actualizar = MediosPago.enganchar(saldoPendiente, { tope: false, ocultarAdeudado: anticipo });
         document.getElementById('pago-chip-hoy')?.addEventListener('click', () => {
             const soloHoy = MediosPago.vacio();
             soloHoy.efectivo = mercaderiaHoy;
             MediosPago.poner(soloHoy);
             actualizar();
         });
+    },
+
+    // Historial de lo pagado a proveedores, con la opción de anular un pago.
+    async historial(proveedorId = '') {
+        const hoy = Utils.formatCurrency;
+        Utils.showModal('Pagos a proveedores', '<p class="modal-hint">Cargando…</p>');
+        let pagos = [];
+        let proveedores = AppState.proveedores || [];
+        try {
+            [pagos, proveedores] = await Promise.all([API.getPagosProveedores(), API.getProveedores()]);
+        } catch (error) {
+            Utils.showError('No se pudieron cargar los pagos. Intentá de nuevo.');
+            return;
+        }
+        const nombres = {};
+        proveedores.forEach(p => { nombres[String(p.id)] = p.nombre || ''; });
+        const conPagos = [...new Set(pagos.map(p => String(p.proveedor_id)))]
+            .filter(id => nombres[id] !== undefined)
+            .sort((a, b) => nombres[a].localeCompare(nombres[b], 'es'));
+        const elegido = conPagos.includes(String(proveedorId)) ? String(proveedorId) : '';
+        const lista = pagos
+            .filter(p => !elegido || String(p.proveedor_id) === elegido)
+            .sort((a, b) => String(Utils.fechaIso(b.fecha) || '').localeCompare(String(Utils.fechaIso(a.fecha) || '')))
+            .slice(0, 80);
+        const prov = elegido ? proveedores.find(p => String(p.id) === elegido) : null;
+        const aFavor = Utils.parsePrice(prov?.a_favor) || 0;
+        const filas = lista.map(p => `
+            <tr>
+                <td data-label="Fecha">${Utils.formatDate(Utils.fechaIso(p.fecha))}</td>
+                <td data-label="Proveedor">${Utils.esc(nombres[String(p.proveedor_id)] || '—')}</td>
+                <td data-label="Monto"><strong>${hoy(Utils.parsePrice(p.monto) || 0)}</strong> · ${Utils.esc(this.metodoPagoLabel(p.metodo))}${p.nota ? `<br><small>${Utils.esc(p.nota)}</small>` : ''}</td>
+                <td data-label=""><button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.anular('${Utils.esc(String(p.id))}', '${elegido}')">Anular</button></td>
+            </tr>`).join('');
+        const content = `
+            <div class="form-group">
+                <label for="historial-proveedor">Proveedor</label>
+                <select id="historial-proveedor" class="form-control">
+                    <option value="">Todos</option>
+                    ${conPagos.map(id => `<option value="${Utils.esc(id)}"${id === elegido ? ' selected' : ''}>${Utils.esc(nombres[id])}</option>`).join('')}
+                </select>
+            </div>
+            ${aFavor > 0.009 ? `<p class="modal-hint"><strong>Saldo a favor: ${hoy(aFavor)}</strong>. Se descuenta de la próxima carga.</p>` : ''}
+            ${lista.length ? `<div class="table-container"><table class="data-table"><thead><tr><th>Fecha</th><th>Proveedor</th><th>Pago</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>
+            <p class="modal-hint">Al anular un pago, vuelve a deberse ese monto y en la caja queda anotado como ingreso de hoy.</p>`
+                : '<p class="modal-hint">Todavía no hay pagos registrados.</p>'}
+        `;
+        Utils.showModal('Pagos a proveedores', content);
+        document.getElementById('historial-proveedor')?.addEventListener('change', (e) => this.historial(e.target.value));
+    },
+
+    async anular(pagoId, proveedorId = '') {
+        const aceptado = await Utils.showConfirm(
+            'Se anula este pago: vuelve a deberse ese monto y en la caja queda anotado como ingreso de hoy. ¿Confirmás?',
+            null, null, { title: 'Anular pago', accept: 'Sí, anular' }
+        );
+        if (!aceptado) return;
+        try {
+            const res = await API.anularPagoProveedor({ id: pagoId });
+            const pid = String(res?.proveedor_id || proveedorId || '');
+            if (pid) {
+                delete this._optimo[pid];
+                this._guardarOptimo();
+                this._pagados.delete(pid);
+                this._pagados.delete(Number(pid));
+            }
+            Utils.avisar('Pago anulado');
+            const proveedores = await API.getProveedores();
+            AppState.proveedores = proveedores;
+            CacheManager.set('proveedores', proveedores);
+            if (AppState.currentPage === 'pagos') this.render(proveedores);
+            this.historial(proveedorId);
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo anular el pago.');
+        }
     },
 
     metodoPagoLabel(metodo) {
@@ -15180,6 +15269,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-seguir-pagos', () => Navigation.navigateTo('pagos-pendientes'), 'Abriendo...');
     addButtonListener('btn-agregar-cobranza', () => Cobranzas.agregar(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-agregar-pago-pendiente', () => Pagos.agregar(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-historial-pagos', () => Pagos.historial(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-seguir-cierre', () => Navigation.navigateTo('cierre'), 'Abriendo...');
     addButtonListener('btn-volver-cierre', () => Navigation.navigateTo('pagos'), 'Volviendo...');
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });

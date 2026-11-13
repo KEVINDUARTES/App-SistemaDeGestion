@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261114full">
+    <link rel="stylesheet" href="styles.css?v=20261114anular2">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -732,6 +732,7 @@
             </div>
             <div class="page-actions">
                 <button class="btn btn-primary" id="btn-agregar-pago-pendiente" type="button" hidden>Agregar pago a proveedor pendiente</button>
+                <button class="btn btn-secondary" id="btn-historial-pagos" type="button">Ver pagos / anular</button>
                 <button class="btn btn-secondary" id="btn-seguir-cierre" type="button">Seguir a cerrar el día</button>
             </div>
         </div>
@@ -951,10 +952,10 @@
         <a href="#" data-page="cierre" class="nav-link"><span>7</span>Cierre</a>
     </nav>
     <script src="auth.js?v=20261013hoja"></script>
-    <script src="services/whatsapp.js?v=20261110app"></script>
+    <script src="services/whatsapp.js?v=20261114anular2"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261114full"></script>
+    <script src="app.js?v=20261114anular2"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

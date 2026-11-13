@@ -669,6 +669,10 @@ function handleRequest(e, method) {
         }
         break;
       
+      case 'pagos-proveedores/anular':
+        result = anularPagoProveedor(data);
+        break;
+
       // Deudas a proveedores cargadas a mano (lo que se les debía antes de usar la app)
       case 'deudas-proveedores':
         if (actualMethod === 'GET') {
@@ -1950,6 +1954,14 @@ function calcularDeudasPorFechaProveedores() {
       item.pagado = Math.round(item.pagado * 100) / 100;
     });
     aFavor += libre;
+    // Lo que se pagó de más se descuenta de lo que todavía debe (lo más viejo primero): pasa a la próxima carga.
+    lista.forEach(function(item) {
+      if (aFavor <= 0.009 || item.saldo <= 0.009) return;
+      var aplicado = Math.min(aFavor, item.saldo);
+      aFavor -= aplicado;
+      item.pagado = Math.round((item.pagado + aplicado) * 100) / 100;
+      item.saldo = Math.round((item.saldo - aplicado) * 100) / 100;
+    });
     resultado[proveedorId] = {
       deudas: lista.filter(function(item) { return item.saldo > 0.009; }),
       a_favor: Math.round(aFavor * 100) / 100
@@ -4674,7 +4686,9 @@ function registrarPago(data) {
     var deudaFecha = detalle ? detalle.deudas.filter(function(d) { return d.fecha === aplicaFecha; })[0] : null;
     saldoPendiente = deudaFecha ? deudaFecha.saldo : 0;
   }
-  if (!anticipo && monto > saldoPendiente + 0.01) {
+  // Pagar de más es válido solo si se confirmó: lo que sobra queda a favor y se descuenta de la próxima carga.
+  var permitirExceso = data.permitir_exceso === true || data.permitir_exceso === 'true';
+  if (!anticipo && !permitirExceso && monto > saldoPendiente + 0.01) {
     throw new Error(aplicaFecha ? 'El monto supera lo que se debe de esa fecha' : 'El monto supera el saldo pendiente');
   }
 
@@ -4696,6 +4710,39 @@ function registrarPago(data) {
   registrarCajaMedios_(fecha, 'egreso', parsed.medios, 'Pago a proveedor', data.proveedor_id);
 
   return { id: primerId, monto: monto, medios: parsed.medios, proveedor_id: data.proveedor_id };
+}
+
+/**
+ * Anula un pago a proveedor: sale del historial, el saldo del proveedor vuelve a subir
+ * y la plata queda anotada como ingreso de hoy en la caja ("Pago anulado"), para que la caja cierre igual.
+ * data: { id }
+ */
+function anularPagoProveedor(data) {
+  if (!data || !data.id) throw new Error('id es requerido');
+  var sheet = getSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var provIdx = headers.indexOf('proveedor_id'); if (provIdx < 0) provIdx = 2;
+  var montoIdx = headers.indexOf('monto'); if (montoIdx < 0) montoIdx = 3;
+  var metodoIdx = headers.indexOf('metodo'); if (metodoIdx < 0) metodoIdx = 4;
+
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][idIdx], data.id)) continue;
+    var monto = normalizeAmount(values[i][montoIdx]);
+    var metodo = String(values[i][metodoIdx] || 'efectivo');
+    if (METODOS_CLIENTE_.indexOf(metodo) === -1) metodo = 'efectivo';
+    var proveedorId = values[i][provIdx];
+    sheet.deleteRow(i + 1);
+    invalidateSheetCache(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+
+    var medios = mediosVacios_();
+    medios[metodo] = monto;
+    registrarCajaMedios_(todayArgentina(), 'ingreso', medios, 'Pago anulado a proveedor', proveedorId);
+    return { success: true, id: data.id, monto: monto, metodo: metodo, proveedor_id: proveedorId };
+  }
+  throw new Error('Ese pago ya no está. Actualizá la página.');
 }
 
 // ========== STOCK ==========
