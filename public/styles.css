@@ -4142,3 +4142,10 @@ html {
 #recepcion-tabla.recepcion-planilla .rp-cel input:focus,
 #recepcion-tabla.recepcion-planilla .recepcion-precio:focus { outline: 2px solid #2563eb; outline-offset: -1px; }
 @media (max-width: 1100px) { #recepcion-btn-vista { display: none; } }
+
+/* La acción queda al final de la fila y fija contra el borde derecho: se ve siempre, sin importar cuántos clientes haya. */
+#recepcion-tabla.recepcion-planilla td.rp-acc { position: sticky; right: 0; z-index: 2; background: #fff; box-shadow: -1px 0 0 #e2e8f0; padding: 6px 10px; }
+#recepcion-tabla.recepcion-planilla thead th.rp-acc { position: sticky; right: 0; z-index: 4; }
+#recepcion-tabla.recepcion-planilla tr.recepcion-row-confirmada td.rp-acc { background: #f0fdf4; }
+#recepcion-tabla.recepcion-planilla .rp-acc .recepcion-acciones-group { flex-wrap: nowrap; gap: 4px; }
+#recepcion-tabla.recepcion-planilla .rp-acc .btn-sm { padding: 5px 9px; font-size: 12px; }

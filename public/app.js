@@ -7483,8 +7483,8 @@ const Recepcion = {
                 <th>Pedido</th>
                 <th>Llegó</th>
                 <th title="Costo por unidad que te cobró el proveedor">Precio <span class="th-hint">(costo / u)</span></th>
-                <th>Acción</th>
                 ${columnas.map(c => `<th class="rp-cli" title="${Utils.esc(c.nombre)}"><span>${Utils.esc(c.nombre)}</span></th>`).join('')}
+                <th class="rp-acc">Acción</th>
             </tr>`;
         }
         tbody.innerHTML = visibles.map(item => this._filaPlanilla(item, columnas)).join('');
@@ -7530,8 +7530,8 @@ const Recepcion = {
                 <td>${item.extra ? '—' : Utils.formatCantidad(item.pedido_total || 0)}</td>
                 <td><input type="number" step="any" class="recepcion-llego rp-total" data-id="${item.id}" data-producto-id="${clave}" value="${llegoValor}" placeholder="0" readonly tabindex="-1" title="Es la suma de lo que le toca a cada cliente"></td>
                 <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${clave}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
-                <td class="recepcion-acciones">${acciones}</td>
                 ${celdas}
+                <td class="recepcion-acciones rp-acc">${acciones}</td>
             </tr>`;
     },
 
