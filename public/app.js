@@ -6579,19 +6579,41 @@ const Recepcion = {
     _pedidosDia: [],
     _pedidosDiaFecha: '',
 
+    // Vista "planilla": una tabla tipo Excel con los clientes en columnas y lo que le toca a cada uno cargado a mano.
+    // Solo en pantallas anchas (por debajo de 1100px la tabla se ve como tarjetas y no entra).
+    get _planilla() {
+        let guardado = true;
+        try { guardado = localStorage.getItem('recepcion-vista') !== 'simple'; } catch (e) { /* sin almacenamiento */ }
+        return guardado && window.matchMedia('(min-width: 1101px)').matches;
+    },
+
+    cambiarVista() {
+        this._flush();
+        try { localStorage.setItem('recepcion-vista', this._planilla ? 'simple' : 'planilla'); } catch (e) { /* sin almacenamiento */ }
+        this.render();
+    },
+
+    // En la planilla una fila puede recibir de cualquier cliente que pidió el producto (aunque se lo haya
+    // pedido a otro proveedor): "pidió" cuenta lo pedido a ESE proveedor y "base" sirve para repartir
+    // automático solo lo ya guardado sin reparto (una fila agregada con "+ Proveedor" no tiene pedidos propios).
     _clientesDe(clave) {
         if (this._pedidosDiaFecha !== AppState.currentDate) return [];
         const { productoId, proveedorId } = this._partesClave(clave);
         const producto = this.findById(AppState.productos || [], productoId);
         const porCliente = new Map();
+        const planilla = this._planilla;
         (this._pedidosDia || []).forEach(pedido => {
             if (String(pedido.producto_id) !== String(productoId)) return;
-            if (proveedorId !== null && this._proveedorDePedido(pedido, producto) !== proveedorId) return;
+            const delProveedor = proveedorId === null || this._proveedorDePedido(pedido, producto) === proveedorId;
+            if (!delProveedor && !planilla) return;
             const id = String(pedido.cliente_id);
             if (!porCliente.has(id)) {
-                porCliente.set(id, { cliente_id: id, nombre: pedido.cliente_nombre || '', cantidadPedida: 0 });
+                porCliente.set(id, { cliente_id: id, nombre: pedido.cliente_nombre || '', cantidadPedida: 0, base: 0 });
             }
-            porCliente.get(id).cantidadPedida += parseFloat(pedido.cantidad) || 0;
+            const cantidad = parseFloat(pedido.cantidad) || 0;
+            const cli = porCliente.get(id);
+            if (delProveedor) cli.cantidadPedida += cantidad;
+            cli.base += cantidad;
         });
         const clientes = [...porCliente.values()];
         clientes.forEach(c => {
@@ -6605,8 +6627,13 @@ const Recepcion = {
 
     // Reparto en proporción a lo pedido: { cliente_id: cantidad }.
     _repartoAuto(clientes, llego) {
-        const lineas = clientes.map(c => ({ cliente_id: c.cliente_id, cantidadPedida: c.cantidadPedida }));
         const mapa = {};
+        clientes.forEach(c => { mapa[String(c.cliente_id)] = 0; });
+        // Una fila sin pedidos propios (otro proveedor agregado a mano) se reparte según lo pedido en total.
+        const conPedido = clientes.some(c => c.cantidadPedida > 0);
+        const lineas = clientes
+            .map(c => ({ cliente_id: c.cliente_id, cantidadPedida: conPedido ? c.cantidadPedida : (c.base || 0) }))
+            .filter(l => l.cantidadPedida > 0);
         Precios.repartirRecibido(lineas, Number(llego) || 0).forEach(l => { mapa[String(l.cliente_id)] = l.cantidad; });
         return mapa;
     },
@@ -6646,7 +6673,8 @@ const Recepcion = {
             mapa[id] = isNaN(n) ? 0 : Math.max(0, n);
             if (Math.abs(mapa[id] - (auto[id] || 0)) > 0.005) distinto = true;
         });
-        return distinto ? mapa : null;
+        // En la planilla lo cargado a mano es siempre el reparto (no existe uno automático que respetar).
+        return distinto || this._planilla ? mapa : null;
     },
 
     // Al cambiar el total, cada cliente vuelve a su parte proporcional.
@@ -6691,7 +6719,42 @@ const Recepcion = {
         return !isNaN(n) && n >= 0 && Math.abs(n - (Number(pedida) || 0)) > 0.005;
     },
 
+    // Planilla: un producto puede tener varias filas (una por proveedor). Cada cliente tiene que recibir en
+    // total lo que pidió, sumando lo de todas las filas: en rojo si no coincide.
+    _marcarDistintosPlanilla(clave) {
+        const item = this._item(clave);
+        if (!item) return;
+        const filas = (AppState.recepcion || []).filter(r => String(r.producto_id) === String(item.producto_id));
+        const pedidoPorCliente = {};
+        this._clientesDe(clave).forEach(c => { pedidoPorCliente[c.cliente_id] = c.base || 0; });
+        const recibido = {};
+        const celdas = [];
+        filas.forEach(fila => {
+            this._inputsReparto(this._claveDe(fila)).forEach(input => {
+                const id = input.getAttribute('data-cliente-id');
+                const n = Utils.parseCantidad(input.value);
+                recibido[id] = (recibido[id] || 0) + (isNaN(n) ? 0 : n);
+                celdas.push({ input, id });
+            });
+        });
+        celdas.forEach(({ input, id }) => {
+            const hayCarga = filas.some(f => this._inputsReparto(this._claveDe(f)).some(i => i.getAttribute('data-cliente-id') === id && i.value !== ''));
+            input.classList.toggle('recepcion-distinto', hayCarga && this._esDistinto(recibido[id] || 0, pedidoPorCliente[id] || 0));
+        });
+        const pedidoTotal = Object.values(pedidoPorCliente).reduce((t, n) => t + n, 0);
+        const llegoTotal = filas.reduce((t, f) => {
+            const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${this._claveDe(f)}"]`);
+            const n = Utils.parseCantidad(llegoInput?.value);
+            return t + (isNaN(n) ? 0 : n);
+        }, 0);
+        filas.forEach(f => {
+            const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${this._claveDe(f)}"]`);
+            if (llegoInput) llegoInput.classList.toggle('recepcion-distinto', llegoInput.value !== '' && this._esDistinto(llegoTotal, pedidoTotal));
+        });
+    },
+
     _marcarDistintos(productoId) {
+        if (this._planilla) return this._marcarDistintosPlanilla(productoId);
         const clientes = this._clientesDe(productoId);
         if (!clientes.length) return;
         const pedidas = Object.fromEntries(clientes.map(c => [String(c.cliente_id), Number(c.cantidadPedida) || 0]));
@@ -6797,6 +6860,23 @@ const Recepcion = {
             const otraExtraAntes = filas.some(o => o !== f && esExtra(o) && String(o.proveedor_id || '') === prov && filas.indexOf(o) < filas.indexOf(f));
             return hayPropia || otraExtraAntes ? f : { ...f, extra: false };
         });
+    },
+
+    // Reparto a mano de una fila ya confirmada, o null si no lo tiene o no cierra con lo que llegó.
+    // Una fila en 0 (ese proveedor no trajo nada) vale como reparto vacío.
+    _repartoManualDe(fila) {
+        const confirmada = fila.confirmado === true || fila.confirmado === 'true' || fila.confirmado === 1;
+        if (!confirmada) return null;
+        const llego = parseFloat(fila.llego) || 0;
+        const reparto = fila.reparto && typeof fila.reparto === 'object' ? fila.reparto : null;
+        if (!reparto) return llego === 0 ? {} : null;
+        const suma = Object.values(reparto).reduce((t, n) => t + (Number(n) || 0), 0);
+        return Math.abs(suma - llego) <= 0.05 ? reparto : null;
+    },
+
+    // Todas las filas del producto están confirmadas y con lo que le tocó a cada cliente cargado a mano.
+    _todasConRepartoManual(filas) {
+        return filas.length > 0 && filas.every(f => this._repartoManualDe(f) !== null);
     },
 
     // Todas las filas de un producto juntas (para las pantallas que miran el producto entero):
@@ -6917,13 +6997,22 @@ const Recepcion = {
         tbody.addEventListener('change', guardarCampo);
         // Flechas arriba/abajo: pasan al mismo campo (llegó, precio o reparto) de la fila siguiente/anterior.
         tbody.addEventListener('keydown', (e) => {
-            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            const teclas = ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'Enter'];
+            if (!teclas.includes(e.key)) return;
             const clase = ['recepcion-llego', 'recepcion-precio', 'recepcion-reparto'].find(c => e.target.classList?.contains(c));
             if (!clase) return;
+            const libre = c => !c.disabled && c.offsetParent !== null;
+            if (this._planilla && this._moverEnPlanilla(e, clase, tbody, libre)) return;
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
             e.preventDefault();
-            const campos = [...tbody.querySelectorAll('.' + clase)].filter(c => !c.disabled && c.offsetParent !== null);
+            const campos = [...tbody.querySelectorAll('.' + clase)].filter(libre);
             const destino = campos[campos.indexOf(e.target) + (e.key === 'ArrowDown' ? 1 : -1)];
             if (destino) { destino.focus(); destino.select(); }
+        });
+        // Como en una planilla: al entrar en una celda queda todo seleccionado y lo que se escribe reemplaza.
+        tbody.addEventListener('focusin', (e) => {
+            if (!this._planilla || !e.target.matches?.('.recepcion-reparto, .recepcion-precio')) return;
+            setTimeout(() => { if (document.activeElement === e.target) e.target.select(); }, 0);
         });
 
         if (!this._salidaEnganchada) {
@@ -6934,6 +7023,26 @@ const Recepcion = {
             window.addEventListener('pagehide', () => this._flush());
         }
         this._actionsBound = true;
+    },
+
+    // Flechas y Enter dentro de la planilla: arriba/abajo (Enter baja) siguen en la misma columna;
+    // izquierda/derecha pasan a la celda de al lado de la misma fila. Devuelve true si movió.
+    _moverEnPlanilla(e, clase, tbody, libre) {
+        const fila = e.target.closest('tr');
+        let destino = null;
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            const celdas = [...fila.querySelectorAll('.recepcion-precio, .recepcion-reparto')].filter(libre);
+            destino = celdas[celdas.indexOf(e.target) + (e.key === 'ArrowRight' ? 1 : -1)];
+        } else {
+            const mismos = c => clase === 'recepcion-reparto'
+                ? c.getAttribute('data-cliente-id') === e.target.getAttribute('data-cliente-id')
+                : true;
+            const campos = [...tbody.querySelectorAll('.' + clase)].filter(c => libre(c) && mismos(c) && !c.closest('tr').classList.contains('fila-oculta'));
+            destino = campos[campos.indexOf(e.target) + (e.key === 'ArrowUp' ? -1 : 1)];
+        }
+        e.preventDefault();
+        if (destino) { destino.focus(); destino.select(); }
+        return true;
     },
 
     // Si la fila guardada en la planilla de recepción quedó con otro proveedor que el de los pedidos del
@@ -7273,6 +7382,8 @@ const Recepcion = {
         // Ocultar loader local
         Utils.hideTableLoader(tbody);
         this._pintarFiltroProveedor();
+        const planilla = this._planilla;
+        this._pintarCabecera(planilla);
         
         if (AppState.recepcion.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No hay recepciones para el día seleccionado</td></tr>';
@@ -7280,6 +7391,10 @@ const Recepcion = {
         }
 
         const visibles = this._visibles();
+        if (planilla) {
+            this._renderPlanilla(visibles, tbody);
+            return;
+        }
         let rowsHtml = '';
         
         visibles.forEach(item => {
@@ -7320,6 +7435,106 @@ const Recepcion = {
         this._aplicarFiltroProducto();
     },
     
+    // ---- Vista planilla ----
+    _clientesColumnas(visibles) {
+        const ids = new Set();
+        const claves = new Set(visibles.map(i => String(i.producto_id)));
+        (this._pedidosDia || []).forEach(p => { if (claves.has(String(p.producto_id))) ids.add(String(p.cliente_id)); });
+        const porId = new Map();
+        (this._pedidosDia || []).forEach(p => {
+            const id = String(p.cliente_id);
+            if (ids.has(id) && !porId.has(id)) {
+                const cli = (AppState.clientes || []).find(x => String(x.id) === id);
+                porId.set(id, { id, nombre: p.cliente_nombre || cli?.nombre || 'Cliente' });
+            }
+        });
+        return [...porId.values()].sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    _pintarCabecera(planilla) {
+        const thead = document.getElementById('recepcion-thead');
+        const contenedor = document.getElementById('recepcion-tabla');
+        const boton = document.getElementById('recepcion-btn-vista');
+        if (contenedor) contenedor.classList.toggle('recepcion-planilla', planilla);
+        if (boton) {
+            boton.textContent = planilla ? 'Ver lista simple' : 'Ver planilla';
+            boton.hidden = !planilla && !window.matchMedia('(min-width: 1101px)').matches;
+        }
+        if (!thead) return;
+        if (!planilla) {
+            thead.innerHTML = `<tr>
+                <th>Producto</th>
+                <th>Pedido</th>
+                <th>Llegó</th>
+                <th title="Costo por unidad que te cobró el proveedor">Precio real <span class="th-hint">(costo / u)</span></th>
+                <th>Proveedor</th>
+                <th>Acción</th>
+            </tr>`;
+        }
+    },
+
+    _renderPlanilla(visibles, tbody) {
+        const columnas = this._clientesColumnas(visibles);
+        const thead = document.getElementById('recepcion-thead');
+        if (thead) {
+            thead.innerHTML = `<tr>
+                <th class="rp-prod">Producto</th>
+                <th>Proveedor</th>
+                <th>Pedido</th>
+                <th>Llegó</th>
+                <th title="Costo por unidad que te cobró el proveedor">Precio <span class="th-hint">(costo / u)</span></th>
+                <th>Acción</th>
+                ${columnas.map(c => `<th class="rp-cli" title="${Utils.esc(c.nombre)}"><span>${Utils.esc(c.nombre)}</span></th>`).join('')}
+            </tr>`;
+        }
+        tbody.innerHTML = visibles.map(item => this._filaPlanilla(item, columnas)).join('');
+        Utils.enablePriceInputs(tbody);
+        tbody.querySelectorAll('.recepcion-llego').forEach(input => this._marcarDistintos(input.getAttribute('data-producto-id')));
+        this._aplicarFiltroProducto();
+    },
+
+    _filaPlanilla(item, columnas) {
+        const clave = this._claveDe(item);
+        const confirmada = item.confirmado === true || item.confirmado === 'true';
+        const disabled = confirmada ? ' disabled' : '';
+        const clientes = this._clientesDe(clave);
+        const porId = Object.fromEntries(clientes.map(c => [c.cliente_id, c]));
+        const sinCargar = this._sinCargar(item);
+        const reparto = sinCargar
+            ? Object.fromEntries(clientes.map(c => [c.cliente_id, c.cantidadPedida]))
+            : this._repartoDe(item);
+        const mostrar = confirmada || sinCargar || Number(item.llego) > 0;
+        const llegoValor = mostrar ? Utils.formatCantidadInput(
+            sinCargar ? item.pedido_total : (clientes.length ? Object.values(reparto).reduce((t, n) => t + (Number(n) || 0), 0) : item.llego)
+        ) : '';
+        const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
+        const acciones = confirmada
+            ? `<div class="recepcion-acciones-group">
+                <span class="status-badge status-activo">Confirmado</span>
+                <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${clave}">Editar</button>
+                <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${clave}">Eliminar</button>
+               </div>`
+            : `<div class="recepcion-acciones-group"><button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${clave}">Confirmar</button>`
+                + (item.extra ? `<button type="button" class="btn btn-danger btn-sm btn-quitar-proveedor-recepcion" data-producto-id="${clave}">Quitar</button>` : '')
+                + '</div>';
+        const celdas = columnas.map(col => {
+            const c = porId[col.id];
+            if (!c) return '<td class="rp-na" aria-hidden="true"></td>';
+            const valor = mostrar ? Utils.formatCantidadInput(reparto[col.id] || 0) : '';
+            return `<td class="rp-cel"><input type="number" step="any" min="0" class="recepcion-reparto" data-producto-id="${clave}" data-cliente-id="${Utils.esc(col.id)}" value="${valor}" placeholder="0"${disabled} title="${Utils.esc(col.nombre)}: cuánto le toca de lo que llegó">${c.cantidadPedida > 0 ? `<small class="rp-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</small>` : ''}</td>`;
+        }).join('');
+        return `
+            <tr${confirmada ? ' class="recepcion-row-confirmada"' : ''} data-nombre="${Utils.esc(this._normalizarBusqueda(item.producto_nombre))}">
+                <td class="rp-prod">${item.extra ? `<span class="rp-sub">↳</span> ${Utils.esc(item.producto_nombre || '')}` : Utils.esc(item.producto_nombre || '')}${!confirmada && !item.extra ? ` <button type="button" class="btn btn-secondary btn-sm btn-dividir-proveedor" data-producto-id="${clave}" title="Agregar otro proveedor de este producto">+ Proveedor</button>` : ''}</td>
+                <td>${Utils.esc(item.proveedor_nombre || '')}</td>
+                <td>${item.extra ? '—' : Utils.formatCantidad(item.pedido_total || 0)}</td>
+                <td><input type="number" step="any" class="recepcion-llego rp-total" data-id="${item.id}" data-producto-id="${clave}" value="${llegoValor}" placeholder="0" readonly tabindex="-1" title="Es la suma de lo que le toca a cada cliente"></td>
+                <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${clave}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
+                <td class="recepcion-acciones">${acciones}</td>
+                ${celdas}
+            </tr>`;
+    },
+
     async save() {
         const items = [];
         const productos = await API.getProductos();
@@ -7556,7 +7771,7 @@ const Recepcion = {
                         <input type="number" step="any" min="0" class="modal-reparto" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${Utils.formatCantidadInput(repartoModal[c.cliente_id] || 0)}">
                     </label>`).join('')}
                 </div>
-                <small class="modal-hint">Si cambiás el total, se reparte en proporción a lo pedido. Si cambiás lo de un cliente, el total se ajusta solo.</small>
+                <small class="modal-hint">${this._planilla ? 'Cargá lo que le toca a cada cliente: el total se ajusta solo.' : 'Si cambiás el total, se reparte en proporción a lo pedido. Si cambiás lo de un cliente, el total se ajusta solo.'}</small>
             </div>` : ''}
             <div class="form-group">
                 <label>Precio real (costo por unidad)</label>
@@ -8855,7 +9070,32 @@ const Precios = {
             const filasProducto = Recepcion._extrasComoPropias((recepciones || []).filter(r => String(r.producto_id) === String(productoId)), proveedoresDelProducto);
             const esExtra = r => r.extra === true || r.extra === 'true';
             let asignadas;
-            if (filasProducto.some(esExtra)) {
+            const acumulado = {};
+            const filasCompletas = proveedoresDelProducto.every(prov => Recepcion._asignarFilas(filasProducto.filter(r => !esExtra(r)), proveedoresDelProducto)[prov]);
+            if (filasProducto.some(esExtra) && filasCompletas && Recepcion._todasConRepartoManual(filasProducto)) {
+                // Vino de varios proveedores y en Recepción se cargó a mano lo que le toca a cada cliente de cada uno:
+                // la línea de cada cliente suma lo de todas las filas.
+                confirmadosIds.add(String(productoId));
+                const lineasCli = {};
+                porProducto[productoId].forEach(pedido => {
+                    const key = String(pedido.cliente_id);
+                    if (!lineasCli[key]) lineasCli[key] = { cliente_id: pedido.cliente_id, producto_id: productoId, producto_nombre: pedido.producto_nombre || '', cantidadPedida: 0, cantidad: 0 };
+                    lineasCli[key].cantidadPedida += parseFloat(pedido.cantidad) || 0;
+                });
+                filasProducto.forEach(fila => {
+                    Object.keys(fila.reparto || {}).forEach(id => {
+                        if (lineasCli[id]) lineasCli[id].cantidad = Math.round((lineasCli[id].cantidad + (Number(fila.reparto[id]) || 0)) * 100) / 100;
+                    });
+                });
+                Object.assign(acumulado, lineasCli);
+                const pedidoTotal = Object.values(lineasCli).reduce((t, l) => t + l.cantidadPedida, 0);
+                const llegoTotal = Object.values(lineasCli).reduce((t, l) => t + l.cantidad, 0);
+                if (Math.abs(llegoTotal - pedidoTotal) > 0.005) {
+                    avisosFaltante.push(`${Object.values(lineasCli)[0].producto_nombre || 'Producto'}: pedido ${pedidoTotal}, llegó ${Math.round(llegoTotal * 100) / 100}`);
+                }
+                proveedoresDelProducto = [];
+                asignadas = {};
+            } else if (filasProducto.some(esExtra)) {
                 // Vino de varios proveedores cargados a mano: lo que llegó en total se reparte entre todos los clientes.
                 const propias = Recepcion._asignarFilas(filasProducto.filter(r => !esExtra(r)), proveedoresDelProducto);
                 const completo = proveedoresDelProducto.every(prov => propias[prov]);
@@ -8868,7 +9108,6 @@ const Precios = {
                 asignadas = Recepcion._asignarFilas(filasProducto, proveedoresDelProducto);
             }
 
-            const acumulado = {};
             proveedoresDelProducto.forEach(prov => {
                 const recepcion = asignadas[prov];
                 if (!recepcion || !confirmada(recepcion)) {
@@ -8901,13 +9140,22 @@ const Precios = {
                 }
 
                 // Si se repartió a mano (a quién le toca de más o de menos), se respeta; si no, es proporcional.
+                // Puede incluir clientes que le pidieron el producto a otro proveedor (le tocó de este).
                 const repartoManual = recepcion.reparto && typeof recepcion.reparto === 'object' ? recepcion.reparto : null;
+                const clientesDelProducto = new Set(porProducto[productoId].map(pedido => String(pedido.cliente_id)));
                 const manualValido = repartoManual
                     && lineas.every(l => repartoManual[String(l.cliente_id)] !== undefined)
-                    && Math.abs(lineas.reduce((t, l) => t + (Number(repartoManual[String(l.cliente_id)]) || 0), 0) - llego) <= 0.05;
-                const repartidas = manualValido
-                    ? lineas.map(l => ({ ...l, cantidad: Math.round((Number(repartoManual[String(l.cliente_id)]) || 0) * 100) / 100 }))
-                    : this.repartirRecibido(lineas, llego);
+                    && Object.keys(repartoManual).every(id => clientesDelProducto.has(id))
+                    && Math.abs(Object.values(repartoManual).reduce((t, n) => t + (Number(n) || 0), 0) - llego) <= 0.05;
+                let repartidas;
+                if (manualValido) {
+                    const extrasCli = Object.keys(repartoManual).filter(id => !lineas.some(l => String(l.cliente_id) === id));
+                    repartidas = lineas.concat(extrasCli.map(id => ({
+                        cliente_id: id, producto_id: productoId, producto_nombre: lineas[0].producto_nombre || '', cantidadPedida: 0
+                    }))).map(l => ({ ...l, cantidad: Math.round((Number(repartoManual[String(l.cliente_id)]) || 0) * 100) / 100 }));
+                } else {
+                    repartidas = this.repartirRecibido(lineas, llego);
+                }
                 repartidas.forEach(linea => {
                     const key = String(linea.cliente_id);
                     if (!acumulado[key]) acumulado[key] = { ...linea, cantidad: 0 };
@@ -11607,8 +11855,8 @@ const Cobranzas = {
             return;
         }
 
+        // Arranca vacío: el botón "Todo en efectivo" completa el saldo si hace falta.
         const inicial = MediosPago.vacio();
-        inicial.efectivo = saldo;
         const yaPagado = Utils.parsePrice(cobranza.pagado) || 0;
         const yaPago = yaPagado > 0.01
             ? `<p class="modal-hint"><strong>Ya pagó ${Utils.formatCurrency(yaPagado)}</strong>${MediosPago.texto(cobranza.medios) !== '—' ? ' · ' + MediosPago.texto(cobranza.medios) : ''}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</p>`
@@ -12465,7 +12713,6 @@ const CobranzasHoy = {
 
     async cobrar(clienteId, total, saldoActual) {
         const inicial = MediosPago.vacio();
-        inicial.efectivo = saldoActual > 0 ? saldoActual : 0;
         const content = `
             <p class="modal-hint">Total del día ${Utils.formatCurrency(total)}. Repartí el cobro. Lo que no cargues queda adeudado.</p>
             ${MediosPago.html(MediosPago.deCliente, inicial)}

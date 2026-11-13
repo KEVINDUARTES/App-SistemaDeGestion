@@ -4118,3 +4118,27 @@ html {
 .links-url { font-size: 12px; color: #56665c; word-break: break-all; max-width: 380px; }
 .links-sin { color: #8a949c; }
 .links-botones { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* Recepción: planilla tipo Excel (clientes en columnas). Solo en pantallas anchas. */
+.recepcion-filtro #recepcion-btn-vista { margin-left: auto; }
+#recepcion-tabla.recepcion-planilla { overflow: auto; max-height: calc(100vh - 220px); }
+#recepcion-tabla.recepcion-planilla .data-table { width: max-content; min-width: 100%; }
+#recepcion-tabla.recepcion-planilla thead th { position: sticky; top: 0; z-index: 3; background: var(--color-primary); white-space: nowrap; padding: 10px 8px; }
+#recepcion-tabla.recepcion-planilla td { padding: 6px 8px; font-size: 13px; white-space: nowrap; }
+#recepcion-tabla.recepcion-planilla tbody tr:hover { transform: none; box-shadow: none; }
+#recepcion-tabla.recepcion-planilla td.rp-prod { position: sticky; left: 0; z-index: 2; background: #fff; min-width: 190px; white-space: normal; box-shadow: 1px 0 0 #e2e8f0; }
+#recepcion-tabla.recepcion-planilla thead th.rp-prod { position: sticky; left: 0; z-index: 4; }
+#recepcion-tabla.recepcion-planilla tr.recepcion-row-confirmada td.rp-prod { background: #f0fdf4; }
+#recepcion-tabla.recepcion-planilla .rp-sub { color: #94a3b8; }
+#recepcion-tabla.recepcion-planilla .recepcion-acciones { min-width: 0; }
+#recepcion-tabla.recepcion-planilla th.rp-cli { min-width: 84px; max-width: 110px; white-space: normal; text-align: center; line-height: 1.15; }
+#recepcion-tabla.recepcion-planilla th.rp-cli span { display: block; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+#recepcion-tabla.recepcion-planilla .rp-cel { text-align: center; border-left: 1px solid #eef2f7; }
+#recepcion-tabla.recepcion-planilla .rp-na { background: repeating-linear-gradient(135deg, #f8fafc, #f8fafc 6px, #f1f5f9 6px, #f1f5f9 12px); border-left: 1px solid #eef2f7; }
+#recepcion-tabla.recepcion-planilla .rp-cel input { width: 70px; padding: 4px 6px; text-align: center; }
+#recepcion-tabla.recepcion-planilla .rp-pidio { display: block; color: #94a3b8; font-size: 10.5px; line-height: 1.2; margin-top: 1px; }
+#recepcion-tabla.recepcion-planilla input.rp-total { width: 72px; padding: 4px 6px; text-align: center; background: #f1f5f9; font-weight: 700; }
+#recepcion-tabla.recepcion-planilla .recepcion-precio { width: 90px; padding: 4px 6px; }
+#recepcion-tabla.recepcion-planilla .rp-cel input:focus,
+#recepcion-tabla.recepcion-planilla .recepcion-precio:focus { outline: 2px solid #2563eb; outline-offset: -1px; }
+@media (max-width: 1100px) { #recepcion-btn-vista { display: none; } }
