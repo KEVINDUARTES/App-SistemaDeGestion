@@ -42,7 +42,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
-    <link rel="stylesheet" href="styles.css?v=20261113prov">
+    <link rel="stylesheet" href="styles.css?v=20261114full">
 </head>
 <body>
     <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
@@ -447,7 +447,19 @@
                 <label for="recepcion-filtro-producto">Producto:</label>
                 <input type="search" id="recepcion-filtro-producto" class="form-control" placeholder="Buscar producto…" autocomplete="off" oninput="Recepcion.filtrarProducto(this.value)">
                 <span id="recepcion-filtro-cuenta" class="modal-hint"></span>
-                <button type="button" class="btn btn-secondary btn-sm" id="recepcion-btn-vista" onclick="Recepcion.cambiarVista()">Ver lista simple</button>
+                <span class="rp-ctrl">
+                    <label for="recepcion-zoom" class="rp-solo-planilla">Tamaño:</label>
+                    <select id="recepcion-zoom" class="form-control rp-solo-planilla" onchange="Recepcion.cambiarZoom(this.value)" aria-label="Tamaño de la planilla">
+                        <option value="100">100 %</option>
+                        <option value="90">90 %</option>
+                        <option value="80">80 %</option>
+                        <option value="70">70 %</option>
+                        <option value="60">60 %</option>
+                        <option value="50">50 %</option>
+                    </select>
+                    <button type="button" class="btn btn-secondary btn-sm rp-solo-planilla" id="recepcion-btn-full" onclick="Recepcion.pantallaCompleta()">Pantalla completa</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="recepcion-btn-vista" onclick="Recepcion.cambiarVista()">Ver lista simple</button>
+                </span>
             </div>
             <div class="table-container" id="recepcion-tabla">
                 <table class="data-table">
@@ -942,7 +954,7 @@
     <script src="services/whatsapp.js?v=20261110app"></script>
     <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
     <script src="services/precioClienteService.js?v=20261027cierre"></script>
-    <script src="app.js?v=20261113nicol"></script>
+    <script src="app.js?v=20261114full"></script>
     <script>
         // Verificar autenticación y configurar UI
         (function() {

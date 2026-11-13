@@ -6587,6 +6587,28 @@ const Recepcion = {
         return guardado && window.matchMedia('(min-width: 1101px)').matches;
     },
 
+    // Tamaño de la planilla (zoom) y pantalla completa: para ver todos los clientes sin desplazarse.
+    get _zoom() {
+        let z = '90';
+        try { z = localStorage.getItem('recepcion-zoom') || '90'; } catch (e) { /* sin almacenamiento */ }
+        return ['100', '90', '80', '70', '60', '50'].includes(z) ? z : '90';
+    },
+
+    get _pantallaCompleta() {
+        try { return localStorage.getItem('recepcion-full') === '1'; } catch (e) { return false; }
+    },
+
+    cambiarZoom(valor) {
+        try { localStorage.setItem('recepcion-zoom', String(valor)); } catch (e) { /* sin almacenamiento */ }
+        this._pintarCabecera(this._planilla);
+    },
+
+    pantallaCompleta(forzar) {
+        const nuevo = typeof forzar === 'boolean' ? forzar : !this._pantallaCompleta;
+        try { localStorage.setItem('recepcion-full', nuevo ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+        this._pintarCabecera(this._planilla);
+    },
+
     cambiarVista() {
         this._flush();
         try { localStorage.setItem('recepcion-vista', this._planilla ? 'simple' : 'planilla'); } catch (e) { /* sin almacenamiento */ }
@@ -7008,6 +7030,9 @@ const Recepcion = {
             const campos = [...tbody.querySelectorAll('.' + clase)].filter(libre);
             const destino = campos[campos.indexOf(e.target) + (e.key === 'ArrowDown' ? 1 : -1)];
             if (destino) { destino.focus(); destino.select(); }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && document.body.classList.contains('recepcion-full') && !document.querySelector('.modal-overlay.active, #custom-confirm-accept')) this.pantallaCompleta(false);
         });
         // Como en una planilla: al entrar en una celda queda todo seleccionado y lo que se escribe reemplaza.
         tbody.addEventListener('focusin', (e) => {
@@ -7455,7 +7480,17 @@ const Recepcion = {
         const thead = document.getElementById('recepcion-thead');
         const contenedor = document.getElementById('recepcion-tabla');
         const boton = document.getElementById('recepcion-btn-vista');
-        if (contenedor) contenedor.classList.toggle('recepcion-planilla', planilla);
+        if (contenedor) {
+            contenedor.classList.toggle('recepcion-planilla', planilla);
+            contenedor.style.setProperty('--rp-zoom', String(Number(this._zoom) / 100));
+        }
+        const completa = planilla && this._pantallaCompleta;
+        document.body.classList.toggle('recepcion-full', completa);
+        document.querySelectorAll('.rp-solo-planilla').forEach(el => { el.hidden = !planilla; });
+        const zoom = document.getElementById('recepcion-zoom');
+        if (zoom) zoom.value = this._zoom;
+        const btnFull = document.getElementById('recepcion-btn-full');
+        if (btnFull) btnFull.textContent = completa ? 'Salir de pantalla completa' : 'Pantalla completa';
         if (boton) {
             boton.textContent = planilla ? 'Ver lista simple' : 'Ver planilla';
             boton.hidden = !planilla && !window.matchMedia('(min-width: 1101px)').matches;
@@ -7510,9 +7545,9 @@ const Recepcion = {
         const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
         const acciones = confirmada
             ? `<div class="recepcion-acciones-group">
-                <span class="status-badge status-activo">Confirmado</span>
+                <span class="status-badge status-activo" title="Confirmado">✓</span>
                 <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${clave}">Editar</button>
-                <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${clave}">Eliminar</button>
+                <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${clave}" title="Eliminar la recepción de este producto">✕</button>
                </div>`
             : `<div class="recepcion-acciones-group"><button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${clave}">Confirmar</button>`
                 + (item.extra ? `<button type="button" class="btn btn-danger btn-sm btn-quitar-proveedor-recepcion" data-producto-id="${clave}">Quitar</button>` : '')

@@ -4120,7 +4120,8 @@ html {
 .links-botones { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* Recepción: planilla tipo Excel (clientes en columnas). Solo en pantallas anchas. */
-.recepcion-filtro #recepcion-btn-vista { margin-left: auto; }
+.recepcion-filtro .rp-ctrl { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+.recepcion-filtro .rp-ctrl select { min-width: 0; width: auto; }
 #recepcion-tabla.recepcion-planilla { overflow: auto; max-height: calc(100vh - 220px); }
 #recepcion-tabla.recepcion-planilla .data-table { width: max-content; min-width: 100%; }
 #recepcion-tabla.recepcion-planilla thead th { position: sticky; top: 0; z-index: 3; background: var(--color-primary); white-space: nowrap; padding: 10px 8px; }
@@ -4155,3 +4156,27 @@ html {
 .rp-prod-celda { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .rp-prod-nombre { min-width: 0; }
 .rp-prod-celda .btn-dividir-proveedor { flex: none; white-space: nowrap; }
+
+/* Planilla compacta + tamaño + pantalla completa: ver todo junto, sin desplazarse hacia el costado. */
+#recepcion-tabla.recepcion-planilla .data-table { zoom: var(--rp-zoom, 0.9); }
+#recepcion-tabla.recepcion-planilla thead th { padding: 6px 6px; font-size: 11px; letter-spacing: .3px; }
+#recepcion-tabla.recepcion-planilla td { padding: 3px 6px; font-size: 12.5px; }
+#recepcion-tabla.recepcion-planilla th.rp-cli { min-width: 62px; max-width: 84px; }
+#recepcion-tabla.recepcion-planilla .rp-cel input { width: 56px; padding: 2px 4px; font-size: 12.5px; }
+#recepcion-tabla.recepcion-planilla input.rp-total { width: 58px; padding: 2px 4px; }
+#recepcion-tabla.recepcion-planilla .recepcion-precio { width: 76px; padding: 2px 4px; font-size: 12.5px; }
+#recepcion-tabla.recepcion-planilla td.rp-prod { min-width: 220px; }
+#recepcion-tabla.recepcion-planilla .rp-pidio { font-size: 9.5px; margin-top: 0; }
+#recepcion-tabla.recepcion-planilla .rp-acc .btn-sm { padding: 3px 8px; font-size: 11.5px; }
+#recepcion-tabla.recepcion-planilla .rp-acc .status-badge { padding: 2px 7px; }
+#recepcion-tabla.recepcion-planilla .btn-dividir-proveedor { padding: 2px 8px; font-size: 11px; }
+
+/* Pantalla completa: solo mientras se está en Recepción. Sin menú, sin barra de arriba y sin textos de ayuda. */
+body.recepcion-full:has(#recepcion.active) .sidebar,
+body.recepcion-full:has(#recepcion.active) .header,
+body.recepcion-full:has(#recepcion.active) #recepcion .page-header,
+body.recepcion-full:has(#recepcion.active) #recepcion .dia-operativo-hint { display: none; }
+body.recepcion-full:has(#recepcion.active) .main-content { margin-left: 0; }
+body.recepcion-full:has(#recepcion.active) #recepcion.page { padding: 10px 14px; }
+body.recepcion-full:has(#recepcion.active) #recepcion .table-container { margin-top: 8px; }
+body.recepcion-full:has(#recepcion.active) #recepcion-tabla.recepcion-planilla { max-height: calc(100vh - 120px); }
