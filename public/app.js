@@ -575,7 +575,7 @@ const Utils = {
     },
 
     // Precios al cliente solo lo ve este usuario (en el menú, en los pasos del día y en la pantalla).
-    USUARIOS_CON_PRECIOS: ['cargasluciano@gmail.com'],
+    USUARIOS_CON_PRECIOS: ['cargasluciano@gmail.com', 'nicolirina.rosascharny@gmail.com'],
 
     veePrecios() {
         const email = String(Auth.getUserEmail() || '').toLowerCase();
@@ -2620,7 +2620,7 @@ const Navigation = {
 const Dashboard = {
     chart: null,
     // Usuarios que ven en el inicio el detalle de saldos por cliente y por proveedor.
-    USUARIOS_CON_SALDOS: ['cargasluciano@gmail.com'],
+    USUARIOS_CON_SALDOS: ['cargasluciano@gmail.com', 'nicolirina.rosascharny@gmail.com'],
     
     async load() {
         const chartContainer = document.querySelector('.chart-container');
