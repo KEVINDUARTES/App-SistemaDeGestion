@@ -8421,6 +8421,7 @@ const Precios = {
                 this.selectedClienteId = savedClienteId;
                 filtroCliente.value = savedClienteId;
             }
+            this._mostrarClienteElegido();
             
             this._sincronizarComision();
             this.render();
@@ -8467,6 +8468,73 @@ const Precios = {
         this.render();
     },
     
+    // Buscador de la tabla: además de filtrar filas, lista en vivo los clientes que coinciden; al elegir uno la tabla muestra solo ese.
+    _norm(texto) {
+        return String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    },
+
+    _mostrarClienteElegido() {
+        const input = document.getElementById('precios-buscador');
+        if (!input) return;
+        const cliente = this.selectedClienteId
+            ? (AppState.clientes || []).find(c => String(c.id) === String(this.selectedClienteId))
+            : null;
+        input.value = cliente ? cliente.nombre : '';
+    },
+
+    _ocultarSugerencias() {
+        const lista = document.getElementById('precios-cliente-sugerencias');
+        if (lista) { lista.hidden = true; lista.innerHTML = ''; }
+    },
+
+    _mostrarSugerencias(texto) {
+        const lista = document.getElementById('precios-cliente-sugerencias');
+        if (!lista) return;
+        const q = this._norm(texto);
+        const coinciden = q
+            ? (AppState.clientes || []).filter(c => c.activo !== false && this._norm(c.nombre).includes(q))
+            : [];
+        lista.innerHTML = '';
+        if (!coinciden.length) { lista.hidden = true; return; }
+        coinciden.forEach(c => {
+            const op = document.createElement('div');
+            op.className = 'opcion';
+            op.dataset.id = c.id;
+            op.textContent = c.nombre;
+            op.addEventListener('mousedown', (e) => { e.preventDefault(); this.elegirCliente(c.id); });
+            lista.appendChild(op);
+        });
+        lista.hidden = false;
+    },
+
+    elegirCliente(clienteId) {
+        const select = document.getElementById('precios-filtro-cliente');
+        if (select) select.value = clienteId || '';
+        this.filterByCliente(clienteId || null);
+        this._mostrarClienteElegido();
+        this._ocultarSugerencias();
+    },
+
+    _teclaBuscador(e) {
+        const lista = document.getElementById('precios-cliente-sugerencias');
+        if (!lista || lista.hidden) return;
+        const ops = Array.from(lista.querySelectorAll('.opcion'));
+        const i = ops.findIndex(o => o.classList.contains('activa'));
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            const nuevo = e.key === 'ArrowDown' ? (i + 1) % ops.length : (i <= 0 ? ops.length - 1 : i - 1);
+            ops.forEach(o => o.classList.remove('activa'));
+            ops[nuevo].classList.add('activa');
+            ops[nuevo].scrollIntoView({ block: 'nearest' });
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            const elegido = i >= 0 ? ops[i] : (ops.length === 1 ? ops[0] : null);
+            if (elegido) this.elegirCliente(elegido.dataset.id);
+        } else if (e.key === 'Escape') {
+            this._ocultarSugerencias();
+        }
+    },
+
     updateComision() {
         const comisionInput = document.getElementById('precios-comision');
         if (comisionInput) {
@@ -9455,6 +9523,8 @@ const Precios = {
         localStorage.removeItem('precios-selected-cliente');
         const select = document.getElementById('precios-filtro-cliente');
         if (select) select.value = '';
+        this._mostrarClienteElegido();
+        this._ocultarSugerencias();
         this.render();
     },
     
@@ -15197,6 +15267,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
     
+    const preciosBuscador = document.getElementById('precios-buscador');
+    if (preciosBuscador) {
+        preciosBuscador.addEventListener('input', (e) => {
+            // Al borrar el texto se quita el cliente elegido y vuelven todos
+            if (!e.target.value.trim() && Precios.selectedClienteId) Precios.elegirCliente(null);
+            Precios._mostrarSugerencias(e.target.value);
+        });
+        preciosBuscador.addEventListener('keydown', (e) => Precios._teclaBuscador(e));
+        preciosBuscador.addEventListener('blur', () => Precios._ocultarSugerencias());
+    }
+
     const preciosComision = document.getElementById('precios-comision');
     if (preciosComision) {
         preciosComision.addEventListener('change', () => {
