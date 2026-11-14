@@ -6914,7 +6914,18 @@ const Recepcion = {
     // Todas las filas de un producto juntas (para las pantallas que miran el producto entero):
     // lo que llegó se suma, el precio es el promedio ponderado y está confirmado si lo están todas.
     agregadoDe(filas, productoId) {
-        const propias = (filas || []).filter(r => String(r.producto_id) === String(productoId));
+        let propias = (filas || []).filter(r => String(r.producto_id) === String(productoId));
+        // Dos filas del mismo proveedor (y que no son un "extra") son la misma mercadería repetida: vale una sola,
+        // la confirmada si la hay. Si no, se sumaría lo que llegó dos veces y el producto nunca quedaría confirmado.
+        const vistas = new Map();
+        propias.forEach(r => {
+            if (r.extra === true || r.extra === 'true') { vistas.set(Symbol('extra'), r); return; }
+            const k = String(r.proveedor_id || '');
+            const previa = vistas.get(k);
+            const conf = x => x.confirmado === true || x.confirmado === 'true' || x.confirmado === 1;
+            if (!previa || (conf(r) && !conf(previa))) vistas.set(k, r);
+        });
+        propias = [...vistas.values()];
         if (propias.length <= 1) return propias[0] || null;
         let llego = 0;
         let costo = 0;

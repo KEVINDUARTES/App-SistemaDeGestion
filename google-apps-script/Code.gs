@@ -3269,6 +3269,22 @@ function saveRecepcion(data) {
         if (yaConf === true || yaConf === 'true' || yaConf === 1 || yaConf === '1') return;
       }
       var repartoItem = item.reparto !== undefined ? normalizarReparto_(item.reparto, item.llego || 0, false) : undefined;
+      // Si el mismo producto y proveedor viene dos veces en este guardado, la segunda vez no agrega otra fila:
+      // pisa la que se acaba de preparar (si no, la recepción queda con una fila repetida sin confirmar).
+      if (rowIdx === undefined && !esExtra_(item.extra)) {
+        var yaPreparada = rowsToAppend.filter(function(f) {
+          return idsMatch(f[2], item.producto_id) && String(f[3] || '') === proveedorItem;
+        })[0];
+        if (yaPreparada) {
+          yaPreparada[5] = item.llego || 0;
+          yaPreparada[6] = normalizeAmount(item.precio_real);
+          if (repartoItem !== undefined && repartoCol !== -1) {
+            while (yaPreparada.length <= repartoCol) yaPreparada.push('');
+            yaPreparada[repartoCol] = repartoItem;
+          }
+          return;
+        }
+      }
       if (rowIdx !== undefined) {
         values[rowIdx][llegoCol]  = item.llego || 0;
         values[rowIdx][precioCol] = normalizeAmount(item.precio_real);
