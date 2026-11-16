@@ -12586,6 +12586,7 @@ const CobranzasHoy = {
             botones.push(`<button type="button" class="btn btn-primary" onclick="CobranzasHoy.cobrar('${clienteId}', ${total}, ${saldo})">Cobrar</button>`);
         }
         botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.verDetalle('${clienteId}')">Ver detalle</button>`);
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="Cuenta.abrir('cliente', '${clienteId}')">Cuenta corriente</button>`);
         botones.push(`<button type="button" class="btn btn-secondary" onclick="SaldoCliente.abrir('${clienteId}')">Enviar saldo</button>`);
         botones.push(`<button type="button" class="btn btn-whatsapp" onclick="CobranzasHoy.avisarWhatsApp('${clienteId}')">${telefono ? 'Avisar por WhatsApp' : 'WhatsApp (falta teléfono)'}</button>`);
         if (pagado > 0) {
@@ -14056,15 +14057,24 @@ const LinksClientes = {
         if (!tbody || !config || !this.datos) return;
         Utils.hideTableLoader(tbody);
         const c = this.datos.config;
+        const esFecha = /^\d{4}-\d{2}-\d{2}$/.test(String(c.dia));
         config.innerHTML = `
             <label class="links-check"><input type="checkbox" id="links-activo"${c.activo ? ' checked' : ''}> Recibir pedidos por link</label>
             <label>Los clientes piden para
                 <select id="links-dia">
                     <option value="manana"${c.dia === 'manana' ? ' selected' : ''}>mañana</option>
                     <option value="hoy"${c.dia === 'hoy' ? ' selected' : ''}>hoy</option>
+                    <option value="fecha"${esFecha ? ' selected' : ''}>otra fecha</option>
                 </select>
             </label>
-            <button type="button" class="btn btn-primary" data-links="config">Guardar</button>`;
+            <label id="links-fecha-label"${esFecha ? '' : ' hidden'}>Fecha
+                <input type="date" id="links-fecha" min="${Cuenta.hoyAR()}" value="${esFecha ? Utils.esc(c.dia) : ''}">
+            </label>
+            <button type="button" class="btn btn-primary" data-links="config">Guardar</button>
+            ${c.fecha ? `<small class="links-sin">Ahora los clientes están pidiendo para el ${Utils.esc(Cuenta.fechaLarga(c.fecha))}.</small>` : ''}`;
+        document.getElementById('links-dia').addEventListener('change', (e) => {
+            document.getElementById('links-fecha-label').hidden = e.target.value !== 'fecha';
+        });
 
         this._renderSinStock();
 
@@ -14133,10 +14143,13 @@ const LinksClientes = {
             if (accion === 'whatsapp') return this._whatsapp(cli);
             if (accion === 'config') {
                 const activo = document.getElementById('links-activo').checked;
+                let dia = document.getElementById('links-dia').value;
+                if (dia === 'fecha') {
+                    dia = document.getElementById('links-fecha').value;
+                    if (!dia) return Utils.showError('Elegí la fecha para la que piden los clientes');
+                }
                 await Utils.withButtonLoader(boton, async () => {
-                    this._aplicar(await API.request('links-clientes/config', 'POST', {
-                        activo, dia: document.getElementById('links-dia').value
-                    }));
+                    this._aplicar(await API.request('links-clientes/config', 'POST', { activo, dia }));
                 }, 'Guardando...');
                 return Utils.avisar('Configuración guardada');
             }
@@ -15400,6 +15413,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-historial-pagos', () => Pagos.historial(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-cuenta-proveedor', () => Pagos.cuenta(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-cuenta-cliente', () => Cuenta.abrir('cliente'), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-cuenta-cliente-hoy', () => Cuenta.abrir('cliente'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-seguir-cierre', () => Navigation.navigateTo('cierre'), 'Abriendo...');
     addButtonListener('btn-volver-cierre', () => Navigation.navigateTo('pagos'), 'Volviendo...');
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });

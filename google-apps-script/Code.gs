@@ -6528,7 +6528,7 @@ function configLinkClientes_() {
   return {
     activo: c.link_clientes_activo === true,
     corte_min: min,
-    dia: c.link_clientes_dia === 'hoy' ? 'hoy' : 'manana'
+    dia: diaLinkValido_(c.link_clientes_dia)
   };
 }
 
@@ -6550,10 +6550,27 @@ function minutosAhoraAR_() {
   return Number(hm[0]) * 60 + Number(hm[1]);
 }
 
-/** Día para el que piden los clientes: hoy o mañana (fecha de Argentina). */
+/** El día de los pedidos por link: 'hoy', 'manana' o una fecha puesta a mano (AAAA-MM-DD). */
+function diaLinkValido_(valor) {
+  var v = String(valor === undefined || valor === null ? '' : valor).trim();
+  if (v === 'hoy') return 'hoy';
+  if (fechaCalendario_(v)) return v;
+  return 'manana';
+}
+
+/** true si el texto es una fecha AAAA-MM-DD que existe en el calendario (no 2026-02-31 ni 2026-13-45). */
+function fechaCalendario_(texto) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(texto));
+  if (!m) return false;
+  var d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return d.getUTCFullYear() === Number(m[1]) && d.getUTCMonth() === Number(m[2]) - 1 && d.getUTCDate() === Number(m[3]);
+}
+
+/** Día para el que piden los clientes: hoy, mañana o la fecha elegida (fecha de Argentina). */
 function fechaDiaLink_(dia) {
   var hoy = todayArgentina();
   if (dia === 'hoy') return hoy;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(dia))) return dia;
   var p = hoy.split('-');
   return Utilities.formatDate(new Date(Date.UTC(Number(p[0]), Number(p[1]) - 1, Number(p[2]) + 1)), 'UTC', 'yyyy-MM-dd');
 }
@@ -6566,6 +6583,10 @@ function estadoLinkClientes_() {
   if (!cfg.activo) {
     estado.abierto = false;
     estado.motivo = 'apagado';
+  } else if (fecha < todayArgentina()) {
+    // La fecha elegida a mano ya pasó: no se reciben más pedidos hasta que se elija otra.
+    estado.abierto = false;
+    estado.motivo = 'fecha_pasada';
   } else {
     var cierre = findCierreRow(fecha);
     if (cierre.row && cierre.estado === 'cerrado') {
@@ -6580,6 +6601,7 @@ function estadoLinkClientes_() {
 function mensajeEstadoLink_(estado) {
   if (estado.motivo === 'apagado') return 'Por ahora no se reciben pedidos por este link.';
   if (estado.motivo === 'dia_cerrado') return 'Ese día ya está cerrado.';
+  if (estado.motivo === 'fecha_pasada') return 'Esa fecha ya pasó. Pedile un link nuevo al equipo.';
   return '';
 }
 
@@ -6634,7 +6656,7 @@ function linksClientesListar_() {
   var productos = getProductos().map(function(p) {
     return { id: p.id, nombre: p.nombre, tipo: p.tipo || '', sin_stock: sinStock[String(p.id)] === true };
   });
-  return { config: { activo: cfg.activo, corte: horaTexto_(cfg.corte_min), dia: cfg.dia }, clientes: clientes, productos: productos };
+  return { config: { activo: cfg.activo, corte: horaTexto_(cfg.corte_min), dia: cfg.dia, fecha: fechaDiaLink_(cfg.dia) }, clientes: clientes, productos: productos };
 }
 
 /** Pone el código en la columna link_token de los clientes indicados: { id: código o '' }. */
@@ -6709,8 +6731,14 @@ function linksClientesGuardarConfig_(data) {
     cambios.link_clientes_corte_min = Number(m[1]) * 60 + Number(m[2]);
   }
   if (data.dia !== undefined) {
-    if (data.dia !== 'hoy' && data.dia !== 'manana') throw new Error('El día de los pedidos tiene que ser hoy o mañana');
-    cambios.link_clientes_dia = data.dia;
+    var dia = String(data.dia === undefined || data.dia === null ? '' : data.dia).trim();
+    if (dia !== 'hoy' && dia !== 'manana') {
+      var fechaElegida = fechaCalendario_(dia) ? dia : null;
+      if (!fechaElegida) throw new Error('El día de los pedidos tiene que ser hoy, mañana o una fecha');
+      if (fechaElegida < todayArgentina()) throw new Error('La fecha tiene que ser hoy o una fecha que todavía no llegó');
+      dia = fechaElegida;
+    }
+    cambios.link_clientes_dia = dia;
   }
   if (Object.keys(cambios).length) saveConfiguracionNotificaciones(cambios);
   return linksClientesListar_();
