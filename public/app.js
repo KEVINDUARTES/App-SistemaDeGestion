@@ -2300,6 +2300,37 @@ const API = {
         return result;
     },
 
+    // Cuenta corriente de un proveedor (extracto con saldo corrido).
+    async getCuentaProveedor(proveedorId) {
+        return this.request('proveedores/cuenta', 'GET', { proveedor_id: proveedorId });
+    },
+
+    // Corrige monto y/o fecha de un pago o de una deuda cargada a mano.
+    async editarMovimientoProveedor(data) {
+        const result = await this.request('proveedores/cuenta/editar', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
+    // Cuenta corriente de un cliente (o de su titular): extracto con saldo corrido.
+    async getCuentaCliente(clienteId) {
+        return this.request('clientes/cuenta', 'GET', { cliente_id: clienteId });
+    },
+
+    // Corrige una deuda anterior o un pago de un cliente.
+    async editarMovimientoCliente(data) {
+        const result = await this.request('clientes/cuenta/editar', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
     // Stock
     async getStock() {
         const cacheKey = 'stock';
@@ -11842,7 +11873,7 @@ const Cobranzas = {
                 <td data-label="Cliente">${Utils.esc(cuenta.titular || cliente.nombre || '')}</td>
                 <td data-label="Te debe">${DeudasPorFecha.html(lineas, total, 0, '')}</td>
                 <td data-label="Fecha">${Utils.formatDate(cobranzas[0].fecha)}${cobranzas.length > 1 ? `<small class="fila-nota">y ${cobranzas.length - 1} más</small>` : ''}</td>
-                <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span></td>
+                <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span><div class="pagos-acciones"><button type="button" class="btn btn-secondary btn-sm" onclick="Cuenta.abrir('cliente', '${cobranzas[0].cliente_id}')">Cuenta corriente</button></div></td>
             `;
             tbody.appendChild(tr);
         });
@@ -13111,7 +13142,7 @@ const Pagos = {
                 <td data-label="Proveedor">${Utils.esc(proveedor.nombre || '')}${vino}</td>
                 <td data-label="Le debés" style="${saldo > 0 && !porFecha ? 'color:#dc3545;font-weight:700;' : ''}">${celdaDebes}${btnPagar}</td>
                 <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
-                <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span>${soloPendientes ? `<div class="pagos-acciones"><button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.historial('${proveedor.id}')">Ver pagos / anular</button></div>` : ''}</td>
+                <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span>${soloPendientes ? `<div class="pagos-acciones"><button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.historial('${proveedor.id}')">Ver pagos / anular</button> <button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.cuenta('${proveedor.id}')">Cuenta corriente</button></div>` : ''}</td>
             `;
             tbody.appendChild(tr);
         });
@@ -13480,7 +13511,8 @@ const Pagos = {
             </div>
             ${aFavor > 0.009 ? `<p class="modal-hint"><strong>Saldo a favor: ${hoy(aFavor)}</strong>. Se descuenta de la próxima carga.</p>` : ''}
             ${lista.length ? `<div class="table-container"><table class="data-table"><thead><tr><th>Fecha</th><th>Proveedor</th><th>Pago</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>
-            <p class="modal-hint">Al anular un pago, vuelve a deberse ese monto y en la caja queda anotado como ingreso de hoy.</p>`
+            <p class="modal-hint">Al anular un pago, vuelve a deberse ese monto y en la caja queda anotado como ingreso de hoy.</p>
+            <div class="page-actions"><button type="button" class="btn btn-secondary" onclick="Pagos.cuenta('${elegido}')">Ver cuenta corriente</button></div>`
                 : '<p class="modal-hint">Todavía no hay pagos registrados.</p>'}
         `;
         Utils.showModal('Pagos a proveedores', content);
@@ -13512,6 +13544,9 @@ const Pagos = {
             Utils.showError(error?.message || 'No se pudo anular el pago.');
         }
     },
+
+    // Cuenta corriente (extracto con saldo corrido): ver la clase Cuenta.
+    cuenta(proveedorId = '') { return Cuenta.abrir('proveedor', proveedorId); },
 
     metodoPagoLabel(metodo) {
         const labels = {
@@ -15362,6 +15397,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     addButtonListener('btn-agregar-cobranza', () => Cobranzas.agregar(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-agregar-pago-pendiente', () => Pagos.agregar(), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-historial-pagos', () => Pagos.historial(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-cuenta-proveedor', () => Pagos.cuenta(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-cuenta-cliente', () => Cuenta.abrir('cliente'), 'Abriendo...', { useButtonLoader: false });
     addButtonListener('btn-seguir-cierre', () => Navigation.navigateTo('cierre'), 'Abriendo...');
     addButtonListener('btn-volver-cierre', () => Navigation.navigateTo('pagos'), 'Volviendo...');
     addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });
@@ -15417,6 +15454,213 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 
+
+// Cuenta corriente de un proveedor o de un cliente: extracto con una línea por movimiento y el saldo corrido.
+// Los pagos y las deudas anteriores se pueden corregir (monto y fecha) en la misma línea.
+const Cuenta = {
+    tipo: 'proveedor',
+    datos: null,
+    editando: '',
+    opciones: [],
+
+    // Lo que cambia entre proveedores y clientes.
+    config() {
+        const proveedor = this.tipo === 'proveedor';
+        return proveedor ? {
+            etiqueta: 'Proveedor',
+            sinEntidades: 'Todavía no hay proveedores.',
+            deuda: 'Le debés',
+            aFavor: 'se descuenta de la próxima carga',
+            ayuda: 'Los pagos y las deudas anteriores se pueden editar (monto y fecha) y queda anotado qué se cambió. Si cambia el monto de un pago, la diferencia queda en la caja de hoy. La mercadería se corrige desde Recepción.',
+            pedir: id => API.getCuentaProveedor(id),
+            editar: d => API.editarMovimientoProveedor(d),
+            entidad: datos => datos.proveedor
+        } : {
+            etiqueta: 'Cliente',
+            sinEntidades: 'Todavía no hay clientes.',
+            deuda: 'Te debe',
+            aFavor: 'se descuenta de su próxima carga',
+            ayuda: 'Las deudas anteriores se pueden editar (monto y fecha) y los pagos se pueden mover de fecha o corregir de monto: queda anotado qué se cambió y, si cambia un monto, un renglón "Pago corregido" (en la caja entra o sale la diferencia, hoy). Las cargas del día se corrigen desde Precios.',
+            pedir: id => API.getCuentaCliente(id),
+            editar: d => API.editarMovimientoCliente(d),
+            entidad: datos => datos.cliente
+        };
+    },
+
+    fechaLarga(iso) {
+        const [y, m, d] = String(iso || '').split('-');
+        return d ? `${d}/${m}/${y}` : '—';
+    },
+
+    hoyAR() {
+        return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+    },
+
+    async _cargarOpciones() {
+        if (this.tipo === 'proveedor') {
+            const lista = await API.getProveedores();
+            this.opciones = [...lista].map(p => ({ id: String(p.id), nombre: p.nombre || '' }));
+        } else {
+            const lista = AppState.clientes?.length ? AppState.clientes : await API.getClientes();
+            // Las listas de un mismo titular suman en una sola cuenta: aparecen una vez.
+            const vistas = new Set();
+            this.opciones = [];
+            lista.filter(c => c.activo !== false && c.activo !== 'false').forEach(c => {
+                const cuenta = Utils.cuentaDe(c.id);
+                if (vistas.has(cuenta.clave)) return;
+                vistas.add(cuenta.clave);
+                this.opciones.push({ id: String(c.id), nombre: cuenta.titular || c.nombre || '', clave: cuenta.clave });
+            });
+        }
+        this.opciones.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    async abrir(tipo, id = '') {
+        this.tipo = tipo;
+        this.editando = '';
+        const cfg = this.config();
+        Utils.showModal('Cuenta corriente', '<p class="modal-hint">Cargando…</p>');
+        try {
+            await this._cargarOpciones();
+            let elegido = String(id || '');
+            if (tipo === 'cliente' && elegido) {
+                // El cliente puede ser una de varias listas de un titular: se muestra la cuenta del titular.
+                const clave = Utils.cuentaDe(elegido).clave;
+                elegido = this.opciones.find(o => o.clave === clave)?.id || elegido;
+            }
+            elegido = elegido || this.opciones[0]?.id || '';
+            if (!elegido) {
+                Utils.showModal('Cuenta corriente', `<p class="modal-hint">${cfg.sinEntidades}</p>`);
+                return;
+            }
+            this.datos = await cfg.pedir(elegido);
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo cargar la cuenta. Intentá de nuevo.');
+            return;
+        }
+        this.pintar();
+    },
+
+    pintar() {
+        const cfg = this.config();
+        const datos = this.datos;
+        const entidad = cfg.entidad(datos);
+        const hoy = Utils.formatCurrency;
+        const eid = String(entidad.id);
+        const maxFecha = this.hoyAR();
+        const filas = datos.movimientos.map(m => {
+            const clave = `${m.tipo}:${m.id}`;
+            if (m.editable && this.editando === clave) {
+                const monto = m.debe || m.haber;
+                const montoFijo = this.tipo === 'cliente' && m.tipo === 'pago' && /transferencia/i.test(m.concepto);
+                return `<tr>
+                    <td data-label="Fecha"><input type="date" id="cuenta-edit-fecha" class="form-control" value="${Utils.esc(m.fecha)}" max="${maxFecha}"></td>
+                    <td data-label="Detalle">${Utils.esc(m.concepto)}${montoFijo ? '<br><small>El monto de una transferencia no se cambia acá: deshacé el pago y cargalo de nuevo. La fecha sí.</small>' : ''}</td>
+                    <td data-label="Monto" colspan="2"><input type="text" id="cuenta-edit-monto" class="form-control" data-price-input="true" inputmode="numeric" value="${Utils.formatPrice(monto)}"${montoFijo ? ' disabled' : ''}></td>
+                    <td data-label=""></td>
+                    <td data-label=""><button type="button" class="btn btn-primary btn-sm" onclick="Cuenta.guardar('${m.tipo}', '${Utils.esc(m.id)}')">Guardar</button> <button type="button" class="btn btn-secondary btn-sm" onclick="Cuenta.editar('')">Cancelar</button></td>
+                </tr>`;
+            }
+            return `<tr>
+                <td data-label="Fecha">${this.fechaLarga(m.fecha)}</td>
+                <td data-label="Detalle">${Utils.esc(m.concepto)}</td>
+                <td data-label="Debe" class="money">${m.debe ? hoy(m.debe) : ''}</td>
+                <td data-label="Haber" class="money">${m.haber ? hoy(m.haber) : ''}</td>
+                <td data-label="Saldo" class="money"><strong>${hoy(m.saldo)}</strong></td>
+                <td data-label="">${m.editable ? `<button type="button" class="btn btn-secondary btn-sm" onclick="Cuenta.editar('${m.tipo}:${Utils.esc(m.id)}')">Editar</button>` : ''}</td>
+            </tr>`;
+        }).join('');
+        const saldo = datos.saldo;
+        const estado = saldo > 0.009 ? `${cfg.deuda} ${hoy(saldo)}` : (saldo < -0.009 ? `Saldo a favor: ${hoy(-saldo)} (${cfg.aFavor})` : 'Cuenta al día');
+        const seleccionada = this.tipo === 'cliente'
+            ? (this.opciones.find(o => o.clave === Utils.cuentaDe(eid).clave)?.id || eid)
+            : eid;
+        const content = `
+            <div class="form-group">
+                <label for="cuenta-entidad">${cfg.etiqueta}</label>
+                <select id="cuenta-entidad" class="form-control">
+                    ${this.opciones.map(o => `<option value="${Utils.esc(o.id)}"${o.id === seleccionada ? ' selected' : ''}>${Utils.esc(o.nombre)}</option>`).join('')}
+                </select>
+            </div>
+            <p class="modal-hint"><strong>${estado}</strong></p>
+            ${datos.movimientos.length ? `<div class="table-container"><table class="data-table"><thead><tr><th>Fecha</th><th>Detalle</th><th>Debe</th><th>Haber</th><th>Saldo</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>`
+                : '<p class="modal-hint">Todavía no tiene movimientos.</p>'}
+            <p class="modal-hint">${cfg.ayuda}</p>
+            <div class="page-actions"><button type="button" class="btn btn-secondary" onclick="Cuenta.imprimir()">Imprimir / guardar PDF</button></div>
+        `;
+        Utils.showModal(`Cuenta corriente · ${entidad.nombre || ''}`, content);
+        document.getElementById('cuenta-entidad')?.addEventListener('change', (e) => this.abrir(this.tipo, e.target.value));
+    },
+
+    editar(clave) {
+        this.editando = clave;
+        this.pintar();
+    },
+
+    async guardar(tipo, id) {
+        const cfg = this.config();
+        const montoInput = document.getElementById('cuenta-edit-monto');
+        const monto = Utils.parsePrice(montoInput?.value) || 0;
+        const fecha = document.getElementById('cuenta-edit-fecha')?.value || '';
+        if (!(monto > 0)) { Utils.showError('Poné un monto mayor a cero'); return; }
+        if (!fecha) { Utils.showError('Poné la fecha'); return; }
+        const eid = String(cfg.entidad(this.datos).id);
+        try {
+            const res = await cfg.editar({ tipo, id, monto, fecha });
+            Utils.avisar(res?.cambio === false ? 'No había cambios' : 'Cambio guardado');
+            await this._refrescarPantallas(eid);
+            this.editando = '';
+            this.datos = await cfg.pedir(eid);
+            this.pintar();
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo guardar el cambio.');
+        }
+    },
+
+    // Lo que se ve detrás del modal se actualiza con el cambio.
+    async _refrescarPantallas(eid) {
+        if (this.tipo === 'proveedor') {
+            delete Pagos._optimo[eid];
+            Pagos._guardarOptimo();
+            Pagos._pagados.delete(eid);
+            Pagos._pagados.delete(Number(eid));
+            const proveedores = await API.getProveedores();
+            AppState.proveedores = proveedores;
+            CacheManager.set('proveedores', proveedores);
+            if (AppState.currentPage === 'pagos' || AppState.currentPage === 'pagos-pendientes') Pagos.render(proveedores);
+        } else {
+            if (AppState.currentPage === 'cobranzas') Cobranzas.load().catch(() => {});
+            if (AppState.currentPage === 'cobros-hoy') CobranzasHoy.load().catch(() => {});
+        }
+    },
+
+    imprimir() {
+        const cfg = this.config();
+        const datos = this.datos;
+        if (!datos) return;
+        const entidad = cfg.entidad(datos);
+        const hoy = Utils.formatCurrency;
+        const filas = datos.movimientos.map(m => `<tr>
+            <td>${this.fechaLarga(m.fecha)}</td><td>${Utils.esc(m.concepto)}</td>
+            <td class="num">${m.debe ? hoy(m.debe) : ''}</td><td class="num">${m.haber ? hoy(m.haber) : ''}</td><td class="num"><strong>${hoy(m.saldo)}</strong></td>
+        </tr>`).join('');
+        const saldo = datos.saldo;
+        const estado = saldo > 0.009 ? `Saldo adeudado: ${hoy(saldo)}` : (saldo < -0.009 ? `Saldo a favor: ${hoy(-saldo)}` : 'Cuenta al día');
+        const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cuenta corriente · ${Utils.esc(entidad.nombre || '')}</title>
+            <style>body{font-family:Arial,sans-serif;margin:24px;color:#222}h1{font-size:20px;margin:0 0 4px}p{margin:2px 0 14px;color:#555}
+            table{width:100%;border-collapse:collapse;font-size:13px}th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}
+            th{background:#f1f1f1}.num{text-align:right;white-space:nowrap}.total{margin-top:14px;font-size:15px;font-weight:bold}</style></head>
+            <body><h1>Cuenta corriente · ${Utils.esc(entidad.nombre || '')}</h1><p>Luciano Cargas · al ${this.fechaLarga(this.hoyAR())}</p>
+            <table><thead><tr><th>Fecha</th><th>Detalle</th><th class="num">Debe</th><th class="num">Haber</th><th class="num">Saldo</th></tr></thead><tbody>${filas}</tbody></table>
+            <div class="total">${estado}</div>
+            <script>window.addEventListener('load',function(){setTimeout(function(){window.print();},200);});<\/script></body></html>`;
+        try {
+            Utils.openPrintHtml(html);
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo abrir la vista de impresión.');
+        }
+    }
+};
 
 // Buscador de cada paso: <input data-filtro-tabla="#selector"> esconde las filas de la tabla que no coinciden.
 // Solo oculta (no redibuja), y se vuelve a aplicar cada vez que el paso dibuja de nuevo sus filas.

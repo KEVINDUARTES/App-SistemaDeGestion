@@ -673,6 +673,22 @@ function handleRequest(e, method) {
         result = anularPagoProveedor(data);
         break;
 
+      case 'proveedores/cuenta':
+        result = cuentaProveedor(data);
+        break;
+
+      case 'proveedores/cuenta/editar':
+        result = editarMovimientoProveedor(data);
+        break;
+
+      case 'clientes/cuenta':
+        result = cuentaCliente(data);
+        break;
+
+      case 'clientes/cuenta/editar':
+        result = editarMovimientoCliente(data);
+        break;
+
       // Deudas a proveedores cargadas a mano (lo que se les debía antes de usar la app)
       case 'deudas-proveedores':
         if (actualMethod === 'GET') {
@@ -4757,6 +4773,418 @@ function anularPagoProveedor(data) {
     medios[metodo] = monto;
     registrarCajaMedios_(todayArgentina(), 'ingreso', medios, 'Pago anulado a proveedor', proveedorId);
     return { success: true, id: data.id, monto: monto, metodo: metodo, proveedor_id: proveedorId };
+  }
+  throw new Error('Ese pago ya no está. Actualizá la página.');
+}
+
+// ========== CUENTA CORRIENTE DE PROVEEDORES ==========
+
+/**
+ * Extracto de un proveedor: una línea por movimiento (mercadería del día, deuda cargada a mano, pago)
+ * en orden de fecha, con el saldo corrido. Saldo negativo = se le pagó de más (queda a favor).
+ * Los pagos y las deudas cargadas a mano se pueden editar; la mercadería se corrige desde Recepción.
+ * data: { proveedor_id }
+ */
+function cuentaProveedor(data) {
+  if (!data || !data.proveedor_id) throw new Error('Elegí el proveedor');
+  var proveedor = getProveedoresList().filter(function(p) { return idsMatch(p.id, data.proveedor_id); })[0];
+  if (!proveedor) throw new Error('Ese proveedor no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  var provId = String(proveedor.id);
+  var movimientos = [];
+
+  var recepcion = readSheetValues(CONFIG.SHEETS.RECEPCION);
+  var hr = recepcion.headers;
+  var iFecha = hr.indexOf('fecha'); if (iFecha === -1) iFecha = 1;
+  var iProv = hr.indexOf('proveedor_id'); if (iProv === -1) iProv = 3;
+  var iLlego = hr.indexOf('llego'); if (iLlego === -1) iLlego = 5;
+  var iPrecio = hr.indexOf('precio_real'); if (iPrecio === -1) iPrecio = 6;
+  var iConf = hr.indexOf('confirmado'); if (iConf === -1) iConf = 7;
+  var porDia = {};
+  recepcion.rows.forEach(function(row) {
+    if (row[iConf] !== true || String(row[iProv]) !== provId) return;
+    var total = (row[iLlego] || 0) * normalizeAmount(row[iPrecio]);
+    if (!total) return;
+    var f = normalizeFecha(row[iFecha]) || '';
+    if (!porDia[f]) porDia[f] = { total: 0, productos: 0 };
+    porDia[f].total += total;
+    porDia[f].productos++;
+  });
+  Object.keys(porDia).forEach(function(f) {
+    movimientos.push({
+      tipo: 'carga', id: '', fecha: f, orden: 0, editable: false,
+      concepto: 'Mercadería del día (' + porDia[f].productos + (porDia[f].productos === 1 ? ' producto' : ' productos') + ')',
+      debe: Math.round(porDia[f].total * 100) / 100, haber: 0
+    });
+  });
+
+  var deudas = readSheetValuesSiExiste_(CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  var dId = Math.max(deudas.headers.indexOf('id'), 0);
+  var dF = deudas.headers.indexOf('fecha');
+  var dP = deudas.headers.indexOf('proveedor_id');
+  var dM = deudas.headers.indexOf('monto');
+  var dN = deudas.headers.indexOf('nota');
+  if (dP !== -1 && dM !== -1) {
+    deudas.rows.forEach(function(row) {
+      if (String(row[dP]) !== provId) return;
+      movimientos.push({
+        tipo: 'deuda', id: String(row[dId]), fecha: (dF !== -1 && normalizeFecha(row[dF])) || '', orden: 1, editable: true,
+        concepto: 'Deuda anterior' + (dN !== -1 && row[dN] ? ' · ' + row[dN] : ''),
+        debe: normalizeAmount(row[dM]), haber: 0
+      });
+    });
+  }
+
+  var pagos = readSheetValues(CONFIG.SHEETS.PAGOS_PROVEEDORES);
+  var hp = pagos.headers;
+  var pId = Math.max(hp.indexOf('id'), 0);
+  var pF = hp.indexOf('fecha'); if (pF === -1) pF = 1;
+  var pP = hp.indexOf('proveedor_id'); if (pP === -1) pP = 2;
+  var pM = hp.indexOf('monto'); if (pM === -1) pM = 3;
+  var pT = hp.indexOf('metodo'); if (pT === -1) pT = 4;
+  var pN = hp.indexOf('nota'); if (pN === -1) pN = 5;
+  var pA = hp.indexOf('aplica_fecha');
+  pagos.rows.forEach(function(row) {
+    if (String(row[pP]) !== provId) return;
+    var aplica = pA !== -1 ? normalizeFecha(row[pA]) : '';
+    movimientos.push({
+      tipo: 'pago', id: String(row[pId]), fecha: normalizeFecha(row[pF]) || '', orden: 2, editable: true,
+      concepto: 'Pago · ' + (row[pT] || 'efectivo') + (aplica ? ' (a la deuda del ' + aplica + ')' : '') + (row[pN] ? ' · ' + row[pN] : ''),
+      debe: 0, haber: normalizeAmount(row[pM])
+    });
+  });
+
+  movimientos.sort(function(a, b) {
+    return a.fecha === b.fecha ? a.orden - b.orden : a.fecha.localeCompare(b.fecha);
+  });
+  var saldo = 0;
+  movimientos.forEach(function(m) {
+    saldo = Math.round((saldo + m.debe - m.haber) * 100) / 100;
+    m.saldo = saldo;
+    delete m.orden;
+  });
+  return { proveedor: { id: provId, nombre: proveedor.nombre }, movimientos: movimientos, saldo: saldo };
+}
+
+/**
+ * Corrige el monto y/o la fecha de un pago a proveedor o de una deuda cargada a mano.
+ * Nada se borra: la fila queda con una nota de lo que cambió y cuándo. Si cambia el monto de un pago,
+ * la diferencia queda en la caja de hoy ("Pago editado a proveedor"), para que la caja siga cerrando.
+ * data: { tipo: 'pago' | 'deuda', id, monto?, fecha? }
+ */
+function editarMovimientoProveedor(data) {
+  if (!data || !data.id) throw new Error('id es requerido');
+  var esPago = data.tipo === 'pago';
+  if (!esPago && data.tipo !== 'deuda') throw new Error('Solo se pueden editar pagos y deudas cargadas a mano');
+  var sheet = getSheet(esPago ? CONFIG.SHEETS.PAGOS_PROVEEDORES : CONFIG.SHEETS.DEUDAS_PROVEEDORES);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var provIdx = headers.indexOf('proveedor_id'); if (provIdx < 0) provIdx = 2;
+  var montoIdx = headers.indexOf('monto'); if (montoIdx < 0) montoIdx = 3;
+  var metodoIdx = headers.indexOf('metodo'); if (metodoIdx < 0) metodoIdx = 4;
+  var notaIdx = headers.indexOf('nota'); if (notaIdx < 0) notaIdx = esPago ? 5 : 4;
+
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][idIdx], data.id)) continue;
+    var montoViejo = normalizeAmount(values[i][montoIdx]);
+    var fechaVieja = normalizeFecha(values[i][fechaIdx]) || '';
+    var montoNuevo = data.monto !== undefined && data.monto !== null && data.monto !== '' ? normalizeAmount(data.monto) : montoViejo;
+    var fechaNueva = data.fecha ? normalizeFecha(data.fecha) : fechaVieja;
+    if (montoNuevo <= 0) throw new Error('Poné un monto mayor a cero');
+    if (!fechaNueva) throw new Error('La fecha no es válida');
+    if (fechaNueva > todayArgentina()) throw new Error('La fecha no puede ser futura');
+    var cambioMonto = Math.abs(montoNuevo - montoViejo) > 0.009;
+    var cambioFecha = fechaNueva !== fechaVieja;
+    if (!cambioMonto && !cambioFecha) return { success: true, cambio: false };
+
+    var partes = [];
+    if (cambioMonto) partes.push('monto ' + formatPesos_(montoViejo) + ' → ' + formatPesos_(montoNuevo));
+    if (cambioFecha) partes.push('fecha ' + fechaVieja + ' → ' + fechaNueva);
+    var nota = String(values[i][notaIdx] || '');
+    nota = (nota ? nota + ' · ' : '') + 'Editado el ' + todayArgentina() + ': ' + partes.join(', ');
+
+    if (cambioMonto) sheet.getRange(i + 1, montoIdx + 1).setValue(montoNuevo);
+    if (cambioFecha) sheet.getRange(i + 1, fechaIdx + 1).setValue(fechaNueva);
+    sheet.getRange(i + 1, notaIdx + 1).setValue(nota);
+
+    var proveedorId = values[i][provIdx];
+    if (esPago && cambioMonto) {
+      var metodo = String(values[i][metodoIdx] || 'efectivo');
+      if (METODOS_CLIENTE_.indexOf(metodo) === -1) metodo = 'efectivo';
+      var medios = mediosVacios_();
+      medios[metodo] = Math.abs(montoNuevo - montoViejo);
+      registrarCajaMedios_(todayArgentina(), montoNuevo > montoViejo ? 'egreso' : 'ingreso', medios, 'Pago editado a proveedor', proveedorId);
+    }
+    var hoja = esPago ? CONFIG.SHEETS.PAGOS_PROVEEDORES : CONFIG.SHEETS.DEUDAS_PROVEEDORES;
+    invalidateSheetCache(hoja);
+    invalidateServerCacheForSheet(hoja);
+    return { success: true, cambio: true, proveedor_id: proveedorId, monto: montoNuevo, fecha: fechaNueva };
+  }
+  throw new Error('Ese movimiento ya no está. Actualizá la página.');
+}
+
+// ========== CUENTA CORRIENTE DE CLIENTES ==========
+
+/**
+ * Extracto de un cliente (o de su titular, si varias listas suman en una sola cuenta): una línea por
+ * movimiento con el saldo corrido. Debe = lo que se le cargó; haber = lo que pagó. Los pagos salen de la
+ * caja (tienen su fecha); lo que no pasó por caja (descuentos, pagos por adelantado, saldo a favor aplicado)
+ * va en una línea aparte, así el saldo final es siempre el mismo que muestra la app.
+ * Saldo negativo = el cliente tiene a favor.
+ * data: { cliente_id }
+ */
+function cuentaCliente(data) {
+  if (!data || !data.cliente_id) throw new Error('Elegí el cliente');
+  var clientes = getClientes();
+  var cliente = clientes.filter(function(c) { return idsMatch(c.id, data.cliente_id); })[0];
+  if (!cliente) throw new Error('Ese cliente no está en el sistema. Actualizá la página y volvé a elegirlo.');
+  var titular = String(cliente.titular || '').trim();
+  var ids = {};
+  var nombres = {};
+  clientes.forEach(function(c) {
+    var mismo = String(c.id) === String(cliente.id) ||
+      (titular && String(c.titular || '').trim().toLowerCase() === titular.toLowerCase());
+    if (mismo) { ids[String(c.id)] = true; nombres[String(c.id)] = c.nombre; }
+  });
+  var variosNombres = Object.keys(ids).length > 1;
+
+  var caja = readSheetValuesSiExiste_(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
+  var kId = Math.max(caja.headers.indexOf('id'), 0);
+  var kF = caja.headers.indexOf('fecha'); if (kF === -1) kF = 1;
+  var kT = caja.headers.indexOf('tipo'); if (kT === -1) kT = 2;
+  var kM = caja.headers.indexOf('monto'); if (kM === -1) kM = 3;
+  var kN = caja.headers.indexOf('nota'); if (kN === -1) kN = 4;
+  var kR = caja.headers.indexOf('referencia'); if (kR === -1) kR = 5;
+  var cajaPorRef = {};
+  caja.rows.forEach(function(row) {
+    var ref = String(row[kR] || '');
+    if (!ref) return;
+    if (!cajaPorRef[ref]) cajaPorRef[ref] = [];
+    cajaPorRef[ref].push({
+      id: String(row[kId]), fecha: normalizeFecha(row[kF]) || '', tipo: String(row[kT] || ''),
+      monto: normalizeAmount(row[kM]), nota: String(row[kN] || '')
+    });
+  });
+
+  var cobranzas = readSheetValues(CONFIG.SHEETS.COBRANZAS);
+  var h = cobranzas.headers;
+  var cId = Math.max(h.indexOf('id'), 0);
+  var cF = h.indexOf('fecha'); if (cF === -1) cF = 1;
+  var cC = h.indexOf('cliente_id'); if (cC === -1) cC = 2;
+  var cT = h.indexOf('total'); if (cT === -1) cT = 3;
+  var cP = h.indexOf('pagado'); if (cP === -1) cP = 4;
+  var cO = h.indexOf('origen');
+  var cN = h.indexOf('nota');
+  var movimientos = [];
+
+  function agregar(fecha, orden, tipo, id, editable, concepto, debe, haber) {
+    movimientos.push({ tipo: tipo, id: id, fecha: fecha, orden: orden, editable: editable, concepto: concepto, debe: debe, haber: haber });
+  }
+
+  cobranzas.rows.forEach(function(row) {
+    if (!ids[String(row[cC])]) return;
+    var total = normalizeAmount(row[cT]);
+    var pagado = normalizeAmount(row[cP]);
+    if (!total && !pagado) return;
+    var fecha = normalizeFecha(row[cF]) || '';
+    var origen = cO !== -1 ? String(row[cO] || '') : '';
+    var cobId = String(row[cId]);
+    var quien = variosNombres ? ' · ' + (nombres[String(row[cC])] || '') : '';
+
+    if (origen === 'credito') {
+      if (total < -0.009) agregar(fecha, 0, 'credito', '', false, 'Saldo a favor (pagó de más)' + quien, 0, -total);
+      if (pagado < -0.009) agregar(fecha, 1, 'credito', '', false, 'Saldo a favor descontado de una carga' + quien, -pagado, 0);
+      return;
+    }
+
+    var nota = cN !== -1 && row[cN] ? ' · ' + row[cN] : '';
+    if (origen === 'manual') {
+      agregar(fecha, 0, 'deuda', cobId, true, 'Deuda anterior' + nota + quien, total, 0);
+    } else {
+      agregar(fecha, 0, 'carga', '', false, 'Cargas del día' + quien, total, 0);
+    }
+
+    var netoCaja = 0;
+    var ultimaFechaCaja = fecha;
+    (cajaPorRef[cobId] || []).forEach(function(mov) {
+      var ingreso = mov.tipo === 'ingreso';
+      netoCaja += ingreso ? mov.monto : -mov.monto;
+      if (mov.fecha > ultimaFechaCaja) ultimaFechaCaja = mov.fecha;
+      var original = ingreso && mov.nota.indexOf('Cobranza ·') === 0;
+      agregar(mov.fecha || fecha, 2, 'pago', mov.id, original, mov.nota + quien, ingreso ? 0 : mov.monto, ingreso ? mov.monto : 0);
+    });
+    netoCaja = Math.round(netoCaja * 100) / 100;
+    var resto = Math.round((pagado - netoCaja) * 100) / 100;
+    if (resto > 0.009) {
+      agregar(fecha, 1, 'ajuste', '', false, 'Descuento, pago por adelantado o saldo a favor aplicado' + quien, 0, resto);
+    } else if (resto < -0.009) {
+      agregar(ultimaFechaCaja, 3, 'ajuste', '', false, 'Excedente pasado a saldo a favor' + quien, -resto, 0);
+    }
+  });
+
+  movimientos.sort(function(a, b) {
+    return a.fecha === b.fecha ? a.orden - b.orden : a.fecha.localeCompare(b.fecha);
+  });
+  var saldo = 0;
+  movimientos.forEach(function(m) {
+    saldo = Math.round((saldo + m.debe - m.haber) * 100) / 100;
+    m.saldo = saldo;
+    delete m.orden;
+  });
+  return { cliente: { id: String(cliente.id), nombre: titular || cliente.nombre }, movimientos: movimientos, saldo: saldo };
+}
+
+/**
+ * Corrige una deuda anterior cargada a mano (monto y fecha) o un pago de un cliente (fecha y monto).
+ * - Deuda anterior: se cambia en la misma cobranza; no puede quedar menos que lo ya pagado.
+ * - Pago, fecha: se mueve el movimiento de caja a la fecha correcta.
+ * - Pago, monto: el pago original queda como está y se suma un renglón "Pago corregido" (ingreso o egreso de hoy
+ *   en la caja); la cobranza se actualiza. Así la caja de los días anteriores no cambia y se ve qué se corrigió.
+ *   El monto de una transferencia no se corrige acá (tiene depósitos asociados): se deshace el pago y se carga de nuevo.
+ * Siempre queda anotado qué se cambió y cuándo.
+ * data: { tipo: 'deuda' | 'pago', id, monto?, fecha? }
+ */
+function editarMovimientoCliente(data) {
+  if (!data || !data.id) throw new Error('id es requerido');
+  if (data.tipo === 'deuda') return editarDeudaCliente_(data);
+  if (data.tipo === 'pago') return editarPagoCliente_(data);
+  throw new Error('Solo se pueden editar pagos y deudas anteriores cargadas a mano');
+}
+
+function textoCambios_(partes) {
+  return 'Editado el ' + todayArgentina() + ': ' + partes.join(', ');
+}
+
+function editarDeudaCliente_(data) {
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  var values = readUsedValues_(sheet);
+  var h = values.length ? values[0] : [];
+  var idIdx = Math.max(h.indexOf('id'), 0);
+  var fechaIdx = h.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var clienteIdx = h.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var totalIdx = h.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+  var pagadoIdx = h.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+  var saldoIdx = h.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
+  var estadoIdx = h.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
+  var origenIdx = h.indexOf('origen');
+  var notaIdx = ensureCobranzasColumna_(sheet, 'nota');
+
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][idIdx], data.id)) continue;
+    if (origenIdx === -1 || String(values[i][origenIdx] || '') !== 'manual') {
+      throw new Error('Solo se pueden editar las deudas anteriores cargadas a mano. Las cargas del día se corrigen desde Precios.');
+    }
+    var totalViejo = normalizeAmount(values[i][totalIdx]);
+    var fechaVieja = normalizeFecha(values[i][fechaIdx]) || '';
+    var pagado = normalizeAmount(values[i][pagadoIdx]);
+    var totalNuevo = data.monto !== undefined && data.monto !== null && data.monto !== '' ? normalizeAmount(data.monto) : totalViejo;
+    var fechaNueva = data.fecha ? normalizeFecha(data.fecha) : fechaVieja;
+    if (totalNuevo <= 0) throw new Error('Poné un monto mayor a cero');
+    if (!fechaNueva) throw new Error('La fecha no es válida');
+    if (fechaNueva >= todayArgentina()) throw new Error('La fecha tiene que ser anterior a hoy');
+    if (totalNuevo < pagado - 0.01) throw new Error('Ya se cobraron ' + formatPesos_(pagado) + ' de esta deuda: no puede quedar en menos');
+    var cambioMonto = Math.abs(totalNuevo - totalViejo) > 0.009;
+    var cambioFecha = fechaNueva !== fechaVieja;
+    if (!cambioMonto && !cambioFecha) return { success: true, cambio: false };
+
+    var partes = [];
+    if (cambioMonto) partes.push('monto ' + formatPesos_(totalViejo) + ' → ' + formatPesos_(totalNuevo));
+    if (cambioFecha) partes.push('fecha ' + fechaVieja + ' → ' + fechaNueva);
+    var nota = String(values[i][notaIdx] || '');
+    var saldo = Math.max(0, Math.round((totalNuevo - pagado) * 100) / 100);
+    sheet.getRange(i + 1, totalIdx + 1).setValue(totalNuevo);
+    sheet.getRange(i + 1, saldoIdx + 1).setValue(saldo);
+    sheet.getRange(i + 1, estadoIdx + 1).setValue(pagado <= 0.009 ? 'pendiente' : (saldo <= 0.01 ? 'pagado' : 'parcial'));
+    if (cambioFecha) sheet.getRange(i + 1, fechaIdx + 1).setValue(fechaNueva);
+    sheet.getRange(i + 1, notaIdx + 1).setValue((nota ? nota + ' · ' : '') + textoCambios_(partes));
+    invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+    invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+    return { success: true, cambio: true, cliente_id: values[i][clienteIdx], monto: totalNuevo, fecha: fechaNueva };
+  }
+  throw new Error('Esa deuda ya no está. Actualizá la página.');
+}
+
+function editarPagoCliente_(data) {
+  var caja = getSheet(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
+  var cv = readUsedValues_(caja);
+  var ch = cv.length ? cv[0] : [];
+  var kId = Math.max(ch.indexOf('id'), 0);
+  var kF = ch.indexOf('fecha'); if (kF < 0) kF = 1;
+  var kT = ch.indexOf('tipo'); if (kT < 0) kT = 2;
+  var kM = ch.indexOf('monto'); if (kM < 0) kM = 3;
+  var kN = ch.indexOf('nota'); if (kN < 0) kN = 4;
+  var kR = ch.indexOf('referencia'); if (kR < 0) kR = 5;
+
+  for (var i = 1; i < cv.length; i++) {
+    if (!idsMatch(cv[i][kId], data.id)) continue;
+    var notaCaja = String(cv[i][kN] || '');
+    if (String(cv[i][kT]) !== 'ingreso' || notaCaja.indexOf('Cobranza ·') !== 0) {
+      throw new Error('Solo se pueden editar los pagos cargados como cobro.');
+    }
+    var montoViejo = normalizeAmount(cv[i][kM]);
+    var fechaVieja = normalizeFecha(cv[i][kF]) || '';
+    var montoNuevo = data.monto !== undefined && data.monto !== null && data.monto !== '' ? normalizeAmount(data.monto) : montoViejo;
+    var fechaNueva = data.fecha ? normalizeFecha(data.fecha) : fechaVieja;
+    if (montoNuevo <= 0) throw new Error('Poné un monto mayor a cero');
+    if (!fechaNueva) throw new Error('La fecha no es válida');
+    if (fechaNueva > todayArgentina()) throw new Error('La fecha no puede ser futura');
+    var cambioMonto = Math.abs(montoNuevo - montoViejo) > 0.009;
+    var cambioFecha = fechaNueva !== fechaVieja;
+    if (!cambioMonto && !cambioFecha) return { success: true, cambio: false };
+
+    var etiqueta = notaCaja.split(' · ')[1] || '';
+    var metodo = METODOS_CLIENTE_.filter(function(m) { return etiquetaMedio_(m) === etiqueta; })[0];
+    if (!metodo) throw new Error('No se pudo saber con qué medio se pagó.');
+    if (cambioMonto && metodo === 'transferencia') {
+      throw new Error('El monto de una transferencia no se corrige acá: deshacé el pago y cargalo de nuevo. La fecha sí se puede cambiar.');
+    }
+    var cobranzaId = String(cv[i][kR] || '');
+
+    if (cambioMonto) {
+      var delta = Math.round((montoNuevo - montoViejo) * 100) / 100;
+      var cobSheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+      ensureCobranzasMediosColumn_(cobSheet);
+      var values = readUsedValues_(cobSheet);
+      var h = values.length ? values[0] : [];
+      var idIdx = Math.max(h.indexOf('id'), 0);
+      var totalIdx = h.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+      var pagadoIdx = h.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+      var saldoIdx = h.indexOf('saldo'); if (saldoIdx < 0) saldoIdx = 5;
+      var estadoIdx = h.indexOf('estado'); if (estadoIdx < 0) estadoIdx = 6;
+      var mediosIdx = h.indexOf('medios');
+      var fila = -1;
+      for (var r = 1; r < values.length; r++) {
+        if (idsMatch(values[r][idIdx], cobranzaId)) { fila = r; break; }
+      }
+      if (fila === -1) throw new Error('No se encontró la cobranza de este pago.');
+      var total = normalizeAmount(values[fila][totalIdx]);
+      var pagado = normalizeAmount(values[fila][pagadoIdx]);
+      var pagadoNuevo = Math.round((pagado + delta) * 100) / 100;
+      if (pagadoNuevo < -0.009) throw new Error('El monto es menor a lo que ya se descontó de esta cobranza.');
+      if (pagadoNuevo > total + 0.01) throw new Error('El monto supera lo que se debe de esa carga');
+      var medios = parseMedios_(mediosIdx >= 0 ? values[fila][mediosIdx] : '');
+      medios[metodo] = Math.round((medios[metodo] + delta) * 100) / 100;
+      if (medios[metodo] < -0.009) throw new Error('El monto es menor a lo que quedó anotado en ' + etiqueta.toLowerCase() + '.');
+      var saldoNuevo = Math.max(0, Math.round((total - pagadoNuevo) * 100) / 100);
+      cobSheet.getRange(fila + 1, pagadoIdx + 1).setValue(pagadoNuevo);
+      cobSheet.getRange(fila + 1, saldoIdx + 1).setValue(saldoNuevo);
+      cobSheet.getRange(fila + 1, estadoIdx + 1).setValue(pagadoNuevo <= 0.009 ? 'pendiente' : (saldoNuevo <= 0.01 ? 'pagado' : 'parcial'));
+      if (mediosIdx >= 0) cobSheet.getRange(fila + 1, mediosIdx + 1).setValue(JSON.stringify(medios));
+      var mediosCaja = mediosVacios_();
+      mediosCaja[metodo] = Math.abs(delta);
+      registrarCajaMedios_(todayArgentina(), delta > 0 ? 'ingreso' : 'egreso', mediosCaja,
+        'Pago corregido (de ' + formatPesos_(montoViejo) + ' a ' + formatPesos_(montoNuevo) + ')', cobranzaId);
+      invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
+    }
+
+    if (cambioFecha) {
+      caja.getRange(i + 1, kF + 1).setValue(fechaNueva);
+      caja.getRange(i + 1, kN + 1).setValue(notaCaja + ' · ' + textoCambios_(['fecha ' + fechaVieja + ' → ' + fechaNueva]));
+      invalidateSheetCache(CONFIG.SHEETS.CAJA_MOVIMIENTOS);
+    }
+    return { success: true, cambio: true, monto: montoNuevo, fecha: fechaNueva };
   }
   throw new Error('Ese pago ya no está. Actualizá la página.');
 }
