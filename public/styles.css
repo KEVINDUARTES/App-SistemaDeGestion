@@ -4187,3 +4187,8 @@ body.recepcion-full:has(#recepcion.active) #recepcion-tabla.recepcion-planilla {
 .buscador-cliente-lista[hidden] { display: none; }
 .buscador-cliente-lista .opcion { padding: 8px 10px; cursor: pointer; }
 .buscador-cliente-lista .opcion:hover, .buscador-cliente-lista .opcion.activa { background: var(--color-gray-100, #f0f0f0); }
+
+/* Cuenta corriente: el modal es más ancho para que el extracto entre sin cortarse */
+.modal.modal-ancho { width: min(980px, calc(100vw - 24px)); max-width: 980px; }
+.modal-ancho .data-table td.money, .modal-ancho .data-table td[data-label="Fecha"] { white-space: nowrap; }
+.modal-ancho .data-table td[data-label="Detalle"] { min-width: 220px; }

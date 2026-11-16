@@ -827,6 +827,7 @@ const Utils = {
         
         modalTitle.textContent = title;
         modalBody.innerHTML = content;
+        modalOverlay.querySelector('.modal')?.classList.remove('modal-ancho');
         Utils.enablePriceInputs(modalBody);
         modalOverlay.classList.add('active');
         console.log('🟢 Modal mostrado');
@@ -15496,6 +15497,11 @@ const Cuenta = {
         return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
     },
 
+    // El modal de la cuenta es más ancho que los demás; los otros modales vuelven a su tamaño.
+    _ancho(si) {
+        document.querySelector('#modal-overlay .modal')?.classList.toggle('modal-ancho', si);
+    },
+
     async _cargarOpciones() {
         if (this.tipo === 'proveedor') {
             const lista = await API.getProveedores();
@@ -15520,6 +15526,7 @@ const Cuenta = {
         this.editando = '';
         const cfg = this.config();
         Utils.showModal('Cuenta corriente', '<p class="modal-hint">Cargando…</p>');
+        this._ancho(true);
         try {
             await this._cargarOpciones();
             let elegido = String(id || '');
@@ -15589,6 +15596,7 @@ const Cuenta = {
             <div class="page-actions"><button type="button" class="btn btn-secondary" onclick="Cuenta.imprimir()">Imprimir / guardar PDF</button></div>
         `;
         Utils.showModal(`Cuenta corriente · ${entidad.nombre || ''}`, content);
+        this._ancho(true);
         document.getElementById('cuenta-entidad')?.addEventListener('change', (e) => this.abrir(this.tipo, e.target.value));
     },
 
