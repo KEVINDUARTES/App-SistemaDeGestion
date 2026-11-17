@@ -1881,6 +1881,7 @@ const API = {
         try {
             const result = await this.request('pedidos', 'POST', data);
             limpiarCaches();
+            this._revisarListaPrecios(fecha);
             return result;
         } catch (error) {
             if (!this._esCorteDeConexion(error)) throw error;
@@ -1909,6 +1910,7 @@ const API = {
         CacheManager.invalidatePattern('bootstrap:');
         DataLoader.invalidateFlujo(fecha);
         this._invalidateFlujo();
+        this._revisarListaPrecios(fecha);
         return result;
     },
 
@@ -1919,6 +1921,13 @@ const API = {
         CacheManager.invalidatePattern('bootstrap:');
         this._invalidateFlujo();
         return result;
+    },
+
+    // Un pedido que cambia después de confirmar la recepción necesita su línea de precio.
+    _revisarListaPrecios(fecha) {
+        setTimeout(() => {
+            try { Precios.completarFaltantes(fecha); } catch (e) { /* se revisa al abrir Precios al cliente */ }
+        }, 1500);
     },
 
     async getCamiones(fecha) {
@@ -8410,6 +8419,61 @@ const Precios = {
     },
 
     async load() {
+        await this._cargar();
+        // Pedidos que se cargaron o cambiaron después de confirmar la recepción no tenían línea de precio.
+        this.completarFaltantes(AppState.currentDate);
+    },
+
+    // Crea las líneas de precio que faltan: pedidos con mercadería recibida (recepción confirmada con
+    // "llegó" > 0) y sin línea. La lista solo se armaba al confirmar la recepción, así que un pedido
+    // agregado o cambiado después quedaba sin precio, se enviaba igual y no se podía cargar ni cerrar el día.
+    // Se reintenta solo si lo que falta cambió: si armar la lista no los resuelve (por ejemplo falta confirmar
+    // a otro proveedor), no se queda en bucle.
+    _completando: false,
+    _completarPendiente: null,
+    _faltantesIntentados: new Map(),
+    async completarFaltantes(fecha) {
+        if (!fecha) return;
+        if (this._completando) {
+            this._completarPendiente = fecha;
+            return;
+        }
+        if (DiaOperativo.diaCerrado(fecha) || DiaOperativo.diaSinPedidos(fecha)) return;
+        this._completando = true;
+        try {
+            const [pedidos, recepciones, precios] = await Promise.all([
+                API.getPedidos(fecha),
+                API.getRecepcion(fecha),
+                API.getPreciosCliente(fecha)
+            ]);
+            const confirmada = r => r.confirmado === true || r.confirmado === 'true';
+            const llegoPorProducto = {};
+            (recepciones || []).filter(confirmada).forEach(r => {
+                llegoPorProducto[String(r.producto_id)] = (llegoPorProducto[String(r.producto_id)] || 0) + (parseFloat(r.llego) || 0);
+            });
+            const conLinea = new Set((precios || []).map(p => `${p.cliente_id}|${p.producto_id}`));
+            const faltan = (pedidos || [])
+                .filter(p => (parseFloat(p.cantidad) || 0) > 0
+                    && llegoPorProducto[String(p.producto_id)] > 0
+                    && !conLinea.has(`${p.cliente_id}|${p.producto_id}`))
+                .map(p => `${p.cliente_id}|${p.producto_id}`)
+                .sort()
+                .join(',');
+            if (!faltan || this._faltantesIntentados.get(fecha) === faltan) return;
+            this._faltantesIntentados.set(fecha, faltan);
+            const lista = await Recepcion._armarListaPrecios();
+            if (lista) Utils.avisar('Se agregaron a la lista de precios pedidos que no la tenían');
+        } catch (error) {
+            console.warn('No se pudo completar la lista de precios:', error);
+        } finally {
+            this._completando = false;
+            const pendiente = this._completarPendiente;
+            this._completarPendiente = null;
+            if (pendiente) this.completarFaltantes(pendiente);
+        }
+    },
+
+    async _cargar() {
         const tbody = document.getElementById('precios-tbody');
         if (!tbody) return;
 
