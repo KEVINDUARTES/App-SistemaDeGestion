@@ -1926,7 +1926,7 @@ const API = {
     // Un pedido que cambia después de confirmar la recepción necesita su línea de precio.
     _revisarListaPrecios(fecha) {
         setTimeout(() => {
-            try { Precios.completarFaltantes(fecha); } catch (e) { /* se revisa al abrir Precios al cliente */ }
+            try { Precios.completarFaltantes(fecha, true); } catch (e) { /* se revisa al abrir Precios al cliente */ }
         }, 1500);
     },
 
@@ -4118,6 +4118,9 @@ const PlanillaPedidos = {
             this._avisarSalidaVacia();
             DiaOperativo.refreshSoon();
             Pedidos.renderEnvioResumen();
+            // Una cantidad que se pone en 0 borra el pedido (y al abrir Precios su línea); si después se
+            // vuelve a escribir, el pedido nuevo tiene que recuperar su línea de precio.
+            if (AppState.currentDate) API._revisarListaPrecios(AppState.currentDate);
         } catch (error) {
             // Sin conexión, servidor ocupado o error de Google: nada se pierde, se reintenta.
             console.warn('Planilla: no se pudo guardar, se reintenta:', error);
@@ -8432,7 +8435,7 @@ const Precios = {
     _completando: false,
     _completarPendiente: null,
     _faltantesIntentados: new Map(),
-    async completarFaltantes(fecha) {
+    async completarFaltantes(fecha, fresco = false) {
         if (!fecha) return;
         if (this._completando) {
             this._completarPendiente = fecha;
@@ -8441,6 +8444,11 @@ const Precios = {
         if (DiaOperativo.diaCerrado(fecha) || DiaOperativo.diaSinPedidos(fecha)) return;
         this._completando = true;
         try {
+            // Tras cambiar pedidos, lo guardado en memoria puede ser anterior al cambio.
+            if (fresco) {
+                CacheManager.invalidate(`pedidos:${fecha}`);
+                CacheManager.invalidate(`precios:${fecha}`);
+            }
             const [pedidos, recepciones, precios] = await Promise.all([
                 API.getPedidos(fecha),
                 API.getRecepcion(fecha),
