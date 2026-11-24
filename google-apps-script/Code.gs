@@ -492,6 +492,10 @@ function handleRequest(e, method) {
       case 'pedidos/eliminar-producto':
         result = eliminarPedidosProductoDia(data);
         break;
+
+      case 'pedidos/mover':
+        result = moverPedidosDeDia(data);
+        break;
       
       case 'pedidos/marcar-enviados':
         result = marcarPedidosEnviados(data.fecha);
@@ -2970,6 +2974,126 @@ function firmaCamiones_(camiones) {
   });
 }
 
+/**
+ * Cuando un camión cambia de día, sus pedidos cambian con él: pasa los pedidos de esos clientes del día "desde" al
+ * día "hasta" (y, si viene camion_id, el camión mismo). Si ya había un pedido del mismo cliente y producto en el día
+ * nuevo, las cantidades se suman. Los pedidos movidos quedan como pendientes de enviar al proveedor.
+ * No se mueve nada si alguno de los dos días está cerrado, ni si ya se confirmó la recepción de esos productos o
+ * ya hay precios cargados a esos clientes (eso dejaría cuentas a medias).
+ */
+function moverPedidosDeDia(data) {
+  if (!data) throw new Error('Faltan datos para mover los pedidos');
+  var desde = normalizeFecha(data.desde);
+  var hasta = normalizeFecha(data.hasta);
+  if (!desde || !hasta) throw new Error('Falta el día de origen o el día nuevo');
+  if (desde === hasta) throw new Error('El día nuevo tiene que ser distinto del actual');
+  var clientes = data.cliente_ids;
+  if (typeof clientes === 'string') { try { clientes = JSON.parse(clientes); } catch (e) { clientes = []; } }
+  if (!Array.isArray(clientes) || !clientes.length) throw new Error('Elegí al menos un cliente');
+  assertDiaAbierto_(desde);
+  assertDiaAbierto_(hasta);
+
+  var sheet = getSheet(CONFIG.SHEETS.PEDIDOS);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var clienteIdx = headers.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var productoIdx = headers.indexOf('producto_id'); if (productoIdx < 0) productoIdx = 3;
+  var cantIdx = headers.indexOf('cantidad');
+  var enviadoIdx = headers.indexOf('enviado');
+  if (cantIdx < 0) throw new Error('La hoja de pedidos no tiene la columna cantidad');
+
+  var elegidos = {};
+  clientes.forEach(function(c) { elegidos[String(c)] = true; });
+  var claveDe = function(fila) { return String(fila[clienteIdx]) + '|' + String(fila[productoIdx]); };
+
+  var enDestino = {};
+  var aMover = [];
+  for (var i = 1; i < values.length; i++) {
+    var f = normalizeFecha(values[i][fechaIdx]);
+    if (f === hasta) enDestino[claveDe(values[i])] = i;
+    else if (f === desde && elegidos[String(values[i][clienteIdx])]) aMover.push(i);
+  }
+  if (!aMover.length) throw new Error('Esos clientes no tienen pedidos en el día de origen');
+
+  var productos = {};
+  aMover.forEach(function(i) { productos[String(values[i][productoIdx])] = true; });
+  var confirmados = getRecepcion(desde).filter(function(r) {
+    return productos[String(r.producto_id)] && recepcionProductoConfirmada(r);
+  });
+  if (confirmados.length) {
+    var nombres = confirmados.map(function(r) { return r.producto_nombre || r.producto_id; });
+    throw new Error('Ya se confirmó la recepción de ' + nombres.slice(0, 4).join(', ') + (nombres.length > 4 ? ' y otros' : '') +
+      ' en ese día. Para mover estos pedidos hay que deshacer primero esa confirmación.');
+  }
+  var conPrecio = getPreciosCliente(desde).filter(function(l) {
+    return elegidos[String(l.cliente_id)] && productos[String(l.producto_id)];
+  });
+  if (conPrecio.length) throw new Error('Ya hay precios cargados a esos clientes en ese día, así que no se pueden mover los pedidos.');
+
+  var aBorrar = [];
+  var combinados = 0;
+  aMover.forEach(function(i) {
+    var clave = claveDe(values[i]);
+    var j = enDestino[clave];
+    if (j !== undefined) {
+      values[j][cantIdx] = Math.round(((Number(values[j][cantIdx]) || 0) + (Number(values[i][cantIdx]) || 0)) * 100) / 100;
+      if (enviadoIdx !== -1) values[j][enviadoIdx] = false;
+      aBorrar.push(i);
+      combinados++;
+    } else {
+      values[i][fechaIdx] = hasta;
+      if (enviadoIdx !== -1) values[i][enviadoIdx] = false;
+      enDestino[clave] = i;
+    }
+  });
+
+  // Se escriben solo las columnas que cambian, de una sola vez (celda por celda tardaría mucho con muchos pedidos).
+  var filas = values.length - 1;
+  var columna = function(idx) { var c = []; for (var r = 1; r < values.length; r++) c.push([values[r][idx]]); return c; };
+  sheet.getRange(2, fechaIdx + 1, filas, 1).setValues(columna(fechaIdx));
+  sheet.getRange(2, cantIdx + 1, filas, 1).setValues(columna(cantIdx));
+  if (enviadoIdx !== -1) sheet.getRange(2, enviadoIdx + 1, filas, 1).setValues(columna(enviadoIdx));
+  aBorrar.sort(function(a, b) { return b - a; }).forEach(function(i) { sheet.deleteRow(i + 1); });
+  invalidateSheetCache(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheForSheet(CONFIG.SHEETS.PEDIDOS);
+  invalidateServerCacheFecha(desde);
+  invalidateServerCacheFecha(hasta);
+
+  var camionMovido = false;
+  if (data.camion_id) {
+    var camSheet = getSheet(CONFIG.SHEETS.CAMIONES);
+    var cv = readUsedValues_(camSheet);
+    var ch = cv.length ? cv[0] : [];
+    var cId = Math.max(ch.indexOf('id'), 0);
+    var cFecha = ch.indexOf('fecha'); if (cFecha < 0) cFecha = 1;
+    var cOrden = ch.indexOf('orden'); if (cOrden < 0) cOrden = 3;
+    var fila = -1;
+    var maxOrden = 0;
+    for (var k = 1; k < cv.length; k++) {
+      var fk = normalizeFecha(cv[k][cFecha]);
+      if (fk === hasta) maxOrden = Math.max(maxOrden, Number(cv[k][cOrden]) || 0);
+      if (fk === desde && String(cv[k][cId]) === String(data.camion_id)) fila = k;
+    }
+    if (fila !== -1) {
+      camSheet.getRange(fila + 1, cFecha + 1).setValue(hasta);
+      camSheet.getRange(fila + 1, cOrden + 1).setValue(maxOrden + 1);
+      invalidateSheetCache(CONFIG.SHEETS.CAMIONES);
+      invalidateServerCacheForSheet(CONFIG.SHEETS.CAMIONES);
+      camionMovido = true;
+    }
+  }
+
+  return {
+    success: true,
+    desde: desde,
+    hasta: hasta,
+    movidos: aMover.length - combinados,
+    combinados: combinados,
+    camion_movido: camionMovido
+  };
+}
+
 function guardarCamiones(data) {
   if (!data || !data.fecha) throw new Error('La fecha es requerida');
   var fechaNorm = normalizeFecha(data.fecha);
@@ -3210,7 +3334,8 @@ function agregarRecepcionProducto_(filas, requeridos) {
   return Object.assign({}, base, {
     llego: llego,
     precio_real: llego > 0 ? Math.max(1, Math.round(costo / llego)) : normalizeAmount(base.precio_real),
-    confirmado: todasConfirmadas
+    confirmado: todasConfirmadas,
+    filas_asignadas: asignadas
   });
 }
 
@@ -3403,13 +3528,46 @@ function recepcionDeProducto(recepcionMap, productoId) {
   return found;
 }
 
+/**
+ * A este cliente no le tocó nada de lo que llegó de ese producto: no se le cobra y no hace falta su precio.
+ * Pasa cuando llega menos de lo pedido y se reparte a mano entre otros clientes (el que queda en cero no tiene
+ * línea de precio, y el cierre le pedía igual un precio).
+ * Es conservadora: solo vale con el producto confirmado y con un reparto manual que cuadra con lo que llegó en cada
+ * proveedor. Con un reparto automático (proporcional) a todos les toca algo, así que no se exime a nadie.
+ */
+function clienteSinParte_(clienteId, rec) {
+  if (!rec || !recepcionProductoConfirmada(rec)) return false;
+  var filas = rec.filas_asignadas || [];
+  if (!filas.length) return false;
+  var total = 0;
+  for (var i = 0; i < filas.length; i++) {
+    var llego = Number(filas[i].llego) || 0;
+    if (llego <= 0) continue;
+    var reparto = parseReparto_(filas[i].reparto);
+    if (!reparto) return false;
+    var suma = 0;
+    var parte = 0;
+    Object.keys(reparto).forEach(function(id) {
+      var n = Number(reparto[id]) || 0;
+      suma += n;
+      if (idsMatch(id, clienteId)) parte += n;
+    });
+    if (Math.abs(suma - llego) > 0.05) return false;
+    total += parte;
+  }
+  return total <= 0.004;
+}
+
 function pedidoTienePrecioCliente(pedido, precios, rec) {
   if (productoNoLlego(rec)) return true;
-  return (precios || []).some(function(pr) {
-    return idsMatch(pr.cliente_id, pedido.cliente_id) &&
-      idsMatch(pr.producto_id, pedido.producto_id) &&
-      normalizeAmount(pr.precio_cliente) > 0;
+  var lineas = (precios || []).filter(function(pr) {
+    return idsMatch(pr.cliente_id, pedido.cliente_id) && idsMatch(pr.producto_id, pedido.producto_id);
   });
+  if (lineas.some(function(pr) { return normalizeAmount(pr.precio_cliente) > 0; })) return true;
+  // Si hay una línea con cantidad, hay que ponerle precio. Sin línea (o con cantidad 0) y sin nada de lo que
+  // llegó para ese cliente, no hace falta.
+  var conCantidad = lineas.some(function(pr) { return Number(pr.cantidad) > 0; });
+  return !conCantidad && clienteSinParte_(pedido.cliente_id, rec);
 }
 
 /**
@@ -4205,6 +4363,45 @@ function consumirSaldoAFavor_(clienteId, cobranzaId) {
   return aplicado;
 }
 
+/**
+ * Un cliente que paga de más deja saldo a favor. Si ya tiene otras cargas pendientes, el sobrante se descuenta ahí
+ * en el momento (como un pago por adelantado), empezando por la carga siguiente a la que acaba de pagar y después
+ * por las más viejas. Si no hay otras cargas pendientes, queda a favor para la próxima que se cree.
+ * Devuelve [{ fecha, monto }] con lo que se descontó de cada carga.
+ */
+function aplicarSaldoAFavorAPendientes_(clienteId, cobranzaPagadaId) {
+  var sheet = getSheet(CONFIG.SHEETS.COBRANZAS);
+  var values = readUsedValues_(sheet);
+  var headers = values.length ? values[0] : [];
+  var idIdx = Math.max(headers.indexOf('id'), 0);
+  var fechaIdx = headers.indexOf('fecha'); if (fechaIdx < 0) fechaIdx = 1;
+  var clienteIdx = headers.indexOf('cliente_id'); if (clienteIdx < 0) clienteIdx = 2;
+  var totalIdx = headers.indexOf('total'); if (totalIdx < 0) totalIdx = 3;
+  var pagadoIdx = headers.indexOf('pagado'); if (pagadoIdx < 0) pagadoIdx = 4;
+  var origenIdx = headers.indexOf('origen');
+
+  var fechaPagada = '';
+  var candidatas = [];
+  for (var i = 1; i < values.length; i++) {
+    if (!idsMatch(values[i][clienteIdx], clienteId)) continue;
+    if (idsMatch(values[i][idIdx], cobranzaPagadaId)) { fechaPagada = normalizeFecha(values[i][fechaIdx]); continue; }
+    if (origenIdx >= 0 && String(values[i][origenIdx] || '') === 'credito') continue;
+    var saldo = normalizeAmount(values[i][totalIdx]) - normalizeAmount(values[i][pagadoIdx]);
+    if (saldo <= 0.01) continue;
+    candidatas.push({ id: values[i][idIdx], fecha: normalizeFecha(values[i][fechaIdx]) || '' });
+  }
+  candidatas.sort(function(a, b) { return a.fecha < b.fecha ? -1 : (a.fecha > b.fecha ? 1 : 0); });
+  var siguientes = candidatas.filter(function(c) { return !fechaPagada || c.fecha > fechaPagada; });
+  var anteriores = candidatas.filter(function(c) { return fechaPagada && c.fecha <= fechaPagada; });
+
+  var aplicados = [];
+  siguientes.concat(anteriores).forEach(function(c) {
+    var monto = consumirSaldoAFavor_(clienteId, c.id);
+    if (monto > 0) aplicados.push({ fecha: c.fecha, monto: monto });
+  });
+  return aplicados;
+}
+
 function registrarCobro(data) {
   var parsed = normalizarMedios_(data, METODOS_CLIENTE_);
   var monto = parsed.total;
@@ -4254,10 +4451,22 @@ function registrarCobro(data) {
     }
 
     registrarCajaMedios_(data.fecha, 'ingreso', parsed.medios, 'Cobranza', data.cobranza_id);
-    if (exceso > 0.01) crearSaldoAFavor_(sheet, values[i][headers.indexOf('cliente_id') >= 0 ? headers.indexOf('cliente_id') : 2], data.fecha, exceso);
+    var aplicadoEn = [];
+    if (exceso > 0.01) {
+      var clienteDelCobro = values[i][headers.indexOf('cliente_id') >= 0 ? headers.indexOf('cliente_id') : 2];
+      crearSaldoAFavor_(sheet, clienteDelCobro, data.fecha, exceso);
+      // Si el cliente ya tiene otras cargas pendientes, el sobrante se descuenta de ellas ahora.
+      aplicadoEn = aplicarSaldoAFavorAPendientes_(clienteDelCobro, data.cobranza_id);
+    }
     invalidateSheetCache(CONFIG.SHEETS.COBRANZAS);
     invalidateServerCacheForSheet(CONFIG.SHEETS.COBRANZAS);
-    return { success: true, pagado: nuevoPagado, saldo: nuevoSaldo, medios: previos, a_favor: exceso };
+    var aplicadoTotal = aplicadoEn.reduce(function(t, x) { return t + x.monto; }, 0);
+    return {
+      success: true, pagado: nuevoPagado, saldo: nuevoSaldo, medios: previos,
+      a_favor: Math.max(0, Math.round((exceso - aplicadoTotal) * 100) / 100),
+      sobrante: exceso,
+      aplicado_en: aplicadoEn
+    };
   }
 
   throw new Error('Cobranza no encontrada');
@@ -5464,6 +5673,7 @@ function getDiasPendientes() {
   var recConfirmIdx = recHeaders.indexOf('confirmado');
   var recProvIdx = recHeaders.indexOf('proveedor_id');
   var recExtraIdx = recHeaders.indexOf('extra');
+  var recRepartoIdx = recHeaders.indexOf('reparto');
   if (recProdIdx === -1) recProdIdx = 2;
 
   var recepcionPorFecha = {};
@@ -5479,7 +5689,8 @@ function getDiasPendientes() {
       llego: recLlegoIdx !== -1 ? row[recLlegoIdx] : null,
       precio_real: recPrecioIdx !== -1 ? row[recPrecioIdx] : 0,
       confirmado: recConfirmIdx !== -1 ? row[recConfirmIdx] : false,
-      extra: recExtraIdx !== -1 ? row[recExtraIdx] : false
+      extra: recExtraIdx !== -1 ? row[recExtraIdx] : false,
+      reparto: recRepartoIdx !== -1 ? row[recRepartoIdx] : ''
     });
   });
 
@@ -5488,6 +5699,7 @@ function getDiasPendientes() {
   var prClienteIdx = precHeaders.indexOf('cliente_id');
   var prProductoIdx = precHeaders.indexOf('producto_id');
   var prPrecioIdx = precHeaders.indexOf('precio_cliente');
+  var prCantidadIdx = precHeaders.indexOf('cantidad');
   if (prFechaIdx === -1) prFechaIdx = 1;
 
   var preciosPorFecha = {};
@@ -5498,7 +5710,8 @@ function getDiasPendientes() {
     preciosPorFecha[f].push({
       cliente_id: prClienteIdx !== -1 ? row[prClienteIdx] : null,
       producto_id: prProductoIdx !== -1 ? row[prProductoIdx] : null,
-      precio_cliente: prPrecioIdx !== -1 ? row[prPrecioIdx] : null
+      precio_cliente: prPrecioIdx !== -1 ? row[prPrecioIdx] : null,
+      cantidad: prCantidadIdx !== -1 ? row[prCantidadIdx] : null
     });
   });
 
