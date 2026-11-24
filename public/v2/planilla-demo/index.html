@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Planilla del día (v2 de prueba)</title>
+    <link rel="stylesheet" href="planilla.css">
+</head>
+<body>
+    <header class="barra">
+        <h1>Planilla del día</h1>
+        <label class="campo">Día
+            <input type="date" id="fecha">
+        </label>
+        <label class="campo campo-check">
+            <input type="checkbox" id="ocultar-vacias"> Ocultar filas sin pedidos
+        </label>
+        <span id="estado" class="estado" role="status" aria-live="polite"></span>
+    </header>
+
+    <p class="aviso-prueba" id="aviso-prueba" hidden>
+        Versión de prueba con datos inventados. Lo que escribís se guarda solo en este navegador, no en el sistema real.
+        <button type="button" id="btn-limpiar" class="boton-chico">Borrar este día</button>
+    </p>
+
+    <nav class="hojas" id="hojas" role="tablist" aria-label="Hojas"></nav>
+
+    <main class="contenedor">
+        <div class="tabla-scroll">
+            <table id="planilla" class="planilla"></table>
+        </div>
+        <p class="ayuda">Escribí la cantidad y pasá a la siguiente con Tab, Enter o las flechas. Se guarda sola. Los productos por kilo aceptan decimales.</p>
+    </main>
+
+    <script src="datos-demo.js"></script>
+    <script src="planilla.js"></script>
+</body>
+</html>

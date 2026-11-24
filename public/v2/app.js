@@ -1,0 +1,16496 @@
+// Configuración de la API
+// API_CONFIG ya está definido en auth.js (se carga primero)
+// No redeclarar para evitar error "already declared"
+
+function fechaHoyAR() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+}
+
+// Estado de la aplicación
+const AppState = {
+    currentPage: 'dashboard',
+    currentDate: fechaHoyAR(),
+    pedidos: [],
+    productos: [],
+    clientes: [],
+    proveedores: [],
+    recepcion: [],
+    precios: [],
+    cobranzas: [],
+    pagos: [],
+    stock: [],
+    cierres: [],
+    whatsappAutoEnvio: false,
+    whatsappModo: 'manual'
+};
+
+// Sistema de caché (memoria + sessionStorage para recargas instantáneas)
+const CacheManager = {
+    cache: {},
+    timestamps: {},
+    DEBUG: false,
+    STORAGE_KEY: 'sg_cache_v5',
+    CATALOG_STORAGE_KEY: 'sg_catalog_v3',
+    _persistTimer: null,
+
+    TTL: {
+        clientes: 60 * 60 * 1000,
+        productos: 60 * 60 * 1000,
+        proveedores: 45 * 60 * 1000,
+        bootstrap: 5 * 60 * 1000,
+        pedidos: 5 * 60 * 1000,
+        recepcion: 5 * 60 * 1000,
+        precios: 5 * 60 * 1000,
+        cobranzas: 10 * 60 * 1000,
+        stock: 10 * 60 * 1000,
+        historial: 15 * 60 * 1000,
+        cierres: 15 * 60 * 1000,
+        dashboard: 5 * 60 * 1000,
+        flujo: 5 * 60 * 1000,
+        whatsapp: 5 * 60 * 1000
+    },
+
+    CATALOG_KEYS: ['clientes', 'productos', 'proveedores'],
+
+    log(...args) {
+        if (this.DEBUG) console.log(...args);
+    },
+
+    _initFromStorage() {
+        try {
+            const raw = sessionStorage.getItem(this.STORAGE_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed.cache && parsed.timestamps) {
+                    this.cache = parsed.cache;
+                    this.timestamps = parsed.timestamps;
+                }
+            }
+            const catalogRaw = localStorage.getItem(this.CATALOG_STORAGE_KEY);
+            if (catalogRaw) {
+                const catalog = JSON.parse(catalogRaw);
+                this.CATALOG_KEYS.forEach(key => {
+                    if (catalog[key] && catalog.timestamps?.[key] && !this.cache[key]) {
+                        this.cache[key] = catalog[key];
+                        this.timestamps[key] = catalog.timestamps[key];
+                    }
+                });
+            }
+        } catch (e) {
+            // storage no disponible o datos corruptos
+        }
+    },
+
+    hydrateAppStateFromCache() {
+        const clientes = this.peek('clientes');
+        const productos = this.peek('productos');
+        const proveedores = this.peek('proveedores');
+        if (clientes) AppState.clientes = clientes;
+        if (productos) AppState.productos = productos;
+        if (proveedores) AppState.proveedores = proveedores;
+    },
+
+    _schedulePersist() {
+        if (this._persistTimer) return;
+        this._persistTimer = setTimeout(() => {
+            this._persistTimer = null;
+            this._persist();
+        }, 250);
+    },
+
+    _persist() {
+        try {
+            sessionStorage.setItem(this.STORAGE_KEY, JSON.stringify({
+                cache: this.cache,
+                timestamps: this.timestamps
+            }));
+        } catch (e) {
+            // Cuota excedida: ignorar persistencia
+        }
+    },
+
+    get(key) {
+        const now = Date.now();
+        const cached = this.cache[key];
+        const timestamp = this.timestamps[key];
+
+        if (!cached || !timestamp) {
+            return null;
+        }
+
+        const dataType = key.split(':')[0];
+        const ttl = this.TTL[dataType] || 60000;
+
+        if (now - timestamp > ttl) return null;
+
+        return cached;
+    },
+
+    peek(key) {
+        if (this.cache[key] == null || !this.timestamps[key]) return null;
+        return this.cache[key];
+    },
+
+    set(key, data) {
+        this.cache[key] = data;
+        this.timestamps[key] = Date.now();
+        this._schedulePersist();
+        if (this.CATALOG_KEYS.includes(key)) {
+            this._persistCatalog();
+        }
+    },
+
+    _persistCatalog() {
+        try {
+            const payload = { timestamps: {}, cache: {} };
+            this.CATALOG_KEYS.forEach(key => {
+                if (this.cache[key]) {
+                    payload.cache[key] = this.cache[key];
+                    payload.timestamps[key] = this.timestamps[key];
+                }
+            });
+            localStorage.setItem(this.CATALOG_STORAGE_KEY, JSON.stringify(payload));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    invalidate(key) {
+        delete this.cache[key];
+        delete this.timestamps[key];
+        this._schedulePersist();
+    },
+
+    invalidatePattern(pattern) {
+        Object.keys(this.cache).forEach(key => {
+            if (key.startsWith(pattern)) {
+                delete this.cache[key];
+                delete this.timestamps[key];
+            }
+        });
+        this._schedulePersist();
+    },
+
+    invalidateAllExcept(keepPrefixes = []) {
+        Object.keys(this.cache).forEach(key => {
+            const keep = keepPrefixes.some(prefix => key.startsWith(prefix));
+            if (!keep) {
+                delete this.cache[key];
+                delete this.timestamps[key];
+            }
+        });
+        this._schedulePersist();
+    },
+
+    clear() {
+        this.cache = {};
+        this.timestamps = {};
+        try {
+            sessionStorage.removeItem(this.STORAGE_KEY);
+            localStorage.removeItem(this.CATALOG_STORAGE_KEY);
+        } catch (e) {
+            // ignore
+        }
+    }
+};
+
+CacheManager._initFromStorage();
+CacheManager.hydrateAppStateFromCache();
+
+// Gestión del día del pedido (recepción puede ser al día siguiente)
+// Calendario de días con color: verde = cerrado, rojo = por cerrar (tiene pedidos y todavía no se cerró),
+// sin color = no se cargó nada. El calendario del navegador no se puede pintar, así que cada selector de día
+// tiene al lado un botón que abre este (el campo sigue siendo el mismo y se puede escribir la fecha).
+const CalendarioDias = {
+    _popup: null,
+    _input: null,
+    _mes: null,
+    _cerrados: new Set(),
+
+    enganchar() {
+        document.querySelectorAll('.dia-operativo-fecha').forEach(input => {
+            if (input.dataset.cal === '1') return;
+            input.dataset.cal = '1';
+            const boton = document.createElement('button');
+            boton.type = 'button';
+            boton.className = 'dia-cal-btn';
+            boton.textContent = '📅';
+            boton.title = 'Abrir el calendario (verde: cerrado, rojo: por cerrar)';
+            boton.setAttribute('aria-label', 'Abrir el calendario de días');
+            input.insertAdjacentElement('afterend', boton);
+            boton.addEventListener('click', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (this._popup && this._input === input) { this.cerrar(); return; }
+                this.abrir(input, boton);
+            });
+        });
+    },
+
+    _estadoDe(fecha) {
+        if (this._cerrados.has(fecha)) return 'cerrado';
+        const info = DiaOperativo.getDiaInfo(fecha);
+        if (info) {
+            if (info.estado === 'cerrado') return 'cerrado';
+            if (Number(info.pedidos_count) > 0) return 'por-cerrar';
+        }
+        return '';
+    },
+
+    async abrir(input, boton) {
+        this.cerrar();
+        this._input = input;
+        const base = /^\d{4}-\d{2}-\d{2}$/.test(input.value) ? input.value : DiaOperativo.today();
+        this._mes = { y: Number(base.slice(0, 4)), m: Number(base.slice(5, 7)) - 1 };
+
+        const popup = document.createElement('div');
+        popup.className = 'dia-cal';
+        popup.setAttribute('role', 'dialog');
+        popup.setAttribute('aria-label', 'Calendario de días');
+        popup.innerHTML = `
+            <div class="dia-cal-cab">
+                <button type="button" class="dia-cal-nav" data-nav="-1" aria-label="Mes anterior">‹</button>
+                <strong class="dia-cal-titulo"></strong>
+                <button type="button" class="dia-cal-nav" data-nav="1" aria-label="Mes siguiente">›</button>
+            </div>
+            <div class="dia-cal-sem">${['DO', 'LU', 'MA', 'MI', 'JU', 'VI', 'SA'].map(d => `<span>${d}</span>`).join('')}</div>
+            <div class="dia-cal-grilla"></div>
+            <div class="dia-cal-leyenda">
+                <span><i class="dia-cal-chip cerrado"></i> Cerrado</span>
+                <span><i class="dia-cal-chip por-cerrar"></i> Por cerrar</span>
+                <span><i class="dia-cal-chip"></i> Sin cargar</span>
+            </div>`;
+        document.body.appendChild(popup);
+        this._popup = popup;
+
+        popup.addEventListener('click', e => {
+            e.stopPropagation();
+            const nav = e.target.closest('[data-nav]');
+            if (nav) {
+                const d = new Date(this._mes.y, this._mes.m + Number(nav.dataset.nav), 1);
+                this._mes = { y: d.getFullYear(), m: d.getMonth() };
+                this._pintar();
+                return;
+            }
+            const dia = e.target.closest('[data-fecha]');
+            if (dia) this._elegir(dia.dataset.fecha);
+        });
+        this._cerrarFuera = e => { if (!popup.contains(e.target)) this.cerrar(); };
+        this._cerrarTecla = e => { if (e.key === 'Escape') this.cerrar(); };
+        setTimeout(() => document.addEventListener('click', this._cerrarFuera), 0);
+        document.addEventListener('keydown', this._cerrarTecla);
+
+        this._pintar();
+        this._ubicar(boton);
+
+        // Los días ya cerrados vienen del historial de cierres (la lista de días abiertos no los trae).
+        try {
+            const cierres = await API.getCierres();
+            this._cerrados = new Set((cierres || [])
+                .filter(c => String(c.estado || '') !== 'cerrando')
+                .map(c => Utils.fechaIso(c.fecha))
+                .filter(Boolean));
+            if (this._popup === popup) this._pintar();
+        } catch (error) {
+            // Sin el historial se muestran solo los días con pedidos sin cerrar.
+        }
+    },
+
+    _pintar() {
+        const popup = this._popup;
+        if (!popup) return;
+        const { y, m } = this._mes;
+        const titulo = new Date(y, m, 1).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+        popup.querySelector('.dia-cal-titulo').textContent = titulo.charAt(0).toUpperCase() + titulo.slice(1);
+        const dos = n => String(n).padStart(2, '0');
+        const primero = new Date(y, m, 1).getDay();
+        const cantidad = new Date(y, m + 1, 0).getDate();
+        const hoy = DiaOperativo.today();
+        const elegido = this._input && this._input.value;
+        let html = '<span></span>'.repeat(primero);
+        for (let d = 1; d <= cantidad; d++) {
+            const fecha = `${y}-${dos(m + 1)}-${dos(d)}`;
+            const estado = this._estadoDe(fecha);
+            const texto = estado === 'cerrado' ? 'cerrado' : (estado === 'por-cerrar' ? 'por cerrar' : 'sin cargar');
+            html += `<button type="button" class="dia-cal-dia ${estado}${fecha === hoy ? ' hoy' : ''}${fecha === elegido ? ' elegido' : ''}" data-fecha="${fecha}" aria-label="${d} de ${titulo}, ${texto}">${d}</button>`;
+        }
+        popup.querySelector('.dia-cal-grilla').innerHTML = html;
+    },
+
+    _ubicar(boton) {
+        const popup = this._popup;
+        if (!popup || !boton) return;
+        const r = boton.getBoundingClientRect();
+        const ancho = popup.offsetWidth || 300;
+        const alto = popup.offsetHeight || 320;
+        const izquierda = Math.max(8, Math.min(r.left, window.innerWidth - ancho - 8));
+        let arriba = r.bottom + 6;
+        if (arriba + alto > window.innerHeight - 8) arriba = Math.max(8, r.top - alto - 6);
+        popup.style.left = izquierda + 'px';
+        popup.style.top = arriba + 'px';
+    },
+
+    _elegir(fecha) {
+        const input = this._input;
+        this.cerrar();
+        if (!input) return;
+        input.value = fecha;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    },
+
+    cerrar() {
+        if (this._popup) this._popup.remove();
+        this._popup = null;
+        this._input = null;
+        document.removeEventListener('click', this._cerrarFuera);
+        document.removeEventListener('keydown', this._cerrarTecla);
+    }
+};
+
+const DiaOperativo = {
+    diasPendientes: [],
+    workDate: null,
+    _initialized: false,
+
+    today() {
+        return fechaHoyAR();
+    },
+
+    formatFechaLabel(fecha) {
+        const d = new Date(fecha + 'T12:00:00');
+        const corta = d.toLocaleDateString('es-AR', {
+            weekday: 'short',
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric'
+        });
+        if (fecha === this.today()) return `Hoy — ${corta}`;
+        return corta;
+    },
+
+    getEstadoLabel(estado) {
+        const labels = {
+            recepcion_pendiente: 'Recepción pendiente',
+            precios_pendiente: 'Falta cargar precios',
+            listo_cierre: 'Listo para cerrar',
+            cerrado: 'Día cerrado',
+            nuevo: 'Sin pedidos aún'
+        };
+        return labels[estado] || estado;
+    },
+
+    getEstadoClass(estado) {
+        const classes = {
+            recepcion_pendiente: 'estado-recepcion',
+            precios_pendiente: 'estado-precios',
+            listo_cierre: 'estado-listo',
+            cerrado: 'estado-listo',
+            nuevo: 'estado-nuevo'
+        };
+        return classes[estado] || 'estado-nuevo';
+    },
+
+    getDiaInfo(fecha) {
+        return this.diasPendientes.find(d => d.fecha === fecha) || null;
+    },
+
+    diaCerrado(fecha) {
+        const info = this.getDiaInfo(fecha || this.workDate || AppState.currentDate);
+        return !!(info && info.estado === 'cerrado');
+    },
+
+    diaSinPedidos(fecha) {
+        const info = this.getDiaInfo(fecha || this.workDate || AppState.currentDate);
+        if (!info) return false;
+        // Un día cerrado siempre tuvo pedidos (no se puede cerrar sin): hay que ir a buscarlos.
+        if (info.estado === 'cerrado') return false;
+        return !(Number(info.pedidos_count) > 0);
+    },
+
+    init() {
+        if (this._initialized) return;
+        document.querySelectorAll('.dia-operativo-select').forEach(select => {
+            if (select.dataset.bound === 'true') return;
+            select.dataset.bound = 'true';
+            select.addEventListener('change', async (e) => {
+                if (this._ignoreSelectChange) return;
+                await this.setWorkDate(e.target.value);
+            });
+        });
+        // Calendario (Pedidos del día): cualquier fecha, pasada o futura, haya pedidos o no.
+        document.querySelectorAll('.dia-operativo-fecha').forEach(input => {
+            if (input.dataset.bound === 'true') return;
+            input.dataset.bound = 'true';
+            input.addEventListener('change', async (e) => {
+                const fecha = e.target.value;
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                    e.target.value = this.workDate || this.today();
+                    return;
+                }
+                await this.setWorkDate(fecha);
+            });
+        });
+        this._initialized = true;
+    },
+
+    async refresh(options = {}) {
+        try {
+            this.diasPendientes = await API.getDiasPendientes();
+            await this.marcarHoyCerrado();
+        } catch (error) {
+            console.warn('No se pudieron cargar días pendientes:', error.message);
+            const hoy = this.today();
+            this.diasPendientes = [{
+                fecha: hoy,
+                pedidos_count: 0,
+                recepcion_confirmada: false,
+                precios_completos: false,
+                estado: 'nuevo'
+            }];
+        }
+
+        if (!options.skipRender) {
+            this.renderSelectors();
+            this.renderEstadoPanels();
+            this.renderDashboardBanner();
+            this.renderNavBadge();
+        }
+    },
+
+    refreshSoon() {
+        clearTimeout(this._refreshTimer);
+        this._refreshTimer = setTimeout(() => {
+            this.refresh().catch(() => {});
+        }, 1200);
+    },
+
+    async resolveWorkDate(options = {}) {
+        if (!options.skipRefresh) {
+            await this.refresh({ skipRender: true });
+        }
+        const hoy = this.today();
+        const openFechas = this.diasPendientes.map(d => d.fecha);
+        const stored = sessionStorage.getItem('sg_work_date');
+
+        if (stored && openFechas.includes(stored)) {
+            this.workDate = stored;
+        } else {
+            const conPedidos = this.diasPendientes.filter(d => d.pedidos_count > 0);
+            const necesitaTrabajo = conPedidos.filter(d =>
+                d.estado === 'recepcion_pendiente' || d.estado === 'precios_pendiente'
+            );
+
+            if (necesitaTrabajo.length > 0) {
+                this.workDate = necesitaTrabajo[0].fecha;
+            } else if (openFechas.includes(hoy)) {
+                this.workDate = hoy;
+            } else if (conPedidos.length > 0) {
+                this.workDate = conPedidos[conPedidos.length - 1].fecha;
+            } else {
+                this.workDate = hoy;
+            }
+        }
+
+        AppState.currentDate = this.workDate;
+        sessionStorage.setItem('sg_work_date', this.workDate);
+        this.renderSelectors();
+        this.renderEstadoPanels();
+        this.renderDashboardBanner();
+        this.renderNavBadge();
+    },
+
+    async setWorkDate(fecha, options = {}) {
+        if (!fecha || fecha === this.workDate) return;
+        this.workDate = fecha;
+        AppState.currentDate = fecha;
+        sessionStorage.setItem('sg_work_date', fecha);
+        // Una fecha elegida en el calendario puede no estar en la lista de días abiertos: si es un
+        // día ya cerrado, se marca como cerrado para que la pantalla no deje cargarle pedidos.
+        if (!this.getDiaInfo(fecha)) await this.marcarHoyCerrado();
+        this.renderSelectors();
+        this.renderEstadoPanels();
+
+        if (!options.skipReload && AppState.currentPage) {
+            const flowPages = ['pedidos', 'camiones', 'recepcion', 'recepcion-pendientes', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
+            if (flowPages.includes(AppState.currentPage)) {
+                await Navigation.loadPageData(AppState.currentPage);
+            }
+        }
+    },
+
+    renderSelectors() {
+        const fechas = this.diasPendientes.map(d => d.fecha);
+        if (this.workDate && !fechas.includes(this.workDate)) {
+            fechas.push(this.workDate);
+            fechas.sort();
+        }
+
+        this._ignoreSelectChange = true;
+        document.querySelectorAll('.dia-operativo-select').forEach(select => {
+            const current = this.workDate || this.today();
+            select.innerHTML = '';
+
+            fechas.forEach(fecha => {
+                const info = this.getDiaInfo(fecha);
+                const option = document.createElement('option');
+                option.value = fecha;
+                let text = this.formatFechaLabel(fecha);
+                if (info && info.pedidos_count > 0) {
+                    text += ` (${info.pedidos_count} pedidos)`;
+                }
+                option.textContent = text;
+                select.appendChild(option);
+            });
+
+            select.value = current;
+        });
+        const actual = this.workDate || this.today();
+        const infoActual = this.getDiaInfo(actual);
+        document.querySelectorAll('.dia-operativo-fecha').forEach(input => {
+            if (document.activeElement !== input) input.value = actual;
+        });
+        document.querySelectorAll('.dia-operativo-fecha-texto').forEach(el => {
+            const pedidos = infoActual && infoActual.pedidos_count > 0 ? ` · ${infoActual.pedidos_count} pedidos` : '';
+            el.textContent = this.formatFechaLabel(actual) + pedidos;
+        });
+        CalendarioDias.enganchar();
+        setTimeout(() => { this._ignoreSelectChange = false; }, 0);
+    },
+
+    renderEstadoPanels() {
+        const info = this.getDiaInfo(this.workDate);
+        const estado = info ? info.estado : 'nuevo';
+        const label = this.getEstadoLabel(estado);
+        const cssClass = this.getEstadoClass(estado);
+
+        ['pedidos', 'recepcion', 'precios', 'cierre'].forEach(page => {
+            const el = document.getElementById(`${page}-estado-dia`);
+            if (!el) return;
+            let label = this.getEstadoLabel(estado);
+            if (info && info.estado === 'recepcion_pendiente' && info.recepcion_total > 0) {
+                label = `Recepción ${info.recepcion_confirmados || 0}/${info.recepcion_total}`;
+            }
+            el.textContent = label;
+            el.className = `dia-operativo-estado ${cssClass}`;
+        });
+    },
+
+    async marcarHoyCerrado() {
+        const hoy = this.workDate || this.today();
+        const info = this.getDiaInfo(hoy);
+        if (info) return;
+
+        try {
+            const cierres = await API.getCierres();
+            const cerrado = (cierres || []).find(cierre => {
+                return Utils.fechaIso(cierre.fecha) === hoy && String(cierre.estado || '') !== 'cerrando';
+            });
+            if (!cerrado) return;
+
+            this.diasPendientes = (this.diasPendientes || []).filter(dia => dia.fecha !== hoy);
+            this.diasPendientes.push({
+                fecha: hoy,
+                pedidos_count: info?.pedidos_count || 0,
+                recepcion_confirmada: true,
+                precios_completos: true,
+                estado: 'cerrado'
+            });
+            this.diasPendientes.sort((a, b) => a.fecha.localeCompare(b.fecha));
+        } catch (error) {
+            console.warn('No se pudo verificar si el día está cerrado:', error.message);
+        }
+    },
+
+    siguientePaso(info) {
+        const estado = info ? info.estado : 'nuevo';
+        if (estado === 'cerrado') {
+            return { pagina: 'historial', texto: 'Ver historial', detalle: 'Este día ya está cerrado.' };
+        }
+        if (estado === 'recepcion_pendiente') {
+            return { pagina: 'pedidos', texto: 'Confirmar lo que llegó', detalle: 'Falta confirmar lo que llegó (columna Llegó de la planilla del día).' };
+        }
+        if (estado === 'precios_pendiente' && !Utils.veePrecios()) {
+            return { pagina: 'dashboard', texto: 'Esperando los precios', detalle: 'La recepción está lista. Falta que se carguen los precios al cliente.' };
+        }
+        if (estado === 'precios_pendiente') {
+            return { pagina: 'precios', texto: 'Cargar precios', detalle: 'La recepción está lista. Falta el precio al cliente.' };
+        }
+        if (estado === 'listo_cierre') {
+            return { pagina: 'cobros-hoy', texto: 'Cobrar a los clientes', detalle: 'Recepción y precios listos. Siguen cobro, deudas, pagos y al final el cierre.' };
+        }
+        return { pagina: 'pedidos', texto: 'Cargar pedidos', detalle: 'Todavía no hay pedidos para este día.' };
+    },
+
+    renderDashboardBanner() {
+        const banner = document.getElementById('dashboard-pendientes-banner');
+        if (!banner) return;
+
+        const pendientes = this.diasPendientes.filter(d =>
+            d.pedidos_count > 0 &&
+            d.estado !== 'listo_cierre' &&
+            d.estado !== 'nuevo' &&
+            d.estado !== 'cerrado'
+        );
+        const foco = pendientes[0] || this.getDiaInfo(this.workDate) || { fecha: this.today(), estado: 'nuevo', pedidos_count: 0 };
+        const paso = this.siguientePaso(foco);
+        const items = pendientes.map(d => {
+            return `<li><strong>${this.formatFechaLabel(d.fecha)}</strong> — ${this.getEstadoLabel(d.estado)} (${d.pedidos_count} pedidos)</li>`;
+        }).join('');
+
+        banner.hidden = false;
+        banner.innerHTML = `
+            <div class="pendientes-banner-text">
+                <strong>${Utils.esc(paso.detalle)}</strong>
+                <span class="pendientes-banner-fecha">${this.formatFechaLabel(foco.fecha)}</span>
+                ${items ? `<ul>${items}</ul>` : ''}
+            </div>
+            <div class="pendientes-banner-actions">
+                <button type="button" class="btn btn-primary" id="btn-banner-siguiente">${paso.texto}</button>
+            </div>
+        `;
+
+        const btn = document.getElementById('btn-banner-siguiente');
+        if (btn) {
+            btn.onclick = async () => {
+                await this.setWorkDate(foco.fecha, { skipReload: true });
+                Navigation.navigateTo(paso.pagina);
+            };
+        }
+    },
+
+    renderNavBadge() {
+        const badge = document.getElementById('nav-badge-recepcion');
+        if (!badge) return;
+
+        const count = this.diasPendientes.filter(d =>
+            d.pedidos_count > 0 &&
+            (d.estado === 'recepcion_pendiente' ||
+                (d.recepcion_total > 0 && (d.recepcion_confirmados || 0) < d.recepcion_total))
+        ).length;
+
+        if (count > 0) {
+            badge.textContent = String(count);
+            badge.hidden = false;
+        } else {
+            badge.hidden = true;
+        }
+    },
+
+    invalidate() {
+        CacheManager.invalidate('flujo:dias-pendientes');
+    }
+};
+
+// Utilidades
+const Utils = {
+    formatDate: (date) => {
+        const iso = Utils.fechaIso(date);
+        if (!iso) return '';
+        const [year, month, day] = iso.split('-');
+        return `${day}/${month}`;
+    },
+
+    fechaIso(value) {
+        if (!value) return '';
+        const raw = String(value).trim();
+        const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+        if (match) return match[1];
+        const parsed = new Date(raw);
+        if (Number.isNaN(parsed.getTime())) return '';
+        return parsed.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+    },
+
+    nombreCatalogo(registro, tipo) {
+        const esProducto = tipo === 'producto';
+        const directo = registro?.[esProducto ? 'producto_nombre' : 'cliente_nombre'];
+        if (directo) return directo;
+        const id = registro?.[esProducto ? 'producto_id' : 'cliente_id'];
+        const lista = esProducto ? AppState.productos : AppState.clientes;
+        const hit = (lista || []).find(item => String(item.id) === String(id));
+        if (hit?.nombre) return hit.nombre;
+        return esProducto ? 'Producto sin ficha' : 'Cliente sin ficha';
+    },
+
+    // El orden de la planilla de pedidos: verdura, fruta, bebida, mercadería y otros; dentro de cada grupo, de la A a la Z.
+    // Camiones, recepción y el PDF al cliente usan este mismo orden.
+    compararProductos(a, b) {
+        const clave = ({ id, nombre }) => {
+            const producto = (AppState.productos || []).find(p => String(p.id) === String(id));
+            const rango = PlanillaPedidos.GRUPOS.findIndex(g => g.tipo === PlanillaPedidos._tipoDe(producto));
+            return { rango: rango < 0 ? PlanillaPedidos.GRUPOS.length : rango, nombre: String((producto && producto.nombre) || nombre || '') };
+        };
+        const x = clave(a);
+        const y = clave(b);
+        return (x.rango - y.rango) || x.nombre.localeCompare(y.nombre, 'es');
+    },
+
+    // Precios al cliente solo lo ve este usuario (en el menú, en los pasos del día y en la pantalla).
+    USUARIOS_CON_PRECIOS: ['cargasluciano@gmail.com', 'nicolirina.rosascharny@gmail.com'],
+
+    veePrecios() {
+        const email = String(Auth.getUserEmail() || '').toLowerCase();
+        return this.USUARIOS_CON_PRECIOS.includes(email);
+    },
+
+    parsePrice(value) {
+        if (value === null || value === undefined || value === '') return 0;
+        if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value) : 0;
+
+        const raw = String(value).trim();
+        if (!raw) return 0;
+
+        const isNegative = raw.startsWith('-');
+        // "10,5" / "1.500,50" / "10.5": 1 o 2 decimales. "5.000" (3 dígitos) son miles.
+        const limpio = raw.replace(/[^\d.,]/g, '');
+        let decimal = null;
+        if (/^[\d.]*\d,\d{1,2}$/.test(limpio)) decimal = parseFloat(limpio.replace(/\./g, '').replace(',', '.'));
+        else if (/^\d+\.\d{1,2}$/.test(limpio)) decimal = parseFloat(limpio);
+        if (decimal !== null && Number.isFinite(decimal)) {
+            const redondeado = Math.round(decimal);
+            return isNegative ? -redondeado : redondeado;
+        }
+        const digits = raw.replace(/\D/g, '');
+        if (!digits) return 0;
+
+        const parsed = parseInt(digits, 10);
+        return isNegative ? -parsed : parsed;
+    },
+
+    formatPrice(value) {
+        const amount = Utils.parsePrice(value);
+        const sign = amount < 0 ? '-' : '';
+        const absAmount = Math.abs(amount);
+        return `${sign}${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 0 }).format(absAmount)}`;
+    },
+
+    formatCurrency(value) {
+        return `$ ${Utils.formatPrice(value)}`;
+    },
+
+    // La comisión por unidad puede tener centavos (5 % de $350 = $17,50 por kilo). Se redondea
+    // recién el total de la línea, igual que en el servidor.
+    // Ayer (Argentina) en formato AAAA-MM-DD.
+    ayerAR() {
+        const d = new Date(fechaHoyAR() + 'T12:00:00');
+        d.setDate(d.getDate() - 1);
+        return d.toLocaleDateString('en-CA');
+    },
+
+    // Saca todas las filas del tbody menos la de "agregar" (así no pierde el foco ni lo que se escribió).
+    limpiarFilasConservando(tbody, filaNueva) {
+        Array.from(tbody.children).forEach(el => { if (el !== filaNueva) el.remove(); });
+        if (filaNueva && filaNueva.parentNode !== tbody) tbody.prepend(filaNueva);
+    },
+
+    // Cantidad que puede tener decimales (kilos): "12,5" o "12.5" → 12.5. Vacío o inválido → NaN.
+    parseCantidad(value) {
+        const texto = String(value ?? '').trim().replace(',', '.');
+        if (texto === '') return NaN;
+        const n = Number(texto);
+        return Number.isFinite(n) ? Math.round(n * 100) / 100 : NaN;
+    },
+
+    formatCantidad(n) {
+        const v = Number(n) || 0;
+        return String(Math.round(v * 100) / 100).replace('.', ',');
+    },
+
+    // Para campos numéricos: lleva punto decimal (un <input type="number"> no entiende la coma).
+    formatCantidadInput(n) {
+        return String(Math.round((Number(n) || 0) * 100) / 100);
+    },
+
+    parseComision(value) {
+        if (typeof value === 'number') return Number.isFinite(value) ? Math.round(value * 100) / 100 : 0;
+        const raw = String(value ?? '').trim();
+        if (/^\d+([.,]\d{1,2})?$/.test(raw)) return Math.round(parseFloat(raw.replace(',', '.')) * 100) / 100;
+        return Utils.parsePrice(value);
+    },
+
+    formatComision(value) {
+        return `$ ${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 2 }).format(Utils.parseComision(value))}`;
+    },
+
+    formatPriceInputValue(input) {
+        if (!input) return;
+        const currentValue = input.value || '';
+        const cursorPosition = input.selectionStart || 0;
+        const digitsBeforeCursor = currentValue.slice(0, cursorPosition).replace(/\D/g, '').length;
+        const digits = currentValue.replace(/\D/g, '');
+
+        if (!digits) {
+            input.value = '';
+            return;
+        }
+
+        const normalizedDigits = String(parseInt(digits, 10));
+        const formatted = normalizedDigits.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+        input.value = formatted;
+
+        if (typeof input.setSelectionRange === 'function') {
+            let nextCursor = formatted.length;
+            if (digitsBeforeCursor === 0) {
+                nextCursor = 0;
+            } else {
+                let digitCount = 0;
+                for (let i = 0; i < formatted.length; i++) {
+                    if (/\d/.test(formatted[i])) {
+                        digitCount++;
+                    }
+                    if (digitCount === digitsBeforeCursor) {
+                        nextCursor = i + 1;
+                        break;
+                    }
+                }
+            }
+            input.setSelectionRange(nextCursor, nextCursor);
+        }
+    },
+
+    enablePriceInputs(root = document) {
+        if (!root || typeof root.querySelectorAll !== 'function') return;
+
+        root.querySelectorAll('[data-price-input="true"]').forEach(input => {
+            if (input.dataset.priceBound === 'true') return;
+            input.dataset.priceBound = 'true';
+            input.setAttribute('inputmode', 'numeric');
+
+            input.addEventListener('input', () => {
+                Utils.formatPriceInputValue(input);
+            });
+
+            input.addEventListener('blur', () => {
+                if (!input.value) return;
+                input.value = Utils.formatPrice(input.value);
+            });
+
+            if (input.value) {
+                input.value = Utils.formatPrice(input.value);
+            }
+        });
+    },
+
+    /** A qué cuenta va un cliente: la de su titular (varias listas de una persona suman juntas) o la suya. */
+    cuentaDe(clienteId) {
+        const id = String(clienteId || '');
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === id);
+        const titular = String(cliente?.titular || '').trim();
+        return titular
+            ? { clave: 't:' + titular.toLowerCase(), titular, nombre: titular }
+            : { clave: 'c:' + id, titular: '', nombre: cliente?.nombre || '' };
+    },
+
+    clientesDeCuenta(clienteId) {
+        const clave = this.cuentaDe(clienteId).clave;
+        const ids = (AppState.clientes || []).filter(c => this.cuentaDe(c.id).clave === clave).map(c => String(c.id));
+        return ids.length ? ids : [String(clienteId)];
+    },
+
+    getCobranzaSaldo(cobranza) {
+        const saldo = Utils.parsePrice(cobranza.saldo);
+        if (!isNaN(saldo)) return Math.max(0, saldo);
+        const total = Utils.parsePrice(cobranza.total) || 0;
+        const pagado = Utils.parsePrice(cobranza.pagado) || 0;
+        return Math.max(0, total - pagado);
+    },
+
+    isCobranzaPendiente(cobranza) {
+        if (String(cobranza.estado || '').toLowerCase() === 'pagado') return false;
+        return Utils.getCobranzaSaldo(cobranza) > 0.01;
+    },
+
+    /**
+     * Abre HTML para imprimir o guardar como PDF.
+     * Si el navegador bloquea ventanas emergentes, usa un iframe en la misma pestaña.
+     */
+    openPrintHtml(html) {
+        let ventana = null;
+        try {
+            ventana = window.open('', '_blank', 'noopener,noreferrer');
+        } catch (err) {
+            ventana = null;
+        }
+
+        if (ventana && ventana.document) {
+            ventana.document.open();
+            ventana.document.write(html);
+            ventana.document.close();
+            ventana.focus();
+            return { mode: 'window' };
+        }
+
+        try {
+            const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const ventanaBlob = window.open(url, '_blank', 'noopener,noreferrer');
+            if (ventanaBlob) {
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+                return { mode: 'blob' };
+            }
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            // Continuar con iframe
+        }
+
+        let iframe = document.getElementById('reporte-print-iframe');
+        if (!iframe) {
+            iframe = document.createElement('iframe');
+            iframe.id = 'reporte-print-iframe';
+            iframe.setAttribute('title', 'Vista de impresión');
+            iframe.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;border:0;visibility:hidden';
+            document.body.appendChild(iframe);
+        }
+
+        const win = iframe.contentWindow;
+        if (!win || !win.document) {
+            throw new Error('No se pudo abrir la vista de impresión. Permite ventanas emergentes para este sitio.');
+        }
+
+        win.document.open();
+        win.document.write(html);
+        win.document.close();
+
+        const lanzarImpresion = () => {
+            try {
+                win.focus();
+                win.print();
+            } catch (err) {
+                console.error('Error al imprimir:', err);
+            }
+        };
+
+        setTimeout(lanzarImpresion, 400);
+        return { mode: 'iframe' };
+    },
+    
+    showModal: (title, content, onSave = null, saveLabel = 'Guardar') => {
+        console.log('🔵 Utils.showModal llamado');
+        const modalTitle = document.getElementById('modal-title');
+        const modalBody = document.getElementById('modal-body');
+        const modalOverlay = document.getElementById('modal-overlay');
+        
+        if (!modalTitle || !modalBody || !modalOverlay) {
+            console.error('❌ Elementos del modal no encontrados');
+            alert('Error: No se pudo abrir el modal. Verifica que los elementos existan en el HTML.');
+            return;
+        }
+        
+        modalTitle.textContent = title;
+        modalBody.innerHTML = content;
+        modalOverlay.querySelector('.modal')?.classList.remove('modal-ancho');
+        Utils.enablePriceInputs(modalBody);
+        modalOverlay.classList.add('active');
+        console.log('🟢 Modal mostrado');
+        
+        const saveBtn = document.getElementById('modal-save');
+        const cancelBtn = document.getElementById('modal-cancel');
+        const closeBtn = document.getElementById('modal-close');
+        
+        // SIEMPRE restaurar el estado inicial del botón al abrir el modal
+        saveBtn.disabled = false;
+        saveBtn.textContent = saveLabel;
+        cancelBtn.textContent = 'Cancelar';
+        
+        // Mostrar u ocultar botón Guardar según si hay callback onSave
+        if (onSave) {
+            saveBtn.style.display = 'inline-block';
+        } else {
+            saveBtn.style.display = 'none';
+        }
+        
+        const closeModal = () => {
+            const overlay = document.getElementById('modal-overlay');
+            const btn = document.getElementById('modal-save');
+            
+            // Restaurar estado del botón al cerrar
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Guardar';
+                btn.style.display = 'inline-block';
+            }
+            const cancel = document.getElementById('modal-cancel');
+            if (cancel) cancel.textContent = 'Cancelar';
+            
+            if (overlay) {
+                overlay.classList.remove('active');
+            }
+        };
+        
+        // Remover listeners anteriores creando nuevos elementos
+        const newSaveBtn = saveBtn.cloneNode(true);
+        const newCancelBtn = cancelBtn.cloneNode(true);
+        const newCloseBtn = closeBtn.cloneNode(true);
+        
+        saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
+        cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+        closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
+        
+        newSaveBtn.onclick = () => {
+            if (!onSave) {
+                closeModal();
+                return;
+            }
+
+            newSaveBtn.disabled = true;
+            newSaveBtn.textContent = 'Guardando...';
+
+            let settled = false;
+            let stayOpen = false;
+            const finish = (value, failed) => {
+                settled = true;
+                stayOpen = failed || value === true;
+            };
+
+            let result;
+            try {
+                result = onSave();
+            } catch (error) {
+                console.error('Error en onSave:', error);
+                newSaveBtn.disabled = false;
+                newSaveBtn.textContent = saveLabel;
+                return;
+            }
+
+            if (!result || typeof result.then !== 'function') {
+                if (result === true) {
+                    newSaveBtn.disabled = false;
+                    newSaveBtn.textContent = saveLabel;
+                    return;
+                }
+                closeModal();
+                return;
+            }
+
+            result.then(
+                value => finish(value, false),
+                () => finish(undefined, true)
+            );
+
+            // Si la validación termina en este turno, el modal sigue abierto.
+            // Si el guardado sigue en el servidor, se cierra y la pantalla no espera.
+            setTimeout(() => {
+                if (!settled) {
+                    closeModal();
+                    result.catch(() => {});
+                    return;
+                }
+                if (stayOpen) {
+                    const btn = document.getElementById('modal-save');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = saveLabel;
+                    }
+                    return;
+                }
+                closeModal();
+            }, 0);
+        };
+        
+        newCancelBtn.onclick = closeModal;
+        newCloseBtn.onclick = closeModal;
+    },
+    
+    showError: (message) => {
+        Utils.showCustomAlert('Error', message, 'error');
+    },
+    
+    showSuccess: (message) => {
+        Utils.avisar(message);
+        return Promise.resolve();
+    },
+
+    avisar: (message) => {
+        let aviso = document.getElementById('aviso-rapido');
+        if (!aviso) {
+            aviso = document.createElement('div');
+            aviso.id = 'aviso-rapido';
+            aviso.className = 'aviso-rapido';
+            aviso.setAttribute('role', 'status');
+            document.body.appendChild(aviso);
+        }
+        aviso.textContent = message;
+        aviso.hidden = false;
+        clearTimeout(Utils._avisoTimer);
+        Utils._avisoTimer = setTimeout(() => {
+            aviso.hidden = true;
+        }, 2200);
+    },
+
+    enSegundoPlano: (tarea, alFallar) => {
+        Promise.resolve()
+            .then(tarea)
+            .catch(error => {
+                console.error(error);
+                if (alFallar) alFallar(error);
+                else Utils.showError(error && error.message ? error.message : 'No se pudo guardar');
+            });
+    },
+    
+    showWarning: (message) => {
+        Utils.showCustomAlert('Advertencia', message, 'warning');
+    },
+    
+    showInfo: (message) => {
+        Utils.showCustomAlert('Información', message, 'info');
+    },
+    
+    showCustomAlert: (title, message, type = 'info') => {
+        return new Promise((resolve) => {
+        try {
+            console.log(`🔵 showCustomAlert llamado: ${title} - ${message} - ${type}`);
+            
+            const overlay = document.getElementById('custom-alert-overlay');
+            const alert = overlay ? overlay.querySelector('.custom-alert') : null;
+            const iconEl = document.getElementById('custom-alert-icon');
+            const titleEl = document.getElementById('custom-alert-title');
+            const messageEl = document.getElementById('custom-alert-message');
+            const btnEl = document.getElementById('custom-alert-btn');
+            
+            // Validar que todos los elementos existan
+            if (!overlay || !alert || !iconEl || !titleEl || !messageEl || !btnEl) {
+                console.error('❌ Elementos del modal de alerta no encontrados:', {
+                    overlay: !!overlay,
+                    alert: !!alert,
+                    iconEl: !!iconEl,
+                    titleEl: !!titleEl,
+                    messageEl: !!messageEl,
+                    btnEl: !!btnEl
+                });
+                // Fallback a alert nativo
+                window.alert(`${title}: ${message}`);
+                resolve();
+                return;
+            }
+            
+            // Remover clases de tipo previas
+            iconEl.classList.remove('success', 'error', 'warning', 'info');
+            iconEl.classList.add(type);
+            
+            // Iconos según tipo
+            const icons = {
+                success: '✅',
+                error: '❌',
+                warning: '⚠️',
+                info: 'ℹ️'
+            };
+            
+            iconEl.innerHTML = `<span>${icons[type] || icons.info}</span>`;
+            titleEl.textContent = title;
+            messageEl.textContent = message;
+            
+            overlay.classList.add('active');
+            console.log('✅ Modal de alerta mostrado');
+            
+            // Crear nuevo botón para evitar múltiples listeners
+            const newBtn = btnEl.cloneNode(true);
+            btnEl.parentNode.replaceChild(newBtn, btnEl);
+            
+            const closeAlert = () => {
+                overlay.classList.remove('active');
+                document.removeEventListener('keydown', escapeHandler);
+                resolve();
+            };
+
+            newBtn.onclick = closeAlert;
+            
+            // Cerrar con Escape
+            const escapeHandler = (e) => {
+                if (e.key === 'Escape') closeAlert();
+            };
+            document.addEventListener('keydown', escapeHandler);
+        } catch (error) {
+            console.error('❌ Error en showCustomAlert:', error);
+            console.error('❌ Stack trace:', error.stack);
+            // Fallback a alert nativo
+            window.alert(`${title}: ${message}`);
+            resolve();
+        }
+        });
+    },
+    
+    showConfirm: (message, onConfirm, onCancel = null, labels = null) => {
+        return new Promise((resolve) => {
+            try {
+                const overlay = document.getElementById('custom-confirm-overlay');
+                const messageEl = document.getElementById('custom-confirm-message');
+                const acceptBtn = document.getElementById('custom-confirm-accept');
+                const cancelBtn = document.getElementById('custom-confirm-cancel');
+                
+                // Validar que todos los elementos existan
+                if (!overlay || !messageEl || !acceptBtn || !cancelBtn) {
+                    console.error('❌ Elementos del modal de confirmación no encontrados');
+                    // Fallback a confirm nativo del navegador
+                    const result = window.confirm(message);
+                    resolve(result);
+                    if (result && onConfirm) {
+                        onConfirm();
+                    } else if (!result && onCancel) {
+                        onCancel();
+                    }
+                    return;
+                }
+                
+                messageEl.textContent = message;
+                overlay.classList.add('active');
+
+                const titleEl = document.getElementById('custom-confirm-title');
+                if (titleEl) titleEl.textContent = labels?.title || 'Confirmar acción';
+                
+                // Crear nuevos botones para evitar múltiples listeners
+                const newAcceptBtn = acceptBtn.cloneNode(true);
+                const newCancelBtn = cancelBtn.cloneNode(true);
+                newAcceptBtn.textContent = labels?.accept || 'Aceptar';
+                newCancelBtn.textContent = labels?.cancel || 'Cancelar';
+                acceptBtn.parentNode.replaceChild(newAcceptBtn, acceptBtn);
+                cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+                
+                const closeConfirm = (result) => {
+                    overlay.classList.remove('active');
+                    resolve(result);
+                    if (result && onConfirm) {
+                        onConfirm();
+                    } else if (!result && onCancel) {
+                        onCancel();
+                    }
+                };
+                
+                newAcceptBtn.onclick = () => closeConfirm(true);
+                newCancelBtn.onclick = () => closeConfirm(false);
+                
+                // Cerrar con Escape
+                const escapeHandler = (e) => {
+                    if (e.key === 'Escape') {
+                        closeConfirm(false);
+                        document.removeEventListener('keydown', escapeHandler);
+                    }
+                };
+                document.addEventListener('keydown', escapeHandler);
+            } catch (error) {
+                console.error('❌ Error en showConfirm:', error);
+                // Fallback a confirm nativo
+                const result = window.confirm(message);
+                resolve(result);
+                if (result && onConfirm) {
+                    onConfirm();
+                } else if (!result && onCancel) {
+                    onCancel();
+                }
+            }
+        });
+    },
+    
+    LOADER_SPINNER_HTML: '<div class="app-loader-spinner" aria-hidden="true"></div>',
+
+    _getLoaderParent(container) {
+        if (!container) return null;
+        const el = typeof container === 'string' ? document.querySelector(container) : container;
+        if (!el) return null;
+        const parent = el.closest('.table-container') ||
+            el.closest('.chart-container') ||
+            el.closest('.cierre-resumen-wrap') ||
+            el.parentElement;
+        if (!parent) return null;
+        if (getComputedStyle(parent).position === 'static') {
+            parent.style.position = 'relative';
+        }
+        return parent;
+    },
+
+    _showContainerLoader(container) {
+        const parent = this._getLoaderParent(container);
+        if (!parent) return;
+        let overlay = parent.querySelector('.app-loader-overlay, .local-loader-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = 'app-loader-overlay';
+            overlay.setAttribute('aria-busy', 'true');
+            overlay.innerHTML = this.LOADER_SPINNER_HTML;
+            parent.appendChild(overlay);
+        }
+        overlay.style.display = 'flex';
+    },
+
+    _hideContainerLoader(container) {
+        const parent = this._getLoaderParent(container);
+        if (!parent) return;
+        const overlay = parent.querySelector('.app-loader-overlay, .local-loader-overlay');
+        if (overlay) overlay.style.display = 'none';
+    },
+
+    showLoader(container) {
+        if (!container) {
+            const loader = document.getElementById('global-loader');
+            if (loader) loader.style.display = 'flex';
+            return;
+        }
+        this._showContainerLoader(container);
+    },
+
+    hideLoader(container) {
+        if (!container) {
+            const loader = document.getElementById('global-loader');
+            if (loader) loader.style.display = 'none';
+            return;
+        }
+        this._hideContainerLoader(container);
+    },
+
+    showTableLoader(container) {
+        this.showLoader(container);
+    },
+
+    hideTableLoader(container) {
+        this.hideLoader(container);
+    },
+
+    // Todo texto que viene de la hoja (nombres, teléfonos, notas) se escapa antes de ir a innerHTML.
+    esc(valor) {
+        return String(valor === undefined || valor === null ? '' : valor).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    },
+
+    // Solo lo que el usuario cambió en el formulario. Si se mandara todo, una persona con la
+    // pantalla desactualizada pisaría con vacío lo que otra acaba de cargar (ej.: un teléfono).
+    cambiosDe(anterior, nuevo) {
+        const normal = v => (v === true || v === 'true' || v === 1 ? true
+            : (v === false || v === 'false' || v === 0 ? false : String(v === undefined || v === null ? '' : v).trim()));
+        const cambios = {};
+        Object.keys(nuevo).forEach(campo => {
+            if (normal(nuevo[campo]) !== normal(anterior ? anterior[campo] : undefined)) cambios[campo] = nuevo[campo];
+        });
+        return cambios;
+    },
+
+    sinUndefined(obj) {
+        const limpio = {};
+        Object.keys(obj).forEach(k => { if (obj[k] !== undefined) limpio[k] = obj[k]; });
+        return limpio;
+    },
+
+    upsertInList(list, item, idField = 'id') {
+        const idx = list.findIndex(x => String(x[idField]) === String(item[idField]));
+        if (idx >= 0) {
+            list[idx] = { ...list[idx], ...item };
+        } else {
+            list.push(item);
+        }
+        return list;
+    },
+
+    removeFromList(list, id, idField = 'id') {
+        const idx = list.findIndex(x => String(x[idField]) === String(id));
+        if (idx >= 0) list.splice(idx, 1);
+        return list;
+    },
+
+    setButtonLoading(button, isLoading = true) {
+        if (!button) return;
+        if (isLoading) {
+            if (!button.dataset.originalHtml) {
+                button.dataset.originalHtml = button.innerHTML;
+            }
+            button.disabled = true;
+            button.classList.add('loading');
+            button.innerHTML = '<span class="app-loader-spinner app-loader-spinner--btn" aria-hidden="true"></span>';
+        } else {
+            button.disabled = false;
+            button.classList.remove('loading');
+            if (button.dataset.originalHtml) {
+                button.innerHTML = button.dataset.originalHtml;
+                delete button.dataset.originalHtml;
+            }
+        }
+    },
+
+    withButtonLoader: async (button, asyncFn) => {
+        try {
+            Utils.setButtonLoading(button, true);
+            const result = await asyncFn();
+            return result;
+        } catch (error) {
+            console.error('Error en withButtonLoader:', error);
+            throw error;
+        } finally {
+            Utils.setButtonLoading(button, false);
+        }
+    }
+};
+
+// Varias personas usan la app a la vez (a veces con el mismo usuario).
+// El servidor cuenta cada escritura (`ver`). Si ese número salta sin que lo haya
+// causado esta pestaña, otra persona cambió datos: se descarta la memoria local
+// y se vuelve a leer lo que se está mirando.
+const Sync = {
+    ver: null,
+    escribiendo: 0,
+    INTERVALO: 40000,
+    REINTENTO: 4000,
+    _timer: null,
+    _chequeando: false,
+    _pendiente: false,
+    _aplicando: false,
+
+    // Versión de los datos con la que quedó la copia guardada en el navegador (sobrevive a recargar).
+    CLAVE_VERSION: 'sg_ver_datos',
+
+    _recordarVersion() {
+        try { localStorage.setItem(this.CLAVE_VERSION, String(this.ver)); } catch (error) { /* sin almacenamiento */ }
+    },
+
+    observar(ver, esEscritura, cambios) {
+        const nueva = Number(ver);
+        if (!Number.isFinite(nueva)) return;
+        if (this.ver === null) {
+            // Al abrir la app se usa la copia guardada (clientes, proveedores… hasta 45 min). Si los
+            // datos cambiaron mientras estaba cerrada, esa copia está vieja: se vuelve a leer todo.
+            let guardada = NaN;
+            try { guardada = Number(localStorage.getItem(this.CLAVE_VERSION)); } catch (error) { /* sin almacenamiento */ }
+            this.ver = nueva;
+            if (guardada === nueva) return;
+            this._pedirRefresco();
+            return;
+        }
+        if (nueva === this.ver) return;
+        // Una escritura propia suma exactamente 1. Cualquier otro salto es de otra persona.
+        const soloMia = esEscritura === true && nueva === this.ver + 1;
+        if (nueva > this.ver) this.ver = nueva;
+        if (soloMia) this._recordarVersion();
+        else this._pedirRefresco(cambios);
+    },
+
+    iniciar() {
+        if (this._timer) return;
+        this._timer = setInterval(() => this.chequear(), this.INTERVALO);
+        // Al abrir se pregunta ya: si la copia guardada en el navegador quedó vieja, se nota enseguida.
+        this.chequear();
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) this.chequear();
+        });
+        window.addEventListener('focus', () => this.chequear());
+    },
+
+    async chequear() {
+        if (document.hidden || this._chequeando) return;
+        this._chequeando = true;
+        try {
+            // La respuesta pasa por observar(); no hace falta mirar el resultado.
+            await API._executeRequest('app/version', 'GET', this.ver === null ? null : { desde: this.ver }, 1);
+        } catch (error) {
+            // Sin conexión: se reintenta en el próximo ciclo.
+        } finally {
+            this._chequeando = false;
+        }
+    },
+
+    _ocupado() {
+        if (this.escribiendo > 0) return true;
+        if (document.querySelector('#modal-overlay.active, #custom-alert-overlay.active, #custom-confirm-overlay.active')) return true;
+        const el = document.activeElement;
+        return !!(el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) && el.closest('.main-content, main, .page'));
+    },
+
+    // Qué cambió desde la última vez: si todo lo que hicieron otros fue un día de pedidos, se recarga
+    // solo ese día; si no se sabe qué fue (o fue otra cosa), se recarga todo como antes.
+    _alcances: new Set(),
+    _refrescoTotal: false,
+
+    _pedirRefresco(cambios) {
+        if (!Array.isArray(cambios) || !cambios.length) this._refrescoTotal = true;
+        else cambios.forEach(c => this._alcances.add(String(c)));
+        this._pendiente = true;
+        this._intentarRefresco();
+    },
+
+    async _intentarRefresco() {
+        if (!this._pendiente || this._aplicando) return;
+        if (this._ocupado()) {
+            // Alguien está tipeando o hay un diálogo abierto: no se le pisa lo que hace.
+            clearTimeout(this._espera);
+            this._espera = setTimeout(() => this._intentarRefresco(), this.REINTENTO);
+            return;
+        }
+        this._pendiente = false;
+        this._aplicando = true;
+        const total = this._refrescoTotal;
+        const alcances = [...this._alcances];
+        this._refrescoTotal = false;
+        this._alcances.clear();
+        try {
+            if (!total && alcances.length && alcances.every(a => a.startsWith('dia:'))) await this.refrescarDias(alcances);
+            else await this.refrescar();
+            Utils.avisar('Se actualizaron datos cargados por otra persona');
+        } catch (error) {
+            console.warn('No se pudo actualizar con los cambios de otra persona:', error);
+            if (total) this._refrescoTotal = true;
+            alcances.forEach(a => this._alcances.add(a));
+            this._pendiente = true;
+            clearTimeout(this._espera);
+            this._espera = setTimeout(() => this._intentarRefresco(), this.REINTENTO * 4);
+        } finally {
+            this._aplicando = false;
+        }
+    },
+
+    // Otra persona solo tocó pedidos de uno o más días: se descarta y se vuelve a leer únicamente
+    // ese día (si es el que se está mirando), sin recargar catálogo, saldos ni cobranzas.
+    async refrescarDias(alcances) {
+        const pantalla = AppState.currentDate;
+        const fechas = new Set(alcances.map(a => a.slice(4) === '*' ? pantalla : a.slice(4)));
+        fechas.forEach(f => {
+            ['pedidos', 'recepcion', 'precios', 'flujo'].forEach(k => CacheManager.invalidate(`${k}:${f}`));
+            DataLoader.invalidateFlujo(f);
+        });
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        if (!fechas.has(pantalla)) { this._recordarVersion(); return; }
+        AppState.fechaCargada = null;
+        const versionLeida = this.ver;
+        await DataLoader.getFlujo(pantalla);
+        if (this.ver === versionLeida) this._recordarVersion();
+        try { await DiaOperativo.refresh(); } catch (error) { /* se recalcula al navegar */ }
+        await Navigation.loadPageData(AppState.currentPage);
+    },
+
+    async refrescar() {
+        CacheManager.clear();
+        AppState.fechaCargada = null;
+        if (typeof CobranzasHoy !== 'undefined') {
+            CobranzasHoy._lastTotales = [];
+            CobranzasHoy._fechaTotales = null;
+        }
+        DataLoader.invalidateFlujo(AppState.currentDate);
+        // Una sola lectura trae catálogo, día y cobranzas.
+        const versionLeida = this.ver;
+        await API.getBootstrap(AppState.currentDate, true);
+        CacheManager.hydrateAppStateFromCache();
+        if (this.ver === versionLeida) this._recordarVersion();
+        try { await DiaOperativo.refresh(); } catch (error) { /* se recalcula al navegar */ }
+        await Navigation.loadPageData(AppState.currentPage);
+    }
+};
+
+// API Client
+const API = {
+    _pending: {},
+    _bootstrapPromise: null,
+
+    _buildDedupKey(endpoint, method, data) {
+        const payload = { ...(data || {}) };
+        delete payload.__timeout;
+        return `${method}:${endpoint}:${JSON.stringify(payload)}`;
+    },
+
+    async request(endpoint, method = 'GET', data = null, retryCount = 0) {
+        const dedupKey = this._buildDedupKey(endpoint, method, data);
+        if (this._pending[dedupKey]) {
+            return this._pending[dedupKey];
+        }
+
+        const escribe = method !== 'GET';
+        if (escribe) Sync.escribiendo++;
+        const promise = this._conReintentoOcupado(() => this._executeRequest(endpoint, method, data, retryCount), escribe)
+            .finally(() => {
+                delete this._pending[dedupKey];
+                if (escribe) Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
+            });
+
+        this._pending[dedupKey] = promise;
+        return promise;
+    },
+
+    // "Hay mucha actividad": el servidor no pudo tomar su turno y no ejecutó nada, así que repetir es seguro.
+    // Se espera cada vez más antes de volver a intentar, en vez de dar el error y perder el cambio.
+    async _conReintentoOcupado(enviar, escribe) {
+        const esperas = [2000, 4000, 8000, 12000];
+        for (let intento = 0; ; intento++) {
+            try {
+                return await enviar();
+            } catch (error) {
+                if (!escribe || !error || !error.busy || intento >= esperas.length) throw error;
+                await new Promise(r => setTimeout(r, esperas[intento]));
+            }
+        }
+    },
+
+    _executeRequest(endpoint, method, data, retryCount) {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                fn(value);
+            };
+
+            const callbackName = 'apiCallback_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            const timeoutMs = data?.__timeout || 30000;
+
+            let url = `${API_CONFIG.baseUrl}?endpoint=${encodeURIComponent(endpoint)}&method=${encodeURIComponent(method)}&apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&token=${encodeURIComponent(Auth.getToken())}&callback=${callbackName}${method !== 'GET' ? `&rid=${callbackName}` : ''}`;
+
+            if (data) {
+                Object.keys(data).forEach(key => {
+                    if (key === '__timeout') return;
+                    if (data[key] !== null && data[key] !== undefined) {
+                        const value = typeof data[key] === 'object' ? JSON.stringify(data[key]) : data[key];
+                        url += `&${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+                    }
+                });
+            }
+
+            let scriptTag = null;
+            let timeoutId = null;
+            let settledRequest = false;
+
+            const cleanup = (keepCallback = false) => {
+                if (timeoutId) clearTimeout(timeoutId);
+                timeoutId = null;
+                if (keepCallback) return;
+                delete window[callbackName];
+                if (scriptTag) {
+                    scriptTag.onerror = null;
+                    if (scriptTag.parentNode) scriptTag.parentNode.removeChild(scriptTag);
+                }
+            };
+
+            const guardarTarde = (response) => {
+                const ok = response && (response.success === true || response.success === 'true');
+                if (response && response.ver !== undefined) Sync.observar(response.ver, method !== 'GET');
+                if (!ok) return;
+                const payload = response.data || response;
+
+                if (endpoint === 'flujo/dia' && data && data.fecha) {
+                    const fechaResp = data.fecha;
+                    CacheManager.set(`flujo:${fechaResp}`, payload);
+                    if (payload.pedidos) CacheManager.set(`pedidos:${fechaResp}`, payload.pedidos);
+                    if (payload.recepcion) CacheManager.set(`recepcion:${fechaResp}`, payload.recepcion);
+                    if (payload.precios) CacheManager.set(`precios:${fechaResp}`, payload.precios);
+                    if (AppState.currentPage === 'pedidos' && AppState.currentDate === fechaResp) {
+                        AppState.pedidos = payload.pedidos || [];
+                        Pedidos.aplicarEnviadosLocales();
+                        Pedidos.render();
+                        Utils.hideLoader(document.getElementById('pedidos-tbody'));
+                    }
+                    return;
+                }
+
+                // El redirect de Google a veces hace fallar el cliente aunque el script ya escribió.
+                // Solo se aplican los campos que se mandaron: si no, se pisarían con vacío.
+                const activoDe = (v) => {
+                    if (v === undefined) return undefined;
+                    if (v === false || v === 'false' || v === 0 || v === '0') return false;
+                    if (v === true || v === 'true' || v === 1 || v === '1') return true;
+                    return v;
+                };
+                if (endpoint === 'clientes/update' && data && data.id) {
+                    Utils.upsertInList(AppState.clientes, Utils.sinUndefined({
+                        id: data.id,
+                        nombre: data.nombre,
+                        telefono: data.telefono === undefined ? undefined : (data.telefono || ''),
+                        activo: activoDe(data.activo)
+                    }));
+                    CacheManager.set('clientes', AppState.clientes);
+                    if (AppState.currentPage === 'clientes') Clientes.render();
+                    return;
+                }
+                if (endpoint === 'proveedores/update' && data && data.id) {
+                    Utils.upsertInList(AppState.proveedores, Utils.sinUndefined({
+                        id: data.id,
+                        nombre: data.nombre,
+                        rubro: data.rubro,
+                        telefono: data.telefono === undefined ? undefined : (data.telefono || ''),
+                        activo: activoDe(data.activo)
+                    }));
+                    CacheManager.set('proveedores', AppState.proveedores);
+                    if (AppState.currentPage === 'proveedores') ProveedoresGestion.render();
+                }
+            };
+
+            const fail = (error, allowRetry) => {
+                if (settledRequest) return;
+                settledRequest = true;
+                const msg = String(error && error.message || '');
+                const esTimeout = msg.includes('tardó más de');
+                // Si la respuesta llega igual más tarde, se aprovecha (en un timeout o tras un onerror).
+                const esperarTarde = esTimeout || msg.includes('No se pudo conectar con Google');
+                cleanup(esperarTarde);
+                if (esperarTarde) {
+                    window[callbackName] = (response) => {
+                        delete window[callbackName];
+                        if (scriptTag && scriptTag.parentNode) scriptTag.parentNode.removeChild(scriptTag);
+                        guardarTarde(response);
+                    };
+                }
+                if (allowRetry && !esTimeout && method === 'GET' && retryCount < 1) {
+                    setTimeout(() => {
+                        this._executeRequest(endpoint, method, data, retryCount + 1)
+                            .then(resolve)
+                            .catch(reject);
+                    }, 800);
+                    return;
+                }
+                finish(reject, error);
+            };
+
+            window[callbackName] = (response) => {
+                if (settledRequest) return;
+                settledRequest = true;
+                cleanup();
+                if (!response) {
+                    finish(reject, new Error('No se recibió respuesta del servidor'));
+                    return;
+                }
+                if (response.sesion === false) {
+                    // La sesión venció o no es válida: se vuelve a la pantalla de ingreso.
+                    Auth.logout();
+                    finish(reject, new Error(response.error || 'Tu sesión venció. Volvé a iniciar sesión.'));
+                    return;
+                }
+                if (response.tm) {
+                    // Cuánto tardó cada paso en el servidor; sirve para ver dónde se va el tiempo.
+                    (API.tiempos = API.tiempos || []).push({ endpoint, ...response.tm });
+                    if (API.tiempos.length > 60) API.tiempos.shift();
+                }
+                if (response.ver !== undefined) Sync.observar(response.ver, method !== 'GET', response.data && response.data.cambios);
+                if (response.success === true || response.success === 'true') {
+                    finish(resolve, response.data || response);
+                } else {
+                    const error = new Error(response?.error || response?.message || 'Error en la petición');
+                    // El servidor no llegó a ejecutar nada (había otra escritura en curso): se puede reintentar.
+                    if (response && response.busy) error.busy = true;
+                    error.servidor = true;
+                    finish(reject, error);
+                }
+            };
+
+            scriptTag = document.createElement('script');
+            scriptTag.src = url;
+            scriptTag.async = true;
+            // Si Google contesta con una página de error (no con la respuesta), el navegador avisa
+            // con onerror y ese script ya no se va a ejecutar. Antes se seguía esperando hasta el
+            // límite (120 s en el cierre) y el error real nunca se veía. Se da un margen corto por si
+            // el callback igual llega y después se corta como "no se pudo conectar".
+            scriptTag.onerror = () => {
+                console.warn('JSONP onerror:', endpoint);
+                setTimeout(() => {
+                    fail(new Error('No se pudo conectar con Google. Revisá la conexión y volvé a intentar.'), true);
+                }, 8000);
+            };
+
+            timeoutId = setTimeout(() => {
+                fail(new Error(
+                    `La operación tardó más de ${timeoutMs / 1000} segundos.`
+                ), false);
+            }, timeoutMs);
+
+            document.head.appendChild(scriptTag);
+        });
+    },
+    
+    _esCorteDeConexion(error) {
+        const msg = String(error && error.message || '');
+        return msg.includes('No se pudo conectar')
+            || msg.includes('tardó más de')
+            || msg.includes('No se recibió respuesta');
+    },
+
+    // Tras un corte de red no se sabe si el servidor llegó a guardar: se lee de nuevo y se compara.
+    async verificarGuardado(tipo, id, esperado) {
+        try {
+            const lista = await this._listaFresca(tipo, tipo);
+            const hallado = lista.find(item => String(item.id) === String(id));
+            if (!hallado) return false;
+            const esActivo = v => !(v === false || v === 'false' || v === 0 || v === '0');
+            return Object.keys(esperado).every(campo => {
+                if (campo === 'id') return true;
+                if (campo === 'activo') return esActivo(hallado.activo) === esActivo(esperado.activo);
+                return String(hallado[campo] === undefined || hallado[campo] === null ? '' : hallado[campo]).trim()
+                    === String(esperado[campo] === undefined || esperado[campo] === null ? '' : esperado[campo]).trim();
+            });
+        } catch (error) {
+            return false;
+        }
+    },
+
+    async _listaFresca(cacheKey, endpoint, params) {
+        CacheManager.invalidate(cacheKey);
+        const data = await this.request(endpoint, 'GET', params || null);
+        const lista = Array.isArray(data) ? data : [];
+        CacheManager.set(cacheKey, lista);
+        return lista;
+    },
+
+    async _encontrarTrasCorte(buscar) {
+        for (let i = 0; i < 3; i++) {
+            try {
+                const hallado = await buscar();
+                if (hallado) return hallado;
+            } catch (error) {
+                if (!this._esCorteDeConexion(error) && i === 2) throw error;
+            }
+            if (i < 2) await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        return null;
+    },
+
+    _porNombre(lista, nombre) {
+        const buscado = String(nombre || '').trim().toLocaleLowerCase('es');
+        const coinciden = (lista || []).filter(item =>
+            String(item.nombre || '').trim().toLocaleLowerCase('es') === buscado
+        );
+        return coinciden.length ? coinciden[coinciden.length - 1] : null;
+    },
+
+    // Clientes
+    async getClientes() {
+        const cacheKey = 'clientes';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        if (this._bootstrapPromise) {
+            try {
+                await this._bootstrapPromise;
+                const fromBootstrap = CacheManager.get(cacheKey);
+                if (fromBootstrap) return fromBootstrap;
+            } catch (e) { /* bootstrap falló */ }
+        }
+
+        const data = await this.request('clientes', 'GET');
+        CacheManager.set(cacheKey, data);
+        return data;
+    },
+    
+    async createCliente(data) {
+        try {
+            const result = await this.request('clientes', 'POST', data);
+            CacheManager.invalidate('clientes');
+            return result;
+        } catch (error) {
+            if (!this._esCorteDeConexion(error)) throw error;
+            const hallado = await this._encontrarTrasCorte(async () => {
+                const lista = await this._listaFresca('clientes', 'clientes');
+                AppState.clientes = lista;
+                return this._porNombre(lista, data.nombre);
+            });
+            if (!hallado) throw error;
+            return hallado;
+        }
+    },
+    
+    async updateCliente(id, data) {
+        data.id = id;
+        data.__timeout = 60000;
+        const result = await this.request('clientes/update', 'POST', data);
+        CacheManager.invalidate('clientes');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+    
+    async deleteCliente(id) {
+        const result = await this.request('clientes/delete', 'POST', { id });
+        CacheManager.invalidate('clientes');
+        return result;
+    },
+    
+    // Proveedores
+    async getProveedores() {
+        const cacheKey = 'proveedores';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        if (this._bootstrapPromise) {
+            try {
+                await this._bootstrapPromise;
+                const fromBootstrap = CacheManager.get(cacheKey);
+                if (fromBootstrap) return fromBootstrap;
+            } catch (e) { /* bootstrap falló */ }
+        }
+
+        const data = await this.request('proveedores', 'GET');
+        CacheManager.set(cacheKey, data);
+        return data;
+    },
+    
+    async createProveedor(data) {
+        try {
+            const result = await this.request('proveedores', 'POST', data);
+            CacheManager.invalidate('proveedores');
+            return result;
+        } catch (error) {
+            if (!this._esCorteDeConexion(error)) throw error;
+            const hallado = await this._encontrarTrasCorte(async () => {
+                const lista = await this._listaFresca('proveedores', 'proveedores');
+                AppState.proveedores = lista;
+                return this._porNombre(lista, data.nombre);
+            });
+            if (!hallado) throw error;
+            return hallado;
+        }
+    },
+    
+    async updateProveedor(id, data) {
+        data.id = id;
+        data.__timeout = 60000;
+        const result = await this.request('proveedores/update', 'POST', data);
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+    
+    async deleteProveedor(id) {
+        const result = await this.request('proveedores/delete', 'POST', { id });
+        CacheManager.invalidate('proveedores');
+        return result;
+    },
+    
+    // Productos
+    async getProductos() {
+        const cacheKey = 'productos';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        if (this._bootstrapPromise) {
+            try {
+                await this._bootstrapPromise;
+                const fromBootstrap = CacheManager.get(cacheKey);
+                if (fromBootstrap) return fromBootstrap;
+            } catch (e) { /* bootstrap falló */ }
+        }
+
+        const data = await this.request('productos', 'GET');
+        CacheManager.set(cacheKey, data);
+        return data;
+    },
+    
+    async createProducto(data) {
+        try {
+            const result = await this.request('productos', 'POST', data);
+            CacheManager.invalidate('productos');
+            return result;
+        } catch (error) {
+            if (!this._esCorteDeConexion(error)) throw error;
+            const hallado = await this._encontrarTrasCorte(async () => {
+                const lista = await this._listaFresca('productos', 'productos');
+                AppState.productos = lista;
+                return this._porNombre(lista, data.nombre);
+            });
+            if (!hallado) throw error;
+            return hallado;
+        }
+    },
+    
+    async updateProducto(id, data) {
+        data.id = id;
+        const result = await this.request('productos/update', 'POST', data);
+        CacheManager.invalidate('productos');
+        return result;
+    },
+    
+    async deleteProducto(id) {
+        const result = await this.request('productos/delete', 'POST', { id });
+        CacheManager.invalidate('productos');
+        return result;
+    },
+    
+    // Pedidos
+    async getPedidos(fecha = null) {
+        const cacheKey = fecha ? `pedidos:${fecha}` : 'pedidos';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        if (this._bootstrapPromise && fecha === AppState.currentDate) {
+            try {
+                await this._bootstrapPromise;
+                const fromBootstrap = CacheManager.get(cacheKey);
+                if (fromBootstrap) return fromBootstrap;
+            } catch (e) { /* bootstrap falló */ }
+        }
+
+        const data = fecha ? { fecha } : null;
+        const result = await this.request('pedidos', 'GET', data);
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    async createPedido(data) {
+        const fecha = data.fecha || AppState.currentDate;
+        const previos = [
+            ...(Array.isArray(AppState.pedidos) ? AppState.pedidos : []),
+            ...(CacheManager.get(`pedidos:${fecha}`) || [])
+        ];
+        const idsAntes = new Set(previos.map(pedido => String(pedido.id)));
+        const limpiarCaches = () => {
+            CacheManager.invalidate(`pedidos:${fecha}`);
+            CacheManager.invalidate(`flujo:${fecha}`);
+            CacheManager.invalidatePattern('estadisticas');
+            CacheManager.invalidatePattern('dashboard');
+            CacheManager.invalidatePattern('bootstrap:');
+            DataLoader.invalidateFlujo(fecha);
+            this._invalidateFlujo();
+        };
+
+        try {
+            const result = await this.request('pedidos', 'POST', data);
+            limpiarCaches();
+            this._revisarListaPrecios(fecha);
+            return result;
+        } catch (error) {
+            if (!this._esCorteDeConexion(error)) throw error;
+            const hallado = await this._encontrarTrasCorte(async () => {
+                const lista = await this._listaFresca(`pedidos:${fecha}`, 'pedidos', { fecha });
+                return lista.find(pedido =>
+                    !idsAntes.has(String(pedido.id)) &&
+                    String(pedido.cliente_id) === String(data.cliente_id) &&
+                    String(pedido.producto_id) === String(data.producto_id) &&
+                    Number(pedido.cantidad) === Number(data.cantidad)
+                ) || null;
+            });
+            if (!hallado) throw error;
+            limpiarCaches();
+            return hallado;
+        }
+    },
+    
+    async updatePedido(id, data) {
+        data.id = id;
+        const result = await this.request('pedidos/update', 'POST', data);
+        const fecha = data.fecha || AppState.currentDate;
+        CacheManager.invalidate(`pedidos:${fecha}`);
+        CacheManager.invalidate(`flujo:${fecha}`);
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        DataLoader.invalidateFlujo(fecha);
+        this._invalidateFlujo();
+        this._revisarListaPrecios(fecha);
+        return result;
+    },
+
+    async deletePedido(id) {
+        const result = await this.request('pedidos/delete', 'POST', { id });
+        CacheManager.invalidatePattern('pedidos');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        this._invalidateFlujo();
+        return result;
+    },
+
+    // Un pedido que cambia después de confirmar la recepción necesita su línea de precio.
+    _revisarListaPrecios(fecha) {
+        setTimeout(() => {
+            try { Precios.completarFaltantes(fecha, true); } catch (e) { /* se revisa al abrir Precios al cliente */ }
+        }, 1500);
+    },
+
+    async getCamiones(fecha) {
+        return await this.request('camiones', 'GET', { fecha });
+    },
+
+    async guardarCamiones(fecha, camiones, previo) {
+        const data = { fecha, camiones };
+        if (previo !== undefined) data.previo = previo;
+        return await this.request('camiones', 'POST', data);
+    },
+
+    async getTopProductosVendidos(dias = 7, limite = 5) {
+        const cacheKey = `estadisticas:top-productos:${dias}:${limite}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        const result = await this.request('estadisticas/productos-mas-vendidos', 'GET', { dias, limite });
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+
+    _hydrateFromBootstrap(result, fecha) {
+        if (result.clientes) CacheManager.set('clientes', result.clientes);
+        if (result.productos) CacheManager.set('productos', result.productos);
+        if (result.proveedores) CacheManager.set('proveedores', result.proveedores);
+        if (result.diasPendientes) CacheManager.set('flujo:dias-pendientes', result.diasPendientes);
+
+        const dash = result.dashboard || result;
+        if (dash.pedidos) CacheManager.set(`pedidos:${fecha}`, dash.pedidos);
+        if (dash.recepcion) CacheManager.set(`recepcion:${fecha}`, dash.recepcion);
+        if (dash.precios) CacheManager.set(`precios:${fecha}`, dash.precios);
+        if (dash.pedidos && dash.recepcion && dash.precios) {
+            CacheManager.set(`flujo:${fecha}`, {
+                fecha: fecha,
+                pedidos: dash.pedidos,
+                recepcion: dash.recepcion,
+                precios: dash.precios
+            });
+        }
+        if (dash.cobranzas) CacheManager.set('cobranzas:all:all', dash.cobranzas);
+        if (dash.stock) CacheManager.set('stock', dash.stock);
+        if (dash.topProductos) CacheManager.set('estadisticas:top-productos:7:5', dash.topProductos);
+        if (dash.pedidos || dash.cobranzas) CacheManager.set(`dashboard:${fecha}`, dash);
+    },
+
+    async getBootstrap(fecha = AppState.currentDate, force = false) {
+        const cacheKey = `bootstrap:${fecha}`;
+        if (!force) {
+            const cached = CacheManager.get(cacheKey);
+            if (cached) {
+                this._hydrateFromBootstrap(cached, fecha);
+                return cached;
+            }
+        }
+
+        const result = await this.request('app/bootstrap', 'GET', {
+            fecha,
+            dias: 7,
+            limite: 5,
+            __timeout: 60000
+        });
+        CacheManager.set(cacheKey, result);
+        this._hydrateFromBootstrap(result, fecha);
+        return result;
+    },
+
+    async getDashboardResumen(fecha) {
+        const cacheKey = `dashboard:${fecha || 'today'}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        const result = await this.request('dashboard/resumen', 'GET', { fecha, dias: 7, limite: 5 });
+        CacheManager.set(cacheKey, result);
+
+        if (result.pedidos) CacheManager.set(`pedidos:${fecha}`, result.pedidos);
+        if (result.cobranzas) CacheManager.set('cobranzas:all:all', result.cobranzas);
+        if (result.stock) CacheManager.set('stock', result.stock);
+        if (result.topProductos) CacheManager.set('estadisticas:top-productos:7:5', result.topProductos);
+
+        return result;
+    },
+    
+    async marcarPedidosEnviados(fecha) {
+        const result = await this.request('pedidos/marcar-enviados', 'POST', { fecha });
+        CacheManager.invalidatePattern('pedidos');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        this._invalidateFlujo();
+        return result;
+    },
+    
+    async marcarPedidosEnviadosPorIds(pedidosIds) {
+        const result = await this.request('pedidos/marcar-enviados-por-ids', 'POST', { pedidosIds });
+        CacheManager.invalidatePattern('pedidos');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        DataLoader.invalidateFlujo(AppState.currentDate);
+        this._invalidateFlujo();
+        return result;
+    },
+
+    async getDiasPendientes() {
+        const cacheKey = 'flujo:dias-pendientes';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        const result = await this.request('flujo/dias-pendientes', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+
+    async getFlujoDia(fecha = AppState.currentDate) {
+        const cacheKey = `flujo:${fecha}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        const result = await this.request('flujo/dia', 'GET', { fecha, __timeout: 90000 });
+        CacheManager.set(cacheKey, result);
+        if (result.pedidos) CacheManager.set(`pedidos:${fecha}`, result.pedidos);
+        if (result.recepcion) CacheManager.set(`recepcion:${fecha}`, result.recepcion);
+        if (result.precios) CacheManager.set(`precios:${fecha}`, result.precios);
+        return result;
+    },
+
+    async resetAllDatos(confirmacion = 'BORRAR TODO') {
+        const result = await this.request('admin/reset-datos', 'POST', {
+            confirmacion,
+            __timeout: 120000
+        });
+        CacheManager.clear();
+        this._invalidateFlujo();
+        return result;
+    },
+
+    _invalidateFlujo() {
+        DiaOperativo.invalidate();
+    },
+
+    async getWhatsAppStatus() {
+        const cacheKey = 'whatsapp:status';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        const result = await this.request('whatsapp/status', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+
+    async enviarWhatsApp(telefono, mensaje) {
+        const result = await this.request('whatsapp/enviar', 'POST', { telefono, mensaje });
+        CacheManager.invalidate('whatsapp:status');
+        return result;
+    },
+    
+    // Recepción
+    async getRecepcion(fecha = null) {
+        const cacheKey = fecha ? `recepcion:${fecha}` : 'recepcion';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const data = fecha ? { fecha } : null;
+        const result = await this.request('recepcion', 'GET', data);
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    // Todo viaja dentro de la dirección (JSONP) y Google rechaza las de más de ~12.000 caracteres
+    // (Error 400). Un día con 80+ productos superaba ese límite: la lista de precios no se terminaba
+    // de armar y la comisión no se guardaba. Las listas largas se mandan en tandas.
+    TANDA_ITEMS: 25,
+
+    async _enTandas(endpoint, data) {
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (items.length <= this.TANDA_ITEMS) return this.request(endpoint, 'POST', data);
+        let result = null;
+        for (let i = 0; i < items.length; i += this.TANDA_ITEMS) {
+            result = await this.request(endpoint, 'POST', { ...data, items: items.slice(i, i + this.TANDA_ITEMS) });
+        }
+        return result;
+    },
+
+    async saveRecepcion(data) {
+        const result = await this._enTandas('recepcion', data);
+        DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
+        this._invalidateFlujo();
+        return result;
+    },
+    
+    async confirmarRecepcion(fecha) {
+        const result = await this.request('recepcion/confirmar', 'POST', { fecha });
+        DataLoader.invalidateFlujo(fecha || AppState.currentDate);
+        this._invalidateFlujo();
+        return result;
+    },
+
+    async confirmarRecepcionItem(data) {
+        const result = await this.request('recepcion/confirmar-item', 'POST', data);
+        DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
+        this._invalidateFlujo();
+        return result;
+    },
+
+    async desconfirmarRecepcionItem(data) {
+        const result = await this.request('recepcion/desconfirmar-item', 'POST', data);
+        DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
+        this._invalidateFlujo();
+        return result;
+    },
+
+    async deleteRecepcionItem(data) {
+        const result = await this.request('recepcion/eliminar-item', 'POST', data);
+        DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
+        this._invalidateFlujo();
+        return result;
+    },
+    
+    // Precios
+    async getPreciosCliente(fecha = null) {
+        const cacheKey = fecha ? `precios:${fecha}` : 'precios';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const data = fecha ? { fecha } : null;
+        const result = await this.request('precios-cliente', 'GET', data);
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    async limpiarPreciosHuerfanos(fecha) {
+        const result = await this.request('precios-cliente/limpiar', 'POST', { fecha });
+        if (result && result.quitadas > 0) {
+            DataLoader.invalidateFlujo(fecha);
+            CacheManager.invalidatePattern('cobranzas');
+            this._invalidateFlujo();
+        }
+        return result;
+    },
+
+    async savePreciosCliente(data) {
+        const result = await this._enTandas('precios-cliente', data);
+        DataLoader.invalidateFlujo(data.fecha || AppState.currentDate);
+        // Los totales a cobrar salen de estos precios: lo guardado antes quedó viejo.
+        CacheManager.invalidatePattern('cobranzas');
+        if (typeof CobranzasHoy !== 'undefined') CobranzasHoy._fechaTotales = null;
+        this._invalidateFlujo();
+        return result;
+    },
+    
+    // Cierre
+    async cerrarDia(fecha) {
+        // Validar que la fecha esté presente
+        if (!fecha) {
+            throw new Error('La fecha es requerida para cerrar el día');
+        }
+        
+        // Validar formato de fecha (debe ser YYYY-MM-DD)
+        if (typeof fecha !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+            console.error('❌ Fecha inválida:', fecha);
+            throw new Error('Formato de fecha inválido. Debe ser YYYY-MM-DD');
+        }
+        
+        console.log('📅 API.cerrarDia - Fecha a enviar:', fecha);
+        console.log('📅 API.cerrarDia - Tipo de fecha:', typeof fecha);
+        console.log('📅 API.cerrarDia - AppState.currentDate:', AppState.currentDate);
+        
+        // El cierre del día puede tardar más tiempo, usar un timeout de 60 segundos
+        // Pasamos el timeout como un campo especial que se removerá antes de enviar
+        const dataWithTimeout = { fecha, __timeout: 120000 };
+        const result = await this.request('cierre', 'POST', dataWithTimeout);
+        CacheManager.invalidateAllExcept(['clientes', 'productos', 'proveedores']);
+        this._invalidateFlujo();
+        return result;
+    },
+    
+    async getCierres() {
+        const cacheKey = 'cierres';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const result = await this.request('cierre', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    // Cobranzas
+    async getCobranzas(fecha = null, clienteId = null) {
+        const cacheKey = `cobranzas:${fecha || 'all'}:${clienteId || 'all'}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const data = {};
+        if (fecha) data.fecha = fecha;
+        if (clienteId) data.cliente_id = clienteId;
+        const result = await this.request('cobranzas', 'GET', Object.keys(data).length > 0 ? data : null);
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    async registrarCobro(data) {
+        const result = await this.request('cobranzas', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        return result;
+    },
+
+    async getTotalesClientesHoy(fecha) {
+        const cacheKey = `cobranzas:totales:${fecha}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        const result = await this.request('cobranzas/totales-hoy', 'GET', { fecha });
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+
+    // Lo que un cliente ya debía antes de usar la app: queda como una cobranza pendiente más.
+    async agregarCobranzaPendiente(data) {
+        const result = await this.request('cobranzas/agregar-pendiente', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
+    async deshacerPagoCobranza(data) {
+        const result = await this.request('cobranzas/deshacer-pago', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        return result;
+    },
+
+    async cobrarClienteHoy(data) {
+        const result = await this.request('cobranzas/cobrar-cliente', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        return result;
+    },
+
+    async ajustarCobroClienteHoy(data) {
+        const result = await this.request('cobranzas/ajustar-cobro', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('caja');
+        return result;
+    },
+    
+    // Pagos
+    async getPagosProveedores() {
+        const cacheKey = 'pagos-proveedores';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const result = await this.request('pagos-proveedores', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    // Lo que se le debía a un proveedor antes de usar la app: se suma a su saldo.
+    async agregarDeudaProveedor(data) {
+        const result = await this.request('deudas-proveedores', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
+    async registrarPago(data) {
+        const result = await this.request('pagos-proveedores', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores'); // Los saldos cambian
+        return result;
+    },
+    
+    async anularPagoProveedor(data) {
+        const result = await this.request('pagos-proveedores/anular', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
+    // Cuenta corriente de un proveedor (extracto con saldo corrido).
+    async getCuentaProveedor(proveedorId) {
+        return this.request('proveedores/cuenta', 'GET', { proveedor_id: proveedorId });
+    },
+
+    // Corrige monto y/o fecha de un pago o de una deuda cargada a mano.
+    async editarMovimientoProveedor(data) {
+        const result = await this.request('proveedores/cuenta/editar', 'POST', data);
+        CacheManager.invalidatePattern('pagos-proveedores');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
+    // Cuenta corriente de un cliente (o de su titular): extracto con saldo corrido.
+    async getCuentaCliente(clienteId) {
+        return this.request('clientes/cuenta', 'GET', { cliente_id: clienteId });
+    },
+
+    // Corrige una deuda anterior o un pago de un cliente.
+    async editarMovimientoCliente(data) {
+        const result = await this.request('clientes/cuenta/editar', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+
+    // Stock
+    async getStock() {
+        const cacheKey = 'stock';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const result = await this.request('stock', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    async updateStock(productoId, cantidad) {
+        const result = await this.request('stock', 'PUT', { producto_id: productoId, cantidad });
+        CacheManager.invalidate('stock');
+        return result;
+    },
+
+    async deleteStock(productoId) {
+        const result = await this.request('stock/delete', 'POST', { producto_id: productoId });
+        CacheManager.invalidate('stock');
+        return result;
+    },
+    
+    // Notificaciones
+    async verificarStockBajo() {
+        const result = await this.request('notificaciones/verificar-stock', 'POST');
+        return result;
+    },
+    
+    async getConfiguracionNotificaciones() {
+        const result = await this.request('notificaciones/config', 'GET');
+        return result;
+    },
+    
+    async saveConfiguracionNotificaciones(data) {
+        const result = await this.request('notificaciones/config', 'POST', data);
+        return result;
+    },
+    
+    // Caja
+    async getCajaMovimientos() {
+        const cacheKey = 'caja';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const result = await this.request('caja', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+    
+    async createCajaMovimiento(data) {
+        const result = await this.request('caja', 'POST', data);
+        CacheManager.invalidate('caja');
+        return result;
+    },
+
+    async repartirEfectivo(data) {
+        const result = await this.request('caja/repartir', 'POST', data);
+        CacheManager.invalidatePattern('cobranzas');
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidate('caja');
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        return result;
+    },
+    
+    // Historial
+    async getHistorial() {
+        const cacheKey = 'historial';
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+        
+        const result = await this.request('historial', 'GET');
+        CacheManager.set(cacheKey, result);
+        return result;
+    },
+
+    // El PDF no entra en una URL (Google corta cerca de los 12.000 caracteres): va en el cuerpo de un
+    // POST. Si la respuesta no se puede leer (corte de red o el redirect de Google), se pregunta al
+    // servidor si el PDF quedó guardado antes de dar error.
+    async subirPdfCierre(fecha, pdfBase64) {
+        const rid = 'pdf_' + Date.now() + '_' + Math.random().toString(36).slice(2, 9);
+        const url = `${API_CONFIG.baseUrl}?endpoint=${encodeURIComponent('drive/cierre')}&method=POST&apiKey=${encodeURIComponent(API_CONFIG.apiKey)}&token=${encodeURIComponent(Auth.getToken())}&rid=${rid}`;
+        const control = new AbortController();
+        const corte = setTimeout(() => control.abort(), 120000);
+        Sync.escribiendo++;
+        try {
+            let respuesta = null;
+            try {
+                const resp = await fetch(url, { method: 'POST', body: JSON.stringify({ fecha, pdf: pdfBase64 }), signal: control.signal });
+                respuesta = await resp.json();
+            } catch (error) {
+                console.warn('No se pudo leer la respuesta al subir el PDF:', error);
+            }
+            if (respuesta) {
+                if (respuesta.sesion === false) {
+                    Auth.logout();
+                    throw new Error(respuesta.error || 'Tu sesión venció. Volvé a iniciar sesión.');
+                }
+                if (respuesta.ver !== undefined) Sync.observar(respuesta.ver, true);
+                if (respuesta.success !== true) throw new Error(String(respuesta.error || 'No se pudo guardar en Drive').replace(/^Error:\s*/, ''));
+                CacheManager.invalidate('historial');
+                return respuesta.data;
+            }
+            CacheManager.invalidate('historial');
+            const cierres = await this._executeRequest('historial', 'GET', null, 0).catch(() => []);
+            const dia = (cierres || []).find(c => Utils.fechaIso(c.fecha) === fecha && c.pdf_drive);
+            if (dia) return { fecha, url: dia.pdf_drive };
+            throw new Error('No se pudo conectar con Google. Revisá la conexión y volvé a intentar.');
+        } finally {
+            clearTimeout(corte);
+            Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
+        }
+    },
+
+    async getDriveConfig() {
+        return this.request('drive/config', 'GET');
+    },
+
+    async compartirDrive(email) {
+        return this.request('drive/compartir', 'POST', { email });
+    },
+
+    async quitarAccesoDrive(email) {
+        return this.request('drive/quitar', 'POST', { email });
+    },
+};
+
+// Navegación
+const Navigation = {
+    init() {
+        // Inicializar categorías desplegables
+        document.querySelectorAll('.nav-category-toggle').forEach(toggle => {
+            toggle.addEventListener('click', (e) => {
+                e.preventDefault();
+                const category = toggle.parentElement;
+                
+                // Cerrar otras categorías
+                document.querySelectorAll('.nav-category').forEach(cat => {
+                    if (cat !== category) {
+                        cat.classList.remove('active');
+                    }
+                });
+                
+                // Toggle categoría actual
+                category.classList.toggle('active');
+            });
+        });
+        
+        const prefetchPage = (page) => {
+            const fecha = AppState.currentDate;
+            const flowPages = ['pedidos', 'recepcion', 'precios', 'cierre'];
+            if (flowPages.includes(page)) {
+                DataLoader.prefetchFlujo(fecha);
+            } else if (page === 'clientes' && !AppState.clientes.length) {
+                API.getClientes().then(d => { AppState.clientes = d; }).catch(() => {});
+            } else if (page === 'productos' && !AppState.productos.length) {
+                API.getProductos().then(d => { AppState.productos = d; }).catch(() => {});
+            } else if ((page === 'pagos' || page === 'pagos-pendientes') && !AppState.proveedores.length) {
+                API.getProveedores().then(d => { AppState.proveedores = d; }).catch(() => {});
+            }
+        };
+
+        document.querySelectorAll('.nav-link').forEach(link => {
+            link.addEventListener('mouseenter', () => {
+                const page = link.getAttribute('data-page');
+                if (page) prefetchPage(page);
+            }, { passive: true });
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                const linkEl = e.currentTarget;
+                const page = linkEl.getAttribute('data-page');
+                if (page) {
+                    this.navigateTo(page);
+                }
+            });
+        });
+    },
+    
+    // Quita del menú lo que este usuario no puede ver.
+    aplicarPermisos() {
+        if (Utils.veePrecios()) return;
+        document.querySelectorAll('[data-page="precios"]').forEach(link => (link.closest('li') || link).setAttribute('hidden', ''));
+        const seguir = document.getElementById('btn-seguir-precios');
+        if (seguir) seguir.textContent = 'Seguir a cobranza';
+    },
+
+    navigateTo(page) {
+        if (!page) return;
+        if (page === 'precios' && !Utils.veePrecios()) page = 'cobros-hoy';
+        const requested = page;
+        const screen = requested === 'pagos-pendientes'
+            ? 'pagos'
+            : (requested === 'recepcion-pendientes' ? 'recepcion' : requested);
+        if (requested === 'pagos-pendientes') Pagos.vista = 'pendientes';
+        else if (requested === 'pagos') Pagos.vista = 'hoy';
+        if (requested === 'recepcion-pendientes') Recepcion.vista = 'pendientes';
+        else if (requested === 'recepcion') Recepcion.vista = 'hoy';
+
+        AppState.currentPage = requested;
+
+        // Actualizar navegación
+        document.querySelectorAll('.nav-link').forEach(link => {
+            link.classList.remove('active');
+        });
+        // "Llegó" es una pestaña de la planilla del día: en el menú se marca "Planilla del día".
+        const enMenu = requested === 'recepcion' ? 'pedidos' : requested;
+        document.querySelectorAll(`[data-page="${enMenu}"]`).forEach(link => {
+            link.classList.add('active');
+            const category = link.closest('.nav-category');
+            if (category) category.classList.add('active');
+        });
+        document.body.classList.remove('sidebar-open');
+        
+        // Ocultar todas las páginas
+        document.querySelectorAll('.page').forEach(p => {
+            p.classList.remove('active');
+        });
+        
+        // Mostrar página seleccionada
+        const pageEl = document.getElementById(screen);
+        if (!pageEl) {
+            console.error('Página no encontrada:', page);
+            Utils.showError('No se encontró la pantalla solicitada.');
+            return;
+        }
+        pageEl.classList.add('active');
+        
+        // Actualizar título
+        const titles = {
+            dashboard: 'Dashboard',
+            clientes: 'Clientes',
+            productos: 'Productos',
+            proveedores: 'Proveedores',
+            pedidos: 'Pedidos del día',
+            camiones: 'Armar camiones',
+            recepcion: 'Confirmación de lo que llegó',
+            'recepcion-pendientes': 'Confirmar recepción (pendientes)',
+            precios: 'Precios al cliente',
+            'cobros-hoy': 'Cobranza al cliente',
+            cierre: 'Cierre del día',
+            cobranzas: 'Cobranzas a clientes (pendientes)',
+            pagos: 'Pagar al proveedor',
+            'pagos-pendientes': 'Pagos a proveedores (pendientes)',
+            stock: 'Stock',
+            historial: 'Historial de días',
+            reparto: 'Repartir efectivo',
+            caja: 'Caja',
+            'links-clientes': 'Links para clientes',
+            mantenimiento: 'Limpiar datos'
+        };
+        document.getElementById('page-title').textContent = titles[requested] || 'Dashboard';
+        
+        // Cargar datos de la página
+        this.loadPageData(requested);
+    },
+    
+    async loadPageData(page) {
+        try {
+            const flowPages = ['pedidos', 'camiones', 'recepcion', 'recepcion-pendientes', 'precios', 'cobros-hoy', 'pagos', 'pagos-pendientes', 'cierre'];
+            if (flowPages.includes(page)) {
+                DiaOperativo.renderSelectors();
+                DiaOperativo.renderEstadoPanels();
+            }
+
+            switch(page) {
+                case 'dashboard':
+                    await Dashboard.load();
+                    break;
+                case 'clientes':
+                    await Clientes.load();
+                    break;
+                case 'productos':
+                    await Productos.load();
+                    break;
+                case 'proveedores':
+                    await ProveedoresGestion.load();
+                    break;
+                case 'pedidos':
+                    await Pedidos.load();
+                    PlanillaPedidos._traerOrdenCamiones();
+                    PlanillaPedidos.cargarLlegada();
+                    break;
+                case 'camiones':
+                    await Camiones.load();
+                    break;
+                case 'recepcion':
+                    await Recepcion.load();
+                    break;
+                case 'precios':
+                    await Precios.load();
+                    break;
+                case 'cobros-hoy':
+                    await CobranzasHoy.load();
+                    break;
+                case 'cierre':
+                    await Cierre.load();
+                    break;
+                case 'cobranzas':
+                    await Cobranzas.load();
+                    break;
+                case 'pagos':
+                case 'pagos-pendientes':
+                    await Pagos.load();
+                    break;
+                case 'recepcion-pendientes':
+                    await Recepcion.load();
+                    break;
+                case 'stock':
+                    await Stock.load();
+                    break;
+                case 'historial':
+                    await Historial.load();
+                    break;
+                case 'caja':
+                    await Caja.load();
+                    break;
+                case 'reparto':
+                    await Reparto.load();
+                    break;
+                case 'links-clientes':
+                    await LinksClientes.load();
+                    break;
+            }
+        } catch (error) {
+            console.error('Error loading page:', error);
+        }
+    }
+};
+
+// Dashboard
+const Dashboard = {
+    chart: null,
+    // Usuarios que ven en el inicio el detalle de saldos por cliente y por proveedor.
+    USUARIOS_CON_SALDOS: ['cargasluciano@gmail.com', 'nicolirina.rosascharny@gmail.com'],
+    
+    async load() {
+        const chartContainer = document.querySelector('.chart-container');
+        const fecha = AppState.currentDate;
+        const cachedDash = CacheManager.peek(`dashboard:${fecha}`);
+
+        if (cachedDash) {
+            this.applyResumen(cachedDash);
+        } else if (chartContainer) {
+            Utils.showTableLoader(chartContainer);
+        }
+
+        try {
+            let data = await DataLoader.bootstrap(fecha);
+            if (data && data.diasPendientes) {
+                DiaOperativo.diasPendientes = data.diasPendientes;
+                const antes = AppState.currentDate;
+                await DiaOperativo.resolveWorkDate({ skipRefresh: true });
+                if (AppState.currentDate !== antes) {
+                    data = await DataLoader.bootstrap(AppState.currentDate);
+                }
+            }
+            this.applyResumen((data && data.dashboard) || data || {});
+            DiaOperativo.renderSelectors();
+            DiaOperativo.renderEstadoPanels();
+            DiaOperativo.renderDashboardBanner();
+            DiaOperativo.renderNavBadge();
+        } catch (error) {
+            console.error('Error loading dashboard:', error);
+            if (!cachedDash) {
+                this.renderChart([], []);
+                Utils.showError('Google no respondió a tiempo. Esperá un minuto y recargá la página una sola vez.');
+            }
+        } finally {
+            if (chartContainer) Utils.hideTableLoader(chartContainer);
+        }
+    },
+
+    applyResumen(resumen) {
+        const pedidos = resumen.pedidos || [];
+        const cobranzas = resumen.cobranzas || [];
+        const stock = resumen.stock || [];
+        const top5 = resumen.topProductos || [];
+
+        AppState.pedidos = pedidos;
+        this.updateCounters(pedidos, cobranzas, stock);
+        this.renderChart(top5.map(p => p.nombre), top5.map(p => p.cantidad));
+    },
+    
+    updateCounters(pedidos, cobranzas, stock) {
+        // Pedidos del día
+        const pedidosCount = pedidos.length || 0;
+        document.getElementById('dashboard-pedidos-count').textContent = pedidosCount;
+        
+        // Cobranzas pendientes (saldo real por cobrar, todas las fechas)
+        const cobranzasPendientes = cobranzas.filter(c => Utils.isCobranzaPendiente(c));
+        const totalCobranzas = cobranzasPendientes.reduce((sum, c) => sum + Utils.getCobranzaSaldo(c), 0);
+        document.getElementById('dashboard-cobranzas-count').textContent = Utils.formatCurrency(totalCobranzas);
+        
+        // Proveedores a pagar
+        const proveedores = AppState.proveedores || [];
+        const totalPagos = proveedores.reduce((sum, p) => sum + Utils.parsePrice(p.saldo), 0);
+        document.getElementById('dashboard-pagos-count').textContent = Utils.formatCurrency(totalPagos);
+        
+        // Stock bajo
+        const stockBajo = Stock._filas(stock).filter(item => item.stock_actual <= item.minimo);
+        document.getElementById('dashboard-stock-count').textContent = stockBajo.length || 0;
+
+        this.renderSaldos(cobranzasPendientes, proveedores);
+    },
+
+    _veSaldos() {
+        const email = String(Auth.getUserEmail() || '').toLowerCase();
+        return this.USUARIOS_CON_SALDOS.includes(email);
+    },
+
+    // Lo que debe cada cliente (sumando todos sus días) y lo que se le debe a cada proveedor.
+    renderSaldos(cobranzasPendientes, proveedores) {
+        const panel = document.getElementById('dashboard-saldos');
+        if (!panel) return;
+        if (!this._veSaldos()) {
+            panel.hidden = true;
+            return;
+        }
+        panel.hidden = false;
+
+        const porCliente = new Map();
+        cobranzasPendientes.forEach(c => {
+            const id = String(c.cliente_id || '');
+            const saldo = Utils.getCobranzaSaldo(c);
+            if (!id || saldo <= 0) return;
+            const previo = porCliente.get(id) || { id, nombre: Cobranzas._clienteDe(c).nombre || 'Cliente', saldo: 0 };
+            previo.saldo += saldo;
+            porCliente.set(id, previo);
+        });
+        const clientes = [...porCliente.values()].sort((a, b) => b.saldo - a.saldo);
+        const deudas = (proveedores || [])
+            .map(p => ({ id: String(p.id), nombre: p.nombre || 'Proveedor', saldo: Utils.parsePrice(p.saldo) || 0 }))
+            .filter(p => p.saldo > 0)
+            .sort((a, b) => b.saldo - a.saldo);
+
+        const pintar = (listaId, totalId, filas, tipo, vacio) => {
+            const total = filas.reduce((suma, f) => suma + f.saldo, 0);
+            document.getElementById(totalId).textContent = Utils.formatCurrency(total);
+            document.getElementById(listaId).innerHTML = filas.length
+                ? filas.map(f => `<li><button type="button" onclick="Dashboard.irASaldo('${tipo}', '${Utils.esc(f.id)}')">
+                        <span class="saldo-nombre">${Utils.esc(f.nombre)}</span>
+                        <span class="saldo-monto">${Utils.formatCurrency(f.saldo)}</span>
+                    </button></li>`).join('')
+                : `<li class="saldos-inicio-vacio">${vacio}</li>`;
+        };
+        pintar('saldos-clientes-lista', 'saldos-clientes-total', clientes, 'cliente', 'Ningún cliente te debe.');
+        pintar('saldos-proveedores-lista', 'saldos-proveedores-total', deudas, 'proveedor', 'No le debés a ningún proveedor.');
+    },
+
+    async _cargarXlsx() {
+        if (window.XLSX) return window.XLSX;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo cargar el generador de Excel'));
+            document.head.appendChild(script);
+        });
+        if (!window.XLSX) throw new Error('No se pudo cargar el generador de Excel');
+        return window.XLSX;
+    },
+
+    // PDF de saldos: qué debe cada cliente (desde y hasta qué día) y qué se le debe a cada
+    // proveedor (hasta qué mercadería y cuándo se le pagó por última vez).
+    // seccion: 'ambos' (inicio), 'clientes' (Cobranzas pendientes) o 'proveedores' (Pagos pendientes).
+    // Se pide todo al servidor en el momento: el archivo tiene que estar al día.
+    async descargarPdfSaldos(seccion = 'ambos') {
+        const conClientes = seccion !== 'proveedores';
+        const conProveedores = seccion !== 'clientes';
+        try {
+            const [cobranzas, proveedores, recepcion, pagos] = await Promise.all([
+                API.request('cobranzas', 'GET'),
+                API.request('proveedores', 'GET'),
+                API.request('recepcion', 'GET'),
+                API.request('pagos-proveedores', 'GET')
+            ]);
+            const fechaCorta = iso => {
+                const f = Utils.fechaIso(iso);
+                if (!f) return '—';
+                const [y, m, d] = f.split('-');
+                return `${d}/${m}/${y}`;
+            };
+
+            const porCliente = new Map();
+            (cobranzas || []).filter(c => Utils.isCobranzaPendiente(c)).forEach(c => {
+                const saldo = Utils.getCobranzaSaldo(c);
+                if (saldo <= 0) return;
+                const id = String(c.cliente_id || '');
+                const fecha = Utils.fechaIso(c.fecha);
+                const fila = porCliente.get(id) || { nombre: Cobranzas._clienteDe(c).nombre || 'Cliente', saldo: 0, dias: 0, desde: '', hasta: '' };
+                fila.saldo += saldo;
+                fila.dias += 1;
+                if (fecha && (!fila.desde || fecha < fila.desde)) fila.desde = fecha;
+                if (fecha && fecha > fila.hasta) fila.hasta = fecha;
+                porCliente.set(id, fila);
+            });
+            const clientes = [...porCliente.values()].sort((a, b) => b.saldo - a.saldo);
+
+            const ultimaMercaderia = {};
+            (recepcion || []).forEach(r => {
+                const confirmado = r.confirmado === true || r.confirmado === 'true';
+                const fecha = Utils.fechaIso(r.fecha);
+                const id = String(r.proveedor_id || '');
+                if (!confirmado || !fecha || !id || !(Number(r.llego) > 0)) return;
+                if (!ultimaMercaderia[id] || fecha > ultimaMercaderia[id]) ultimaMercaderia[id] = fecha;
+            });
+            const ultimoPago = {};
+            (pagos || []).forEach(p => {
+                const fecha = Utils.fechaIso(p.fecha);
+                const id = String(p.proveedor_id || '');
+                if (!fecha || !id) return;
+                if (!ultimoPago[id] || fecha > ultimoPago[id]) ultimoPago[id] = fecha;
+            });
+            const deudas = (proveedores || [])
+                .map(p => ({ id: String(p.id), nombre: p.nombre || 'Proveedor', saldo: Utils.parsePrice(p.saldo) || 0 }))
+                .filter(p => p.saldo > 0)
+                .sort((a, b) => b.saldo - a.saldo);
+
+            const total = filas => filas.reduce((suma, f) => suma + f.saldo, 0);
+            const filasClientes = clientes.map((f, i) => `
+                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                    <td>${Utils.esc(f.nombre)}</td>
+                    <td class="col-money">${Utils.formatCurrency(f.saldo)}</td>
+                    <td class="col-num">${f.dias}</td>
+                    <td class="col-num">${fechaCorta(f.desde)}</td>
+                    <td class="col-num">${fechaCorta(f.hasta)}</td>
+                </tr>`).join('') || '<tr><td colspan="5" class="vacio">Ningún cliente te debe.</td></tr>';
+            const filasProveedores = deudas.map((f, i) => `
+                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                    <td>${Utils.esc(f.nombre)}</td>
+                    <td class="col-money">${Utils.formatCurrency(f.saldo)}</td>
+                    <td class="col-num">${fechaCorta(ultimaMercaderia[f.id])}</td>
+                    <td class="col-num">${fechaCorta(ultimoPago[f.id])}</td>
+                </tr>`).join('') || '<tr><td colspan="4" class="vacio">No le debés a ningún proveedor.</td></tr>';
+
+            const ahora = new Date();
+            const generado = ahora.toLocaleString('es-AR', { hour12: false });
+            const html = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Saldos</title>
+                <style>
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 13px; color: #1e293b; padding: 32px 40px; background: #fff; }
+                    .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 3px solid #1a73e8; }
+                    .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                    .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                    .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                    .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                    .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 12px 20px; border-radius: 8px; margin: 8px 0 14px; display: flex; justify-content: space-between; align-items: baseline; }
+                    .cliente-box .name { font-size: 18px; font-weight: 700; color: #1e293b; }
+                    .cliente-box .monto { font-size: 18px; font-weight: 700; color: #1a73e8; }
+                    table { width: 100%; border-collapse: collapse; margin-bottom: 26px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                    thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 11px 12px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+                    thead th.col-money, thead th.col-num { text-align: right; }
+                    tbody td { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; }
+                    .row-even { background: #fff; }
+                    .row-odd { background: #f8fafc; }
+                    td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                    td.col-num { text-align: right; white-space: nowrap; color: #475569; }
+                    td.vacio { text-align: center; color: #64748b; padding: 18px; }
+                    tfoot td { padding: 10px 12px; font-weight: 700; background: #f1f5f9; }
+                    tfoot td.col-money { text-align: right; color: #1e293b; }
+                    .footer { margin-top: 12px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+                </style></head><body>
+                <div class="doc-header">
+                    <div class="brand"><h1>Luciano Cargas</h1><p>${conClientes && conProveedores ? 'Saldos de clientes y proveedores' : (conClientes ? 'Cobranzas a clientes (pendientes)' : 'Pagos a proveedores (pendientes)')}</p></div>
+                    <div class="doc-meta"><strong>Saldos al</strong>${Utils.esc(generado)}</div>
+                </div>
+                ${conClientes ? `<div class="cliente-box"><span class="name">Clientes que te deben</span><span class="monto">${Utils.formatCurrency(total(clientes))}</span></div>
+                <table>
+                    <thead><tr><th>Cliente</th><th class="col-money">Saldo que debe</th><th class="col-num">Días</th><th class="col-num">Debe desde</th><th class="col-num">Hasta</th></tr></thead>
+                    <tbody>${filasClientes}</tbody>
+                    <tfoot><tr><td>Total</td><td class="col-money">${Utils.formatCurrency(total(clientes))}</td><td colspan="3"></td></tr></tfoot>
+                </table>` : ''}
+                ${conProveedores ? `<div class="cliente-box"><span class="name">Proveedores a pagar</span><span class="monto">${Utils.formatCurrency(total(deudas))}</span></div>
+                <table>
+                    <thead><tr><th>Proveedor</th><th class="col-money">Saldo a pagar</th><th class="col-num">Mercadería hasta</th><th class="col-num">Último pago</th></tr></thead>
+                    <tbody>${filasProveedores}</tbody>
+                    <tfoot><tr><td>Total</td><td class="col-money">${Utils.formatCurrency(total(deudas))}</td><td colspan="2"></td></tr></tfoot>
+                </table>` : ''}
+                <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+                </body></html>`;
+            const doc = await Precios._pdfDesdeHtml(html);
+            const prefijo = seccion === 'clientes' ? 'cobranzas-pendientes' : (seccion === 'proveedores' ? 'pagos-pendientes' : 'saldos');
+            doc.save(`${prefijo}-${ahora.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' })}.pdf`);
+            Utils.showSuccess('Se descargó el PDF con los saldos.');
+        } catch (error) {
+            console.error('Error armando el PDF de saldos:', error);
+            Utils.showError('No se pudo armar el PDF: ' + error.message);
+        }
+    },
+
+    // Lleva a la pantalla de pendientes y marca la fila de ese cliente o proveedor.
+    irASaldo(tipo, id) {
+        this._resaltar = { tipo, id: String(id), hasta: Date.now() + 30000 };
+        Navigation.navigateTo(tipo === 'cliente' ? 'cobranzas' : 'pagos-pendientes');
+    },
+
+    // Las tablas se dibujan dos veces (lo guardado y después lo del servidor): la marca
+    // se vuelve a poner mientras dura, y solo la primera vez se desplaza hasta la fila.
+    resaltarFila(tipo) {
+        const r = this._resaltar;
+        if (!r || r.tipo !== tipo || Date.now() > r.hasta) return;
+        const atributo = tipo === 'cliente' ? 'data-cliente-id' : 'data-proveedor-id';
+        const filas = [...document.querySelectorAll(`tr[${atributo}]`)].filter(tr => tr.getAttribute(atributo) === r.id);
+        if (!filas.length) return;
+        filas.forEach(tr => tr.classList.add('fila-resaltada'));
+        if (r.marcada) return;
+        r.marcada = true;
+        r.hasta = Date.now() + 4000;
+        filas[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        setTimeout(() => {
+            if (this._resaltar === r) this._resaltar = null;
+            document.querySelectorAll('tr.fila-resaltada').forEach(tr => tr.classList.remove('fila-resaltada'));
+        }, 4000);
+    },
+    
+    renderChart(labels, data) {
+        const ctx = document.getElementById('topProductsChart');
+        if (!ctx) return;
+
+        if (this.chart) {
+            this.chart.destroy();
+        }
+
+        const sinDatos = !labels || labels.length === 0;
+        const chartLabels = sinDatos ? ['Sin ventas en la última semana'] : labels;
+        const chartData = sinDatos ? [0] : data;
+
+        this.chart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: chartLabels,
+                datasets: [{
+                    label: 'Unidades vendidas',
+                    data: chartData,
+                    backgroundColor: [
+                        'rgba(59, 130, 246, 0.8)',
+                        'rgba(96, 165, 250, 0.8)',
+                        'rgba(147, 197, 253, 0.8)',
+                        'rgba(191, 219, 254, 0.8)',
+                        'rgba(219, 234, 254, 0.8)'
+                    ],
+                    borderColor: [
+                        'rgb(59, 130, 246)',
+                        'rgb(96, 165, 250)',
+                        'rgb(147, 197, 253)',
+                        'rgb(191, 219, 254)',
+                        'rgb(219, 234, 254)'
+                    ],
+                    borderWidth: 2,
+                    borderRadius: 6,
+                }]
+            },
+            options: {
+                indexAxis: 'y',
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                        padding: 12,
+                        titleColor: '#fff',
+                        bodyColor: '#fff',
+                        borderColor: 'rgba(59, 130, 246, 0.5)',
+                        borderWidth: 1,
+                        displayColors: false,
+                        callbacks: {
+                            label: function(context) {
+                                return context.parsed.x + ' unidades';
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        beginAtZero: true,
+                        grid: {
+                            color: 'rgba(0, 0, 0, 0.05)',
+                            drawBorder: false
+                        },
+                        ticks: {
+                            color: '#6b7280',
+                            font: {
+                                size: 12,
+                                weight: '500'
+                            }
+                        }
+                    },
+                    y: {
+                        grid: {
+                            display: false,
+                            drawBorder: false
+                        },
+                        ticks: {
+                            color: '#374151',
+                            font: {
+                                size: 13,
+                                weight: '600'
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+};
+
+// Clientes
+const Clientes = {
+    async load() {
+        const tbody = document.getElementById('clientes-tbody');
+        if (!tbody) return;
+
+        const cached = CacheManager.peek('clientes');
+        const hasStale = AppState.clientes.length > 0 || cached;
+        if (hasStale) {
+            if (!AppState.clientes.length && cached) AppState.clientes = cached;
+            this.render();
+        } else {
+            Utils.showTableLoader(tbody);
+        }
+
+        try {
+            AppState.clientes = await API.getClientes();
+            this.render();
+        } catch (error) {
+            console.error('Error loading clientes:', error);
+            if (!hasStale) Utils.hideTableLoader(tbody);
+        }
+    },
+    
+    render() {
+        const tbody = document.getElementById('clientes-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        
+        if (AppState.clientes.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align: center;">No hay clientes registrados</td></tr>';
+            return;
+        }
+        
+        // Construir todo el HTML de una sola vez para minimizar operaciones DOM
+        let rowsHtml = '';
+        
+        AppState.clientes.forEach(cliente => {
+            const esActivo = cliente.activo === true || cliente.activo === 'true' || cliente.activo === 1;
+            const inactiveStyle = !esActivo ? ' style="opacity:0.6;background-color:#f8f9fa;"' : '';
+            
+            rowsHtml += `
+                <tr${inactiveStyle}>
+                    <td>${Utils.esc(cliente.nombre || '')}</td>
+                    <td>${Utils.esc(cliente.telefono || '')}</td>
+                    <td><span class="status-badge ${esActivo ? 'status-activo' : 'status-inactivo'}">${esActivo ? 'Activo' : 'Inactivo'}</span></td>
+                    <td>
+                        <button class="btn btn-secondary" onclick="CuentaCorriente.abrir('cliente', '${cliente.id}')">Cuenta</button>
+                        <button class="btn btn-secondary" onclick="Clientes.edit('${cliente.id}')">Editar</button>
+                        <button class="btn ${esActivo ? 'btn-secondary' : 'btn-primary'}" onclick="Clientes.toggleActivo('${cliente.id}', ${esActivo})">${esActivo ? 'Desactivar' : 'Activar'}</button>
+                        <button class="btn btn-danger" onclick="Clientes.delete('${cliente.id}')">Eliminar</button>
+                    </td>
+                </tr>
+            `;
+        });
+        
+        tbody.innerHTML = rowsHtml;
+    },
+    
+    async add() {
+        console.log('🔵 Clientes.add() llamado');
+        const content = `
+            <div class="form-group">
+                <label>Nombre</label>
+                <input type="text" id="modal-cliente-nombre" class="form-control" required>
+            </div>
+            <div class="form-group">
+                <label>Teléfono (WhatsApp)</label>
+                <input type="text" id="modal-cliente-telefono" class="form-control">
+                <small>Necesario para enviar precios por WhatsApp</small>
+            </div>
+            <div class="form-group">
+                <label>Titular de la cuenta (opcional)</label>
+                <input type="text" id="modal-cliente-titular" class="form-control" placeholder="Ej: Raúl Ortiz">
+                <small>Si esta lista es de otra persona, poné su nombre: todas sus listas suman en una sola cuenta.</small>
+            </div>
+        `;
+        
+        console.log('🔵 Mostrando modal...');
+        Utils.showModal('Agregar cliente', content, async () => {
+            const nombre = document.getElementById('modal-cliente-nombre').value.trim();
+            const telefono = document.getElementById('modal-cliente-telefono').value.trim();
+            const titular = document.getElementById('modal-cliente-titular').value.trim();
+            
+            if (!nombre) {
+                Utils.showError('El nombre es obligatorio');
+                return true;
+            }
+            
+            try {
+                const result = await API.createCliente({
+                    nombre: nombre,
+                    telefono: telefono,
+                    titular: titular
+                });
+                
+                if (result && (result.success !== false)) {
+                    const nuevo = {
+                        id: result.id,
+                        nombre,
+                        telefono,
+                        titular,
+                        activo: true,
+                        ...result
+                    };
+                    Utils.upsertInList(AppState.clientes, nuevo);
+                    CacheManager.set('clientes', AppState.clientes);
+                    Clientes.render();
+                    if (result.existente) Utils.showInfo('Ya existía un cliente con ese nombre: no se creó otro.');
+                    else Utils.showSuccess('Cliente agregado correctamente');
+                } else {
+                    throw new Error(result?.error || 'No se pudo crear el cliente');
+                }
+            } catch (error) {
+                console.error('❌ Error creating cliente:', error);
+                Utils.showError('Error al crear cliente: ' + error.message);
+            }
+        });
+    },
+    
+    async edit(id) {
+        const cliente = AppState.clientes.find(c => c.id === id);
+        if (!cliente) {
+            Utils.showError('Cliente no encontrado');
+            return;
+        }
+        
+        const content = `
+            <div class="form-group">
+                <label>Nombre</label>
+                <input type="text" id="modal-cliente-nombre" class="form-control" value="${Utils.esc(cliente.nombre || '')}" required>
+            </div>
+            <div class="form-group">
+                <label>Teléfono (WhatsApp)</label>
+                <input type="text" id="modal-cliente-telefono" class="form-control" value="${Utils.esc(cliente.telefono || '')}">
+                <small>Necesario para enviar precios por WhatsApp</small>
+            </div>
+            <div class="form-group">
+                <label>Titular de la cuenta (opcional)</label>
+                <input type="text" id="modal-cliente-titular" class="form-control" placeholder="Ej: Raúl Ortiz" value="${Utils.esc(cliente.titular || '')}">
+                <small>Si esta lista es de otra persona, poné su nombre: todas sus listas suman en una sola cuenta.</small>
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="modal-cliente-activo" ${cliente.activo === true || cliente.activo === 'true' || cliente.activo === 1 ? 'checked' : ''}>
+                    Activo
+                </label>
+            </div>
+        `;
+        
+        Utils.showModal('Editar cliente', content, async () => {
+            const nombre = document.getElementById('modal-cliente-nombre').value.trim();
+            const telefono = document.getElementById('modal-cliente-telefono').value.trim();
+            const activo = document.getElementById('modal-cliente-activo').checked;
+            const titular = document.getElementById('modal-cliente-titular').value.trim();
+            
+            if (!nombre) {
+                Utils.showError('El nombre es obligatorio');
+                return true;
+            }
+
+            const anterior = { ...cliente };
+            const cambios = Utils.cambiosDe({ ...anterior, titular: anterior.titular || '' }, { nombre, telefono, activo, titular });
+            if (!Object.keys(cambios).length) return;
+            const datos = { id, ...cambios };
+            Utils.upsertInList(AppState.clientes, datos);
+            CacheManager.set('clientes', AppState.clientes);
+            Clientes.render();
+            Utils.avisar('Cliente actualizado');
+
+            Utils.enSegundoPlano(async () => {
+                await API.updateCliente(id, { ...cambios });
+                CacheManager.set('clientes', AppState.clientes);
+            }, async (error) => {
+                if (API._esCorteDeConexion(error) && await API.verificarGuardado('clientes', id, datos)) {
+                    AppState.clientes = CacheManager.peek('clientes') || AppState.clientes;
+                    Clientes.render();
+                    return;
+                }
+                Utils.upsertInList(AppState.clientes, anterior);
+                CacheManager.set('clientes', AppState.clientes);
+                Clientes.render();
+                Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo guardar el cliente. Revisá la conexión y volvé a intentar.' : 'No se pudo guardar el cliente: ' + error.message);
+            });
+        });
+    },
+    
+    async toggleActivo(id, activoActual) {
+        const cliente = AppState.clientes.find(c => String(c.id) === String(id));
+        if (!cliente) {
+            Utils.showError('Cliente no encontrado');
+            return;
+        }
+
+        const activoBoolean = activoActual === true || activoActual === 'true' || activoActual === 1;
+        const nuevoEstado = !activoBoolean;
+        const accion = activoBoolean ? 'desactivar' : 'activar';
+        const confirmar = await Utils.showConfirm(`¿Está seguro de ${accion} este cliente?`);
+        if (!confirmar) return;
+
+        const anterior = { ...cliente };
+        Utils.upsertInList(AppState.clientes, { id: cliente.id, activo: nuevoEstado });
+        CacheManager.set('clientes', AppState.clientes);
+        Clientes.render();
+        Utils.avisar(`Cliente ${activoBoolean ? 'desactivado' : 'activado'}`);
+
+        Utils.enSegundoPlano(async () => {
+            // Solo el estado: así no se pisa un nombre que otra persona acaba de editar.
+            await API.updateCliente(cliente.id, { activo: nuevoEstado });
+            CacheManager.set('clientes', AppState.clientes);
+        }, async (error) => {
+            if (API._esCorteDeConexion(error) && await API.verificarGuardado('clientes', cliente.id, { activo: nuevoEstado })) {
+                AppState.clientes = CacheManager.peek('clientes') || AppState.clientes;
+                Clientes.render();
+                return;
+            }
+            Utils.upsertInList(AppState.clientes, anterior);
+            CacheManager.set('clientes', AppState.clientes);
+            Clientes.render();
+            Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo cambiar el estado del cliente. Revisá la conexión y volvé a intentar.' : 'No se pudo cambiar el estado del cliente: ' + error.message);
+        });
+    },
+    
+    async delete(id) {
+        const cliente = AppState.clientes.find(c => c.id === id);
+        if (!cliente) {
+            Utils.showError('Cliente no encontrado');
+            return;
+        }
+        
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente a "${cliente.nombre}"?\n\nEsta acción NO se puede deshacer.\n\nSolo se puede eliminar si nunca tuvo pedidos ni cobranzas. Si ya trabajó con él, usá Desactivar para conservar el historial.\n\n¿Desea continuar?`;
+        
+        const confirmar = await Utils.showConfirm(confirmMsg);
+        if (!confirmar) return;
+        
+        try {
+            await API.deleteCliente(id);
+            Utils.removeFromList(AppState.clientes, id);
+            CacheManager.set('clientes', AppState.clientes);
+            Clientes.render();
+            Utils.showSuccess('Cliente eliminado correctamente');
+        } catch (error) {
+            console.error('Error deleting cliente:', error);
+            Utils.showError('Error al eliminar cliente: ' + error.message);
+        }
+    }
+};
+
+// Productos
+const Productos = {
+    async load() {
+        const tbody = document.getElementById('productos-tbody');
+        if (!tbody) return;
+
+        const hasStale = AppState.productos.length > 0 || CacheManager.peek('productos');
+        if (hasStale) {
+            if (!AppState.productos.length) AppState.productos = CacheManager.peek('productos') || [];
+            if (!AppState.proveedores.length) AppState.proveedores = CacheManager.peek('proveedores') || [];
+            this.render();
+        } else {
+            Utils.showTableLoader(tbody);
+        }
+
+        try {
+            const promises = [];
+            if (!CacheManager.get('productos')) {
+                promises.push(API.getProductos().then(data => { AppState.productos = data; }));
+            }
+            if (!CacheManager.get('proveedores')) {
+                promises.push(API.getProveedores().then(data => { AppState.proveedores = data; }));
+            }
+            if (promises.length > 0) await Promise.all(promises);
+            this.render();
+        } catch (error) {
+            console.error('Error loading productos:', error);
+            if (!hasStale) Utils.hideTableLoader(tbody);
+            Utils.showError('Error al cargar productos');
+        }
+    },
+    
+    render() {
+        const tbody = document.getElementById('productos-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        
+        if (AppState.productos.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No hay productos registrados. Agregue productos para poder crear pedidos.</td></tr>';
+            return;
+        }
+        
+        let rowsHtml = '';
+        
+        AppState.productos.forEach(producto => {
+            const proveedor = AppState.proveedores.find(p => p.id === producto.proveedor_default);
+            const tipoBadgeClass = producto.tipo === 'verdura' ? 'status-activo' : 'status-pendiente';
+            
+            rowsHtml += `
+                <tr>
+                    <td>${Utils.esc(producto.nombre || '')}${PlanillaPedidos.esPorKilo(producto) ? ' <span class="planilla-kg" title="Se vende por kilo">kg</span>' : ''}</td>
+                    <td><span class="status-badge ${tipoBadgeClass}">${producto.tipo || ''}</span></td>
+                    <td>${proveedor ? proveedor.nombre : 'Sin proveedor'}</td>
+                    <td>${Comisiones.textoCorto(producto)}</td>
+                    <td>
+                        <button class="btn btn-secondary" onclick="Productos.edit('${producto.id}')">Editar</button>
+                        <button class="btn btn-danger" onclick="Productos.delete('${producto.id}')">Eliminar</button>
+                    </td>
+                </tr>
+            `;
+        });
+        
+        tbody.innerHTML = rowsHtml;
+    },
+    
+    async add() {
+        if (!AppState.proveedores?.length) {
+            const cache = CacheManager.peek('proveedores');
+            if (Array.isArray(cache)) AppState.proveedores = cache;
+        }
+        const proveedores = AppState.proveedores || [];
+        
+        const content = `
+            <div class="form-group">
+                <label>Nombre del producto</label>
+                <input type="text" id="modal-producto-nombre" class="form-control" placeholder="Ej: Tomate, Coca Cola 1.5L" required>
+            </div>
+            <div class="form-group">
+                <label>Tipo</label>
+                <select id="modal-producto-tipo" class="form-control" required>
+                    <option value="">Seleccionar...</option>
+                    <option value="verdura">Verdura</option>
+                    <option value="fruta">Fruta</option>
+                    <option value="bebida">Bebida</option>
+                    <option value="mercadería">Mercadería</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Proveedor predeterminado</label>
+                <select id="modal-producto-proveedor" class="form-control">
+                    <option value="">Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+                <small>Si no tienes proveedores, puedes agregarlo después</small>
+            </div>
+            ${Comisiones.camposHtml()}
+        `;
+        
+        Utils.showModal('Agregar producto', content, async () => {
+            const nombre = document.getElementById('modal-producto-nombre').value.trim();
+            const tipo = document.getElementById('modal-producto-tipo').value;
+            const proveedorId = document.getElementById('modal-producto-proveedor').value;
+            
+            if (!nombre || !tipo) {
+                Utils.showError('Complete todos los campos obligatorios');
+                return true;
+            }
+            const comision = Comisiones.leerCampos();
+            if (!comision) return true;
+            
+            try {
+                const result = await API.createProducto({
+                    nombre: nombre,
+                    tipo: tipo,
+                    proveedor_default: proveedorId || '',
+                    ...comision
+                });
+                
+                console.log('✅ Producto creado, resultado:', result);
+                
+                if (result && (result.success !== false)) {
+                    const nuevo = {
+                        id: result.id,
+                        nombre,
+                        tipo,
+                        proveedor_default: proveedorId || '',
+                        ...comision,
+                        ...result
+                    };
+                    Utils.upsertInList(AppState.productos, nuevo);
+                    CacheManager.set('productos', AppState.productos);
+                    Productos.render();
+                    if (result.existente) Utils.showInfo('Ya existía un producto con ese nombre: no se creó otro.');
+                    else Utils.showSuccess('Producto agregado correctamente');
+                } else {
+                    throw new Error(result?.error || 'No se pudo crear el producto');
+                }
+            } catch (error) {
+                console.error('❌ Error creating producto:', error);
+                Utils.showError('Error al crear producto: ' + error.message);
+            }
+        });
+        Comisiones.activarCampos();
+
+        if (!CacheManager.get('proveedores')) {
+            API.getProveedores().then(lista => {
+                AppState.proveedores = lista || [];
+                const select = document.getElementById('modal-producto-proveedor');
+                if (!select) return;
+                const elegido = select.value;
+                select.innerHTML = '<option value="">Sin proveedor</option>' +
+                    AppState.proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('');
+                if (elegido) select.value = elegido;
+            }).catch(() => {});
+        }
+    },
+    
+    async edit(id) {
+        const producto = AppState.productos.find(p => p.id === id);
+        if (!producto) {
+            Utils.showError('Producto no encontrado');
+            return;
+        }
+        
+        const proveedores = AppState.proveedores || [];
+        
+        const content = `
+            <div class="form-group">
+                <label>Nombre del producto</label>
+                <input type="text" id="modal-producto-nombre" class="form-control" value="${Utils.esc(producto.nombre || '')}" required>
+            </div>
+            <div class="form-group">
+                <label>Tipo</label>
+                <select id="modal-producto-tipo" class="form-control" required>
+                    <option value="verdura" ${producto.tipo === 'verdura' ? 'selected' : ''}>Verdura</option>
+                    <option value="fruta" ${producto.tipo === 'fruta' ? 'selected' : ''}>Fruta</option>
+                    <option value="bebida" ${producto.tipo === 'bebida' ? 'selected' : ''}>Bebida</option>
+                    <option value="mercadería" ${producto.tipo === 'mercadería' ? 'selected' : ''}>Mercadería</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Proveedor predeterminado</label>
+                <select id="modal-producto-proveedor" class="form-control">
+                    <option value="">Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${p.id}" ${p.id === producto.proveedor_default ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+            </div>
+            ${Comisiones.camposHtml(producto)}
+        `;
+        
+        Utils.showModal('Editar producto', content, async () => {
+            const nombre = document.getElementById('modal-producto-nombre').value.trim();
+            const tipo = document.getElementById('modal-producto-tipo').value;
+            const proveedorId = document.getElementById('modal-producto-proveedor').value;
+            
+            if (!nombre || !tipo) {
+                Utils.showError('Complete todos los campos obligatorios');
+                return true;
+            }
+            const comision = Comisiones.leerCampos();
+            if (!comision) return true;
+            const reglaAntes = Comisiones.reglaDe(id);
+            
+            try {
+                await API.updateProducto(id, {
+                    nombre: nombre,
+                    tipo: tipo,
+                    proveedor_default: proveedorId || '',
+                    ...comision
+                });
+                
+                Utils.upsertInList(AppState.productos, {
+                    id,
+                    nombre,
+                    tipo,
+                    proveedor_default: proveedorId || '',
+                    ...comision
+                });
+                CacheManager.set('productos', AppState.productos);
+                Productos.render();
+                Utils.showSuccess('Producto actualizado correctamente');
+                const reglaNueva = Comisiones.reglaDe(id);
+                if (reglaNueva.tipo !== reglaAntes.tipo || reglaNueva.valor !== reglaAntes.valor) {
+                    Precios.aplicarReglaProducto(id);
+                }
+            } catch (error) {
+                console.error('Error updating producto:', error);
+                Utils.showError('Error al actualizar producto: ' + error.message);
+            }
+        });
+        Comisiones.activarCampos();
+    },
+
+    async delete(id) {
+        let producto = AppState.productos.find(p => String(p.id) === String(id));
+        if (!producto) {
+            CacheManager.invalidate('productos');
+            AppState.productos = await API.getProductos();
+            producto = AppState.productos.find(p => String(p.id) === String(id));
+            Productos.render();
+        }
+        if (!producto) {
+            Utils.showError('Ese producto ya no está en el catálogo. La lista se actualizó.');
+            return;
+        }
+
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente "${producto.nombre}"?\n\nEsta acción NO se puede deshacer.\n\nSolo se puede eliminar si nunca se usó en pedidos, recepciones ni precios.\n\n¿Desea continuar?`;
+
+        const confirmar = await Utils.showConfirm(confirmMsg);
+        if (!confirmar) return;
+
+        try {
+            await API.deleteProducto(producto.id);
+            Utils.removeFromList(AppState.productos, producto.id);
+            CacheManager.set('productos', AppState.productos);
+            Productos.render();
+            Utils.showSuccess('Producto eliminado correctamente');
+        } catch (error) {
+            console.error('Error deleting producto:', error);
+            const mensaje = String(error.message || '');
+            if (mensaje.includes('no encontrado')) {
+                CacheManager.invalidate('productos');
+                AppState.productos = await API.getProductos();
+                Productos.render();
+                Utils.showError('Ese producto ya no está en el servidor. La lista se actualizó.');
+                return;
+            }
+            Utils.showError('Error al eliminar producto: ' + error.message);
+        }
+    }
+};
+
+// Planilla de pedidos: como el Excel que usan. Todos los productos de Configuración en filas
+// (verdura, fruta, bebida, mercadería), todos los clientes en columnas y solo se escriben cantidades.
+// Por detrás cada celda es un pedido común (cliente + producto + día), así camiones, recepción,
+// precios y el envío a proveedores siguen igual. Cada celda se guarda sola al salir de ella.
+const PlanillaPedidos = {
+    GRUPOS: [
+        { tipo: 'verdura', nombre: 'Verdura' },
+        { tipo: 'fruta', nombre: 'Fruta' },
+        { tipo: 'bebida', nombre: 'Bebida' },
+        { tipo: 'mercaderia', nombre: 'Mercadería' },
+        { tipo: 'otros', nombre: 'Otros' }
+    ],
+    vista: (() => { try { return localStorage.getItem('pedidos-vista') || 'planilla'; } catch (e) { return 'planilla'; } })(),
+    filtroTipo: 'todos',
+    soloPedidos: false,
+    texto: '',
+    _cola: Promise.resolve(),
+    _pendientes: 0,
+    _proveedorElegido: {},
+    _listo: false,
+
+    esPorKilo(producto) {
+        const v = producto && producto.por_kilo;
+        return v === true || v === 'true' || v === 'TRUE' || v === 1;
+    },
+
+    _tipoDe(producto) {
+        const t = String(producto?.tipo || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+        return ['verdura', 'fruta', 'bebida', 'mercaderia'].includes(t) ? t : 'otros';
+    },
+
+    // Todos los clientes activos (y los que tienen pedido ese día aunque estén inactivos), de la A a la Z.
+    _todosLosClientes() {
+        const conPedido = new Set((AppState.pedidos || []).map(p => String(p.cliente_id)));
+        const lugar = this._lugarEnCamiones(AppState.currentDate);
+        const porNombre = (a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es');
+        return (AppState.clientes || [])
+            .filter(c => c.activo !== false && c.activo !== 'false' || conPedido.has(String(c.id)))
+            .slice()
+            .sort((a, b) => {
+                const la = lugar.has(String(a.id)) ? lugar.get(String(a.id)) : Infinity;
+                const lb = lugar.has(String(b.id)) ? lugar.get(String(b.id)) : Infinity;
+                if (la !== lb) return la < lb ? -1 : 1;
+                return porNombre(a, b);
+            });
+    },
+
+    // Dónde queda cada cliente según Armar camiones: primero los del camión 1 (en el orden en que se
+    // armó), después los del camión 2, etc. Los que no están en ningún camión van al final, de la A a la Z.
+    // Así las columnas salen en el mismo orden que la hoja impresa.
+    _lugarEnCamiones(fecha) {
+        const lugar = new Map();
+        let lista = [];
+        try { lista = Camiones._leerLocal(fecha); } catch (e) { lista = []; }
+        lista.slice().sort((a, b) => (a.orden || 0) - (b.orden || 0)).forEach(camion => {
+            (camion.clientes || []).forEach(id => {
+                if (!lugar.has(String(id))) lugar.set(String(id), lugar.size);
+            });
+        });
+        return lugar;
+    },
+
+    // Trae los camiones del día (por si todavía no se abrió Armar camiones) y reordena las columnas si cambió algo.
+    async _traerOrdenCamiones() {
+        const fecha = AppState.currentDate;
+        try {
+            const remotos = await API.getCamiones(fecha);
+            if (fecha !== AppState.currentDate || !Array.isArray(remotos) || !remotos.length) return;
+            const antes = JSON.stringify([...this._lugarEnCamiones(fecha)]);
+            const lista = Camiones._normalizar(remotos);
+            Camiones._firmas[fecha] = Camiones._firma(remotos);
+            Camiones._guardarLocal(fecha, lista);
+            const despues = JSON.stringify([...this._lugarEnCamiones(fecha)]);
+            const editando = document.activeElement && document.activeElement.closest && document.activeElement.closest('.planilla-tabla, #pedidos-root');
+            if (antes !== despues && !editando && AppState.currentPage === 'pedidos') this.render();
+        } catch (error) { /* se queda con el orden que ya había */ }
+    },
+
+    // Columnas que se muestran. Por defecto solo los clientes que pidieron ese día más los que se sumaron con
+    // "+ Cliente" (que se quedan mientras se trabaja el día, aunque se les borre el pedido, para que la columna
+    // no desaparezca de golpe). Con el interruptor apagado se ven todos, para tener cada cliente siempre en el mismo lugar.
+    get soloClientes() {
+        try { return localStorage.getItem('pedidos-solo-clientes') !== '0'; } catch (e) { return true; }
+    },
+
+    set soloClientes(valor) {
+        try { localStorage.setItem('pedidos-solo-clientes', valor ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+    },
+
+    _agregados: {},
+
+    _clientes() {
+        const todos = this._todosLosClientes();
+        if (!this.soloClientes) return todos;
+        const fecha = AppState.currentDate;
+        const mostrados = this._agregados[fecha] || (this._agregados[fecha] = new Set());
+        (AppState.pedidos || []).forEach(p => mostrados.add(String(p.cliente_id)));
+        return todos.filter(c => mostrados.has(String(c.id)));
+    },
+
+    // La lista de "+ Cliente…": los que todavía no tienen columna.
+    _pintarAgregarCliente() {
+        const select = document.getElementById('planilla-agregar-cliente');
+        const boton = document.getElementById('planilla-solo-clientes');
+        if (boton) boton.setAttribute('aria-pressed', String(this.soloClientes));
+        if (!select) return;
+        const visibles = new Set(this._clientes().map(c => String(c.id)));
+        const faltan = this._todosLosClientes().filter(c => !visibles.has(String(c.id)));
+        select.hidden = !this.soloClientes || this._bloqueado() || !faltan.length;
+        select.innerHTML = '<option value="">+ Cliente…</option>' + faltan
+            .map(c => `<option value="${Utils.esc(c.id)}">${Utils.esc(c.nombre || 'Cliente')}</option>`).join('');
+    },
+
+    _agregarCliente(clienteId) {
+        if (!clienteId) return;
+        const fecha = AppState.currentDate;
+        (this._agregados[fecha] || (this._agregados[fecha] = new Set())).add(String(clienteId));
+        this.render();
+        const celda = document.querySelector(`#planilla-pedidos tbody tr:not([hidden]) .planilla-celda[data-cliente="${CSS.escape(String(clienteId))}"]`);
+        if (celda) {
+            celda.scrollIntoView({ block: 'nearest', inline: 'center' });
+            celda.focus();
+        }
+    },
+
+    _pedidosDe(productoId, clienteId) {
+        return (AppState.pedidos || []).filter(p =>
+            String(p.producto_id) === String(productoId) &&
+            (clienteId === undefined || String(p.cliente_id) === String(clienteId)));
+    },
+
+    _cantidad(productoId, clienteId) {
+        return this._pedidosDe(productoId, clienteId).reduce((s, p) => s + (parseFloat(p.cantidad) || 0), 0);
+    },
+
+    // Proveedor de la fila: el de sus pedidos del día; si no tiene, el elegido en la fila o el habitual del producto.
+    _proveedorFila(producto) {
+        const ids = [...new Set(this._pedidosDe(producto.id).map(p => String(p.proveedor_id || producto.proveedor_default || '')))];
+        if (ids.length > 1) return { id: '', varios: true };
+        if (ids.length === 1) return { id: ids[0] || PedidoProveedorService.SIN_PROVEEDOR_ID, varios: false };
+        const elegido = this._proveedorElegido[String(producto.id)];
+        return { id: elegido || producto.proveedor_default || PedidoProveedorService.SIN_PROVEEDOR_ID, varios: false };
+    },
+
+    _estadoHtml(producto) {
+        const pedidos = this._pedidosDe(producto.id);
+        if (!pedidos.length) return '<span class="planilla-vacio">—</span>';
+        if (pedidos.every(p => Pedidos._sinProveedorAProposito(p) || !(p.proveedor_id || producto.proveedor_default))) {
+            return '<span class="status-badge status-inactivo">Sin proveedor</span>';
+        }
+        return pedidos.every(p => PedidoProveedorService.isEnviado(p))
+            ? '<span class="status-badge status-activo">Enviado</span>'
+            : '<span class="status-badge status-pendiente">Pendiente</span>';
+    },
+
+    _bloqueado() {
+        return DiaOperativo.diaCerrado(AppState.currentDate);
+    },
+
+    enganchar() {
+        if (this._listo) return;
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        this._listo = true;
+        tabla.addEventListener('change', e => {
+            if (e.target.classList.contains('planilla-celda')) this._guardarCelda(e.target);
+            if (e.target.classList.contains('planilla-proveedor')) this._cambiarProveedor(e.target);
+            if (e.target.matches('.planilla-llego-input, .planilla-precio-input')) this._cambioLlegada(e.target);
+        });
+        tabla.addEventListener('input', e => {
+            const el = e.target;
+            if (!el.classList.contains('planilla-celda')) return;
+            el.value = el.dataset.kilo === '1'
+                ? el.value.replace(/[^\d,.]/g, '').replace('.', ',').replace(/,(?=.*,)/g, '')
+                : el.value.replace(/\D/g, '');
+        });
+        tabla.addEventListener('keydown', e => {
+            if (!e.target.classList.contains('planilla-celda')) return;
+            const celdas = [...tabla.querySelectorAll('tbody tr:not([hidden]) .planilla-celda')];
+            const i = celdas.indexOf(e.target);
+            const ir = (destino) => { if (destino) { e.preventDefault(); destino.focus(); destino.select(); } };
+            const paso = this._clientes().length;
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const sig = celdas[i + paso];
+                if (sig) sig.focus(); else e.target.blur();
+            } else if (e.key === 'ArrowDown') {
+                ir(celdas[i + paso]);
+            } else if (e.key === 'ArrowUp') {
+                ir(celdas[i - paso]);
+            } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                const t = e.target;
+                const alBorde = e.key === 'ArrowRight'
+                    ? t.selectionStart === t.value.length && t.selectionEnd === t.value.length
+                    : t.selectionStart === 0 && t.selectionEnd === 0;
+                if (alBorde) ir(celdas[i + (e.key === 'ArrowRight' ? 1 : -1)]);
+            }
+        });
+        tabla.addEventListener('click', e => {
+            const ed = e.target.closest('[data-planilla-editar]');
+            const el = e.target.closest('[data-planilla-eliminar]');
+            if (ed) this.editar(ed.dataset.planillaEditar);
+            if (el) this.eliminar(el.dataset.planillaEliminar);
+            const conf = e.target.closest('[data-planilla-confirmar]');
+            const rep = e.target.closest('[data-planilla-repartir], [data-planilla-editar-llego]');
+            if (conf) this._confirmarLlegada(conf.dataset.planillaConfirmar);
+            if (rep) Recepcion.editarProducto(rep.dataset.planillaRepartir || rep.dataset.planillaEditarLlego);
+            const addProv = e.target.closest('[data-planilla-agregar-prov]');
+            const delProv = e.target.closest('[data-planilla-quitar-prov]');
+            if (addProv) Recepcion.agregarProveedor(addProv.dataset.planillaAgregarProv);
+            if (delProv) Recepcion.quitarProveedor(delProv.dataset.planillaQuitarProv);
+        });
+        // Si llegaron cambios de otra persona mientras se escribía, se redibuja al soltar la planilla.
+        tabla.addEventListener('focusout', () => {
+            setTimeout(() => {
+                if (this._redibujar && !tabla.contains(document.activeElement)) this.render();
+            }, 0);
+        });
+        document.getElementById('pedidos-vista')?.addEventListener('click', e => {
+            const b = e.target.closest('[data-vista]');
+            if (b) this.cambiarVista(b.dataset.vista);
+        });
+        document.getElementById('planilla-filtro-tipo')?.addEventListener('click', e => {
+            const b = e.target.closest('[data-tipo]');
+            if (!b) return;
+            this.filtroTipo = b.dataset.tipo;
+            this._filtrar();
+        });
+        document.getElementById('planilla-solo-clientes')?.addEventListener('click', () => {
+            this.soloClientes = !this.soloClientes;
+            this.render();
+        });
+        document.getElementById('planilla-agregar-cliente')?.addEventListener('change', e => {
+            const id = e.target.value;
+            e.target.value = '';
+            this._agregarCliente(id);
+        });
+        document.getElementById('planilla-zoom')?.addEventListener('change', e => this.cambiarZoom(e.target.value));
+        document.getElementById('planilla-btn-full')?.addEventListener('click', () => this.pantallaCompleta());
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape' && document.body.classList.contains('pedidos-full') && !document.querySelector('.modal-overlay.active, #custom-confirm-accept')) this.pantallaCompleta(false);
+        });
+        document.getElementById('planilla-solo-pedidos')?.addEventListener('click', () => {
+            this.soloPedidos = !this.soloPedidos;
+            this._filtrar();
+        });
+        document.getElementById('planilla-buscar')?.addEventListener('input', e => {
+            this.texto = e.target.value.trim().toLowerCase();
+            this._filtrar();
+        });
+    },
+
+    // Tamaño de la planilla y pantalla completa (como en Recepción): para ver todos los clientes sin desplazarse.
+    get _zoom() {
+        let z = '90';
+        try { z = localStorage.getItem('pedidos-zoom') || '90'; } catch (e) { /* sin almacenamiento */ }
+        return ['100', '90', '80', '70', '60', '50'].includes(z) ? z : '90';
+    },
+
+    get _pantallaCompleta() {
+        try { return localStorage.getItem('pedidos-full') === '1'; } catch (e) { return false; }
+    },
+
+    cambiarZoom(valor) {
+        try { localStorage.setItem('pedidos-zoom', String(valor)); } catch (e) { /* sin almacenamiento */ }
+        this._pintarPantalla();
+    },
+
+    pantallaCompleta(forzar) {
+        const nuevo = typeof forzar === 'boolean' ? forzar : !this._pantallaCompleta;
+        try { localStorage.setItem('pedidos-full', nuevo ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+        this._pintarPantalla();
+    },
+
+    _pintarPantalla() {
+        const completa = this._pantallaCompleta;
+        document.body.classList.toggle('pedidos-full', completa);
+        const caja = document.getElementById('pedidos-planilla');
+        if (caja) caja.style.setProperty('--pp-zoom', String(Number(this._zoom) / 100));
+        const zoom = document.getElementById('planilla-zoom');
+        if (zoom) zoom.value = this._zoom;
+        const boton = document.getElementById('planilla-btn-full');
+        if (boton) boton.textContent = completa ? 'Salir de pantalla completa' : 'Pantalla completa';
+    },
+
+    cambiarVista(vista) {
+        this.vista = vista === 'lista' ? 'lista' : 'planilla';
+        try { localStorage.setItem('pedidos-vista', this.vista); } catch (e) { /* sin almacenamiento */ }
+        this.render();
+    },
+
+    _pintarVista() {
+        const enPlanilla = this.vista === 'planilla';
+        const planilla = document.getElementById('pedidos-planilla');
+        const lista = document.getElementById('pedidos-lista');
+        if (planilla) planilla.hidden = !enPlanilla;
+        if (lista) lista.hidden = enPlanilla;
+        const agregar = document.getElementById('btn-agregar-pedido');
+        if (agregar) agregar.hidden = enPlanilla;
+        document.querySelectorAll('#pedidos-vista [data-vista]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.vista === this.vista)));
+        document.querySelectorAll('#planilla-filtro-tipo [data-tipo]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.tipo === this.filtroTipo)));
+        const solo = document.getElementById('planilla-solo-pedidos');
+        if (solo) solo.setAttribute('aria-pressed', String(this.soloPedidos));
+    },
+
+    render() {
+        this.superponerPendientes();
+        this.enganchar();
+        this._pintarVista();
+        this._pintarPantalla();
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla || this.vista !== 'planilla') return;
+        // No se redibuja debajo de los dedos de quien está escribiendo.
+        if (tabla.contains(document.activeElement)) {
+            this._redibujar = true;
+            this._totales();
+            return;
+        }
+        this._redibujar = false;
+
+        if ((!(AppState.productos || []).length || !(AppState.clientes || []).length) && !this._buscandoCatalogo) {
+            this._buscandoCatalogo = true;
+            Promise.all([
+                (AppState.productos || []).length ? null : API.getProductos().then(d => { AppState.productos = d || []; }),
+                (AppState.clientes || []).length ? null : API.getClientes().then(d => { AppState.clientes = d || []; }),
+                (AppState.proveedores || []).length ? null : API.getProveedores().then(d => { AppState.proveedores = d || []; })
+            ]).catch(() => {}).finally(() => {
+                this._buscandoCatalogo = false;
+                if ((AppState.productos || []).length && (AppState.clientes || []).length) this.render();
+            });
+        }
+
+        const clientes = this._clientes();
+        const productos = (AppState.productos || []).slice()
+            .sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        const bloqueado = this._bloqueado();
+        const aviso = document.getElementById('planilla-aviso');
+        if (aviso) {
+            aviso.hidden = !bloqueado;
+            aviso.textContent = bloqueado ? 'Este día está cerrado: la planilla se puede ver pero no cambiar.' : '';
+        }
+
+        if (!productos.length || !clientes.length) {
+            const hayClientes = this._todosLosClientes().length > 0;
+            tabla.innerHTML = `<tbody><tr><td class="planilla-sin-datos">${!productos.length
+                ? 'Todavía no hay productos cargados. Agregalos en Configuración → Productos.'
+                : (hayClientes
+                    ? 'Todavía no hay pedidos este día. Elegí un cliente en "+ Cliente…" para empezar, o apagá "Solo clientes con pedido" para ver a todos.'
+                    : 'Todavía no hay clientes cargados. Agregalos en Configuración → Clientes.')}</td></tr></tbody>`;
+            this._pintarAgregarCliente();
+            return;
+        }
+
+        const esc = Utils.esc;
+        const proveedores = Pedidos.getProveedoresActivos(AppState.proveedores || [])
+            .slice().sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        const dis = bloqueado ? ' disabled' : '';
+        const cabeza = `<thead><tr><th class="planilla-prod" scope="col">Producto</th>${clientes.map(c => `<th scope="col" class="planilla-cli">${esc(c.nombre || 'Cliente')}</th>`).join('')}<th scope="col" class="planilla-total">Total pedido</th><th scope="col" class="planilla-th-llego">Llegó</th><th scope="col" class="planilla-th-precio">Precio real <span class="th-hint">(costo / u)</span></th><th scope="col">Proveedor</th><th scope="col">Pedido a proveedor</th><th scope="col">Acciones</th><th scope="col" class="planilla-th-recepcion">Recepción</th></tr></thead>`;
+
+        let cuerpo = '';
+        this.GRUPOS.forEach(grupo => {
+            const lista = productos.filter(p => this._tipoDe(p) === grupo.tipo);
+            if (!lista.length) return;
+            cuerpo += `<tr class="planilla-grupo planilla-grupo-${grupo.tipo}" data-grupo="${grupo.tipo}"><th colspan="${clientes.length + 8}" scope="rowgroup">${grupo.nombre}</th></tr>`;
+            lista.forEach(producto => {
+                const kilo = this.esPorKilo(producto);
+                const celdas = clientes.map(c => {
+                    const cant = this._cantidad(producto.id, c.id);
+                    return `<td><input class="planilla-celda${cant > 0 ? ' con-valor' : ''}" type="text" inputmode="${kilo ? 'decimal' : 'numeric'}" autocomplete="off"
+                        id="planilla-${producto.id}-${c.id}" data-producto="${esc(producto.id)}" data-cliente="${esc(c.id)}" data-kilo="${kilo ? 1 : 0}"
+                        value="${cant > 0 ? Utils.formatCantidad(cant) : ''}" aria-label="${esc(producto.nombre)} para ${esc(c.nombre)}"${dis}></td>`;
+                }).join('');
+                const prov = this._proveedorFila(producto);
+                const opciones = (prov.varios ? '<option value="" selected disabled>Varios proveedores</option>' : '') +
+                    `<option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}"${prov.id === PedidoProveedorService.SIN_PROVEEDOR_ID ? ' selected' : ''}>Sin proveedor</option>` +
+                    proveedores.map(p => `<option value="${esc(p.id)}"${String(p.id) === prov.id ? ' selected' : ''}>${esc(p.nombre)}</option>`).join('');
+                const tiene = this._pedidosDe(producto.id).length > 0;
+                cuerpo += `<tr data-producto-fila="${esc(producto.id)}" data-grupo="${grupo.tipo}" data-nombre="${esc(String(producto.nombre || '').toLowerCase())}">
+                    <th class="planilla-prod" scope="row">${esc(producto.nombre || '')}${kilo ? ' <span class="planilla-kg" title="Se pide en kilos, admite decimales">kg</span>' : ''}</th>
+                    ${celdas}
+                    <td class="planilla-total" data-total="${esc(producto.id)}"></td>
+                    <td class="planilla-llego"></td>
+                    <td class="planilla-precio-real"></td>
+                    <td class="planilla-prov"><select class="planilla-proveedor form-control" id="planilla-prov-${producto.id}" data-producto="${esc(producto.id)}" aria-label="Proveedor de ${esc(producto.nombre)}"${dis}>${opciones}</select></td>
+                    <td class="planilla-estado" data-estado="${esc(producto.id)}"></td>
+                    <td class="planilla-acciones">
+                        <button type="button" class="btn btn-secondary btn-sm" data-planilla-editar="${esc(producto.id)}"${tiene && !bloqueado ? '' : ' disabled'}>Editar</button>
+                        <button type="button" class="btn btn-danger btn-sm" data-planilla-eliminar="${esc(producto.id)}"${tiene && !bloqueado ? '' : ' disabled'}>Eliminar</button>
+                    </td>
+                    <td class="planilla-recepcion"></td>
+                </tr>`;
+            });
+        });
+        const pie = `<tfoot><tr><th class="planilla-prod" scope="row">Total cargado</th>${clientes.map(c => `<td data-total-cliente="${esc(c.id)}"></td>`).join('')}<td class="planilla-total" data-total-general></td><td></td><td></td><td></td><td></td><td></td><td></td></tr></tfoot>`;
+        tabla.innerHTML = cabeza + `<tbody>${cuerpo}</tbody>` + pie;
+        this._totales();
+        this._filtrar();
+        this._pintarLlegada();
+        this._pintarAgregarCliente();
+    },
+
+    // ---------- Llegó / Precio real / Confirmar, en la misma fila del producto ----------
+
+    _timerLlegada: null,
+    _cargandoLlegada: false,
+    _llegadaPendiente: false,
+
+    // Trae (o actualiza) lo de Recepción del día para mostrarlo en esta planilla.
+    async cargarLlegada() {
+        if (this._cargandoLlegada) { this._llegadaPendiente = true; return; }
+        this._cargandoLlegada = true;
+        try {
+            Recepcion.vista = 'hoy';
+            await Recepcion.load();
+        } catch (error) {
+            console.warn('No se pudo cargar lo que llegó:', error);
+        } finally {
+            this._cargandoLlegada = false;
+            this._pintarLlegada();
+            if (this._llegadaPendiente) {
+                this._llegadaPendiente = false;
+                this.cargarLlegada();
+            }
+        }
+    },
+
+    // Cuando cambian los pedidos, la recepción (cuánto se pidió de cada producto) tiene que ponerse al día.
+    _refrescarLlegada() {
+        clearTimeout(this._timerLlegada);
+        this._timerLlegada = setTimeout(() => this.cargarLlegada(), 1200);
+    },
+
+    _valoresLlegada(tr, item) {
+        const llegoInput = tr.querySelector('.planilla-llego-input');
+        const precioInput = tr.querySelector('.planilla-precio-input');
+        let llego = Utils.parseCantidad(llegoInput ? llegoInput.value : '');
+        // Vacío vale lo pedido (así se trata un producto que nadie tocó).
+        if (isNaN(llego)) llego = Number(item.pedido_total) || 0;
+        llego = Math.max(0, llego);
+        const precio = Utils.parsePrice(precioInput ? precioInput.value : 0);
+        const clave = Recepcion._claveDe(item);
+        // El reparto manual se conserva mientras siga cuadrando con lo que llegó; si no, vuelve el proporcional.
+        const reparto = item.reparto && Recepcion._repartoValido(item.reparto, Recepcion._clientesDe(clave), llego)
+            ? item.reparto
+            : null;
+        return { llego, precio, reparto };
+    },
+
+    _cambioLlegada(input) {
+        const clave = input.dataset.clave;
+        const item = (AppState.recepcion || []).find(r => Recepcion._claveDe(r) === String(clave));
+        if (!item || item.confirmado === true || item.confirmado === 'true') return;
+        const { llego, precio, reparto } = this._valoresLlegada(input.closest('tr'), item);
+        Recepcion._aplicarCambio(clave, llego, precio, reparto);
+        this._pintarLlegada();
+    },
+
+    async _confirmarLlegada(clave) {
+        const item = (AppState.recepcion || []).find(r => Recepcion._claveDe(r) === String(clave));
+        if (!item) return;
+        const campo = [...document.querySelectorAll('#planilla-pedidos .planilla-llego-input')].find(i => i.dataset.clave === String(clave));
+        const tr = campo && campo.closest('tr');
+        if (!tr) return;
+        await Recepcion.confirmarProducto(clave, this._valoresLlegada(tr, item));
+        this._pintarLlegada();
+    },
+
+    // Lo de Llegó de un item de recepción (un producto de un proveedor): campos y botones.
+    _htmlLlegada(item, bloqueado) {
+        const esc = Utils.esc;
+        const clave = Recepcion._claveDe(item);
+        const confirmada = item.confirmado === true || item.confirmado === 'true';
+        const pedido = Number(item.pedido_total) || 0;
+        const mostrar = confirmada || Number(item.llego) > 0 || !Recepcion._sinCargar(item);
+        const llegoValor = mostrar ? Utils.formatCantidadInput(item.llego || 0) : '';
+        const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
+        const dis = confirmada || bloqueado ? ' disabled' : '';
+        const nombre = esc(item.producto_nombre || '');
+        const llego = `<input type="number" step="any" min="0" class="planilla-llego-input" data-clave="${esc(clave)}" value="${llegoValor}" placeholder="${esc(Utils.formatCantidadInput(pedido))}"${dis} aria-label="Cuánto llegó de ${nombre}" title="Lo que llegó. Vacío vale lo pedido (${esc(Utils.formatCantidad(pedido))}).">`;
+        const precio = `<input type="text" class="planilla-precio-input" data-clave="${esc(clave)}" data-price-input="true" value="${precioValor}" placeholder="0"${dis} aria-label="Precio real de ${nombre}" title="Lo que te cobró el proveedor por unidad">`;
+        let rec;
+        if (bloqueado) {
+            rec = confirmada ? '✓' : '';
+        } else if (confirmada) {
+            rec = `<span class="status-badge status-activo" title="Confirmado">✓</span> <button type="button" class="btn btn-secondary btn-sm" data-planilla-editar-llego="${esc(clave)}" title="Corregir lo que llegó o a quién le toca">Editar</button>`;
+        } else {
+            rec = `<button type="button" class="btn btn-primary btn-sm" data-planilla-confirmar="${esc(clave)}">Confirmar</button> `
+                + `<button type="button" class="btn btn-secondary btn-sm" data-planilla-repartir="${esc(clave)}" title="Cargar a qué cliente le toca de más o de menos">Repartir</button>`
+                + (item.extra
+                    ? ` <button type="button" class="btn btn-danger btn-sm" data-planilla-quitar-prov="${esc(clave)}" title="Quitar este proveedor">Quitar</button>`
+                    : ` <button type="button" class="btn btn-secondary btn-sm" data-planilla-agregar-prov="${esc(clave)}" title="Este producto llegó también de otro proveedor">+ Proveedor</button>`);
+        }
+        const efectivo = mostrar ? Number(item.llego) || 0 : pedido;
+        return { llego, precio, rec, distinto: Recepcion._esDistinto(efectivo, pedido) };
+    },
+
+    // Dibuja las columnas de Llegó de cada producto sin tocar las celdas de pedidos ni lo que se esté escribiendo.
+    // Un producto de un solo proveedor lleva sus campos en su propia fila; si llegó de más de uno, cada proveedor
+    // tiene su subfila debajo, con sus propios campos.
+    _pintarLlegada() {
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        const bloqueado = this._bloqueado();
+        const esc = Utils.esc;
+        const items = AppState.recepcion || [];
+        const activo = document.activeElement;
+        const nClientes = tabla.querySelectorAll('thead th.planilla-cli').length;
+        const escribiendo = el => el && el.matches && el.matches('.planilla-llego-input, .planilla-precio-input');
+
+        tabla.querySelectorAll('tr[data-producto-fila]').forEach(tr => {
+            const pid = tr.dataset.productoFila;
+            const tdLlego = tr.querySelector('.planilla-llego');
+            const tdPrecio = tr.querySelector('.planilla-precio-real');
+            const tdRec = tr.querySelector('.planilla-recepcion');
+            if (!tdLlego || !tdPrecio || !tdRec) return;
+            const subfilas = [...tabla.querySelectorAll(`tr[data-sub-de="${CSS.escape(pid)}"]`)];
+            // No se pisa el campo que la persona está escribiendo (ni en la fila ni en sus subfilas).
+            if (escribiendo(activo) && (tr.contains(activo) || subfilas.some(f => f.contains(activo)))) return;
+
+            subfilas.forEach(f => f.remove());
+            tdLlego.classList.remove('planilla-distinto');
+            const delProducto = items.filter(r => String(r.producto_id) === pid);
+            if (!delProducto.length) {
+                tdLlego.textContent = '';
+                tdPrecio.textContent = '';
+                tdRec.textContent = '';
+                return;
+            }
+
+            if (delProducto.length === 1) {
+                const h = this._htmlLlegada(delProducto[0], bloqueado);
+                tdLlego.innerHTML = h.llego;
+                tdPrecio.innerHTML = h.precio;
+                tdRec.innerHTML = h.rec;
+                tdLlego.classList.toggle('planilla-distinto', h.distinto);
+                Utils.enablePriceInputs(tdPrecio);
+                return;
+            }
+
+            // Más de un proveedor: la fila del producto resume, y cada proveedor tiene su subfila.
+            const suma = delProducto.reduce((t, r) => t + (Number(r.llego) || 0), 0);
+            const confirmados = delProducto.filter(r => r.confirmado === true || r.confirmado === 'true').length;
+            tdLlego.innerHTML = `<strong>${esc(Utils.formatCantidad(suma))}</strong> <span class="planilla-vacio">en total</span>`;
+            tdPrecio.textContent = '';
+            tdRec.innerHTML = `<span class="planilla-vacio">${confirmados} de ${delProducto.length} confirmados</span>`;
+            let ancla = tr;
+            delProducto.forEach(item => {
+                const h = this._htmlLlegada(item, bloqueado);
+                const pedido = Number(item.pedido_total) || 0;
+                const sub = document.createElement('tr');
+                sub.className = 'planilla-subfila';
+                sub.dataset.subDe = pid;
+                sub.innerHTML = `<th class="planilla-prod planilla-sub-nombre" scope="row">↳ ${esc(item.proveedor_nombre || 'Proveedor')}${item.extra ? ' <span class="planilla-kg" title="Proveedor agregado a mano">agregado</span>' : ''}</th>
+                    <td colspan="${nClientes}" class="planilla-sub-info">${item.extra ? 'Llegó de este proveedor' : `Pidió ${esc(Utils.formatCantidad(pedido))} a este proveedor`}</td>
+                    <td class="planilla-total"></td>
+                    <td class="planilla-llego${h.distinto ? ' planilla-distinto' : ''}">${h.llego}</td>
+                    <td class="planilla-precio-real">${h.precio}</td>
+                    <td></td><td></td><td></td>
+                    <td class="planilla-recepcion">${h.rec}</td>`;
+                ancla.after(sub);
+                ancla = sub;
+                Utils.enablePriceInputs(sub);
+            });
+        });
+        this._sincronizarSubfilas();
+    },
+
+    // Una subfila se ve o se oculta junto con la fila de su producto (filtros y búsqueda).
+    _sincronizarSubfilas() {
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        tabla.querySelectorAll('tr[data-sub-de]').forEach(sub => {
+            const padre = tabla.querySelector(`tr[data-producto-fila="${CSS.escape(sub.dataset.subDe)}"]`);
+            sub.hidden = !padre || padre.hidden;
+        });
+    },
+
+    // Totales, estados y botones sin rearmar las celdas (para no sacar el cursor de donde está).
+    _totales() {
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        const bloqueado = this._bloqueado();
+        let general = 0;
+        tabla.querySelectorAll('[data-total]').forEach(td => {
+            const total = this._cantidad(td.dataset.total);
+            general += total;
+            td.textContent = total > 0 ? Utils.formatCantidad(total) : '';
+        });
+        tabla.querySelectorAll('[data-total-cliente]').forEach(td => {
+            const total = (AppState.pedidos || []).filter(p => String(p.cliente_id) === td.dataset.totalCliente)
+                .reduce((s, p) => s + (parseFloat(p.cantidad) || 0), 0);
+            td.textContent = total > 0 ? Utils.formatCantidad(total) : '';
+        });
+        const tg = tabla.querySelector('[data-total-general]');
+        if (tg) tg.textContent = Utils.formatCantidad(general);
+        tabla.querySelectorAll('[data-estado]').forEach(td => {
+            const producto = (AppState.productos || []).find(p => String(p.id) === td.dataset.estado);
+            if (producto) td.innerHTML = this._estadoHtml(producto);
+            const tiene = this._pedidosDe(td.dataset.estado).length > 0;
+            td.parentElement.querySelectorAll('.planilla-acciones button').forEach(b => { b.disabled = !tiene || bloqueado; });
+        });
+        tabla.querySelectorAll('.planilla-celda').forEach(inp => {
+            inp.classList.toggle('con-valor', inp.value.trim() !== '');
+        });
+    },
+
+    _filtrar() {
+        const tabla = document.getElementById('planilla-pedidos');
+        if (!tabla) return;
+        tabla.querySelectorAll('tbody tr').forEach(tr => {
+            let ver = this.filtroTipo === 'todos' || tr.dataset.grupo === this.filtroTipo;
+            if (ver && tr.dataset.productoFila) {
+                if (this.texto && !String(tr.dataset.nombre || '').includes(this.texto)) ver = false;
+                if (this.soloPedidos && !this._pedidosDe(tr.dataset.productoFila).length) ver = false;
+            }
+            tr.hidden = !ver;
+        });
+        // Un grupo sin filas visibles no muestra su título.
+        tabla.querySelectorAll('tbody tr[data-grupo]:not([data-producto-fila])').forEach(tit => {
+            if (tit.hidden) return;
+            const hay = [...tabla.querySelectorAll(`tbody tr[data-producto-fila][data-grupo="${tit.dataset.grupo}"]`)].some(tr => !tr.hidden);
+            tit.hidden = !hay;
+        });
+        this._sincronizarSubfilas();
+        this._pintarVista();
+    },
+
+    _pintarGuardado() {
+        const el = document.getElementById('planilla-guardado');
+        if (!el) return;
+        const celdas = this._salida ? this._salida.size : 0;
+        const total = this._pendientes + celdas;
+        if (celdas > 0 && this._reintentos > 0) {
+            el.textContent = `Sin guardar: ${celdas} cambio(s). No se perdieron, se reintenta solo…`;
+        } else {
+            el.textContent = total > 0 ? `Guardando… (${total})` : 'Todo guardado';
+        }
+        el.classList.toggle('is-guardando', total > 0);
+    },
+
+    // Las escrituras van de a una, en orden: así dos celdas seguidas no compiten por la planilla.
+    _encolar(tarea) {
+        this._pendientes++;
+        this._pintarGuardado();
+        const fecha = AppState.currentDate;
+        const paso = this._cola.then(() => this._esperarSalida()).then(tarea).catch(error => {
+            console.error('Error guardando la planilla:', error);
+            Utils.showError('No se pudo guardar un cambio de la planilla: ' + (error && error.message || 'revisá la conexión') + '. Se vuelve a leer el día.');
+            if (AppState.currentDate === fecha) {
+                CacheManager.invalidate(`pedidos:${fecha}`);
+                DataLoader.invalidateFlujo(fecha);
+                AppState.fechaCargada = null;
+                Pedidos.load().catch(() => {});
+            }
+        }).finally(() => {
+            this._pendientes = Math.max(0, this._pendientes - 1);
+            this._pintarGuardado();
+            if (this._pendientes === 0) {
+                DiaOperativo.refreshSoon();
+                Pedidos.renderEnvioResumen();
+            }
+        });
+        this._cola = paso;
+        return paso;
+    },
+
+    pendientes() {
+        this._cargarSalida();
+        return this._salida.size;
+    },
+
+    esperarGuardado() {
+        const limite = new Promise((_, rechazar) => setTimeout(() => rechazar(
+            new Error('Hay cambios de la planilla que todavía no se guardaron. Esperá unos segundos y volvé a intentar.')), 40000));
+        return Promise.race([this._esperarSalida(), limite]).then(() => this._cola.catch(() => {}));
+    },
+
+    _guardarCache(fecha) {
+        CacheManager.set(`pedidos:${fecha}`, AppState.pedidos);
+        CacheManager.invalidate(`flujo:${fecha}`);
+        CacheManager.invalidatePattern('dashboard');
+        CacheManager.invalidatePattern('bootstrap:');
+        DataLoader.invalidateFlujo(fecha);
+    },
+
+    _aplicarCelda(fecha, productoId, clienteId, cantidad, proveedorId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === String(clienteId));
+        const actuales = this._pedidosDe(productoId, clienteId);
+        AppState.pedidos = (AppState.pedidos || []).filter(p => !actuales.includes(p));
+        if (cantidad > 0) {
+            const base = actuales[0] || {};
+            AppState.pedidos.push({
+                ...base,
+                id: base.id || ('local-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7)),
+                fecha,
+                cliente_id: clienteId,
+                producto_id: productoId,
+                cliente_nombre: cliente?.nombre || base.cliente_nombre || '',
+                producto_nombre: producto?.nombre || base.producto_nombre || '',
+                tipo: producto?.tipo || base.tipo || '',
+                cantidad,
+                proveedor_id: base.proveedor_id || proveedorId || '',
+                enviado: Number(base.cantidad) === cantidad && actuales.length === 1 ? base.enviado : false
+            });
+        }
+    },
+
+    _guardarCelda(input) {
+        const fecha = AppState.currentDate;
+        const productoId = input.dataset.producto;
+        const clienteId = input.dataset.cliente;
+        const kilo = input.dataset.kilo === '1';
+        let cantidad = input.value.trim() === '' ? 0 : Utils.parseCantidad(input.value);
+        if (!Number.isFinite(cantidad) || cantidad < 0) {
+            Utils.showError('Escribí un número válido.');
+            input.value = this._cantidad(productoId, clienteId) > 0 ? Utils.formatCantidad(this._cantidad(productoId, clienteId)) : '';
+            return;
+        }
+        if (!kilo) cantidad = Math.round(cantidad);
+        const antes = this._cantidad(productoId, clienteId);
+        input.value = cantidad > 0 ? Utils.formatCantidad(cantidad) : '';
+        if (cantidad === antes && this._pedidosDe(productoId, clienteId).length <= 1) return;
+
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        const prov = this._proveedorFila(producto || { id: productoId });
+        const proveedorId = prov.varios ? undefined : prov.id;
+        this._aplicarCelda(fecha, productoId, clienteId, cantidad, proveedorId);
+        this._totales();
+        Pedidos.renderEnvioResumen();
+
+        this._agregarALote({
+            fecha,
+            cliente_id: clienteId,
+            producto_id: productoId,
+            cantidad,
+            proveedor_id: proveedorId === PedidoProveedorService.SIN_PROVEEDOR_ID ? proveedorId : (proveedorId || undefined)
+        });
+    },
+
+    // ---- Cola de salida: ninguna celda escrita se pierde ----
+    // Cada celda que se escribe queda anotada en el navegador (sobrevive a recargar) y se manda al
+    // servidor en lotes. Si el servidor no responde o está ocupado, se reintenta sola con esperas
+    // cada vez más largas y lo escrito sigue a la vista. Nunca se vuelve a leer el día encima de
+    // lo que todavía no se guardó: al releer, las celdas pendientes se vuelven a poner arriba.
+    CLAVE_SALIDA: 'sg_cola_pedidos',
+    // Ventana fija desde la primera celda pendiente (no se reinicia con cada celda): lo que se escribe
+    // dentro de ella viaja junto, así varias personas cargando a la vez no saturan al servidor.
+    LOTE_ESPERA_MS: 4000,
+    LOTE_MAX: 20,
+    ESPERAS_MS: [2000, 4000, 8000, 15000, 30000],
+    _salida: null,
+    _seq: 0,
+    _enVuelo: false,
+    _reintentos: 0,
+    _timerEnvio: null,
+    _esperando: [],
+
+    _cargarSalida() {
+        if (this._salida) return;
+        this._salida = new Map();
+        try {
+            const guardado = JSON.parse(localStorage.getItem(this.CLAVE_SALIDA) || '[]');
+            (Array.isArray(guardado) ? guardado : []).forEach(c => {
+                if (!c || !c.fecha || !c.cliente_id || !c.producto_id) return;
+                this._seq = Math.max(this._seq, Number(c.seq) || 0);
+                this._salida.set(`${c.fecha}|${c.producto_id}|${c.cliente_id}`, c);
+            });
+        } catch (error) { /* sin almacenamiento o dato roto: se empieza vacía */ }
+    },
+
+    _guardarSalida() {
+        try {
+            if (this._salida && this._salida.size) localStorage.setItem(this.CLAVE_SALIDA, JSON.stringify([...this._salida.values()]));
+            else localStorage.removeItem(this.CLAVE_SALIDA);
+        } catch (error) { /* sin almacenamiento: queda en memoria */ }
+    },
+
+    _agregarALote(celda) {
+        this._cargarSalida();
+        this._salida.set(`${celda.fecha}|${celda.producto_id}|${celda.cliente_id}`, { ...celda, seq: ++this._seq });
+        this._guardarSalida();
+        this._pintarGuardado();
+        if (!this._timerEnvio) this._programarEnvio(this.LOTE_ESPERA_MS);
+    },
+
+    _programarEnvio(ms) {
+        clearTimeout(this._timerEnvio);
+        this._timerEnvio = setTimeout(() => this._enviarSalida(), ms);
+    },
+
+    // Se llama al abrir la app: si quedaron celdas sin guardar (se cerró la pestaña, se cortó internet), se mandan.
+    reanudar() {
+        this._cargarSalida();
+        if (!window.__colaPedidosEnganchada) {
+            window.__colaPedidosEnganchada = true;
+            window.addEventListener('online', () => { if (this._salida && this._salida.size) this._programarEnvio(0); });
+            // Al cambiar de pestaña, bloquear el celular o salir de la app, no se espera la ventana: se manda ya.
+            const mandarYa = () => { if (this._salida && this._salida.size) this._programarEnvio(0); };
+            document.addEventListener('visibilitychange', () => { if (document.hidden) mandarYa(); });
+            window.addEventListener('pagehide', mandarYa);
+            window.addEventListener('beforeunload', (e) => {
+                if (this._salida && this._salida.size) { e.preventDefault(); e.returnValue = ''; }
+            });
+        }
+        if (this._salida.size) {
+            this._pintarGuardado();
+            this._programarEnvio(500);
+        }
+    },
+
+    // Pone encima de lo que vino del servidor las celdas que todavía no se guardaron.
+    superponerPendientes() {
+        this._cargarSalida();
+        if (!this._salida.size) return;
+        const fecha = AppState.currentDate;
+        this._salida.forEach(c => {
+            if (c.fecha === fecha) this._aplicarCelda(fecha, c.producto_id, c.cliente_id, c.cantidad, c.proveedor_id);
+        });
+    },
+
+    // Errores que el servidor contestó y que reintentar no arregla.
+    _esPermanente(error) {
+        return !!(error && error.servidor && /ya est[aá] cerrado|Falta el d[ií]a|No hay celdas|demasiadas celdas/i.test(String(error.message || '')));
+    },
+
+    async _enviarSalida() {
+        clearTimeout(this._timerEnvio);
+        this._timerEnvio = null;
+        this._cargarSalida();
+        if (this._enVuelo || !this._salida.size) {
+            if (!this._salida.size) this._avisarSalidaVacia();
+            return;
+        }
+        this._enVuelo = true;
+        try {
+            while (this._salida.size) {
+                const todas = [...this._salida.values()];
+                const fecha = todas[0].fecha;
+                const tanda = todas.filter(c => c.fecha === fecha).slice(0, this.LOTE_MAX);
+                const quitar = () => {
+                    tanda.forEach(c => {
+                        const k = `${c.fecha}|${c.producto_id}|${c.cliente_id}`;
+                        const actual = this._salida.get(k);
+                        // Si la celda se volvió a tocar mientras viajaba, lo nuevo sigue pendiente.
+                        if (actual && actual.seq === c.seq) this._salida.delete(k);
+                    });
+                    this._guardarSalida();
+                };
+                let res;
+                try {
+                    res = await API.request('pedidos/celdas', 'POST', {
+                        fecha,
+                        celdas: tanda.map(({ cliente_id, producto_id, cantidad, proveedor_id }) => ({ cliente_id, producto_id, cantidad, proveedor_id }))
+                    });
+                } catch (error) {
+                    if (!this._esPermanente(error)) throw error;
+                    quitar();
+                    Utils.showError('No se pudieron guardar ' + tanda.length + ' celda(s): ' + error.message);
+                    this._releerDia(fecha);
+                    continue;
+                }
+                this._reintentos = 0;
+                quitar();
+                const resultados = res?.resultados || [];
+                this._aplicarResultados(fecha, resultados);
+                const fallos = resultados.filter(r => r.error);
+                if (fallos.length) {
+                    Utils.showError('No se pudo guardar ' + fallos.length + ' celda(s): ' + fallos[0].error);
+                    this._releerDia(fecha);
+                }
+                this._pintarGuardado();
+            }
+            this._avisarSalidaVacia();
+            DiaOperativo.refreshSoon();
+            Pedidos.renderEnvioResumen();
+            // Una cantidad que se pone en 0 borra el pedido (y al abrir Precios su línea); si después se
+            // vuelve a escribir, el pedido nuevo tiene que recuperar su línea de precio.
+            if (AppState.currentDate) API._revisarListaPrecios(AppState.currentDate);
+            this._refrescarLlegada();
+        } catch (error) {
+            // Sin conexión, servidor ocupado o error de Google: nada se pierde, se reintenta.
+            console.warn('Planilla: no se pudo guardar, se reintenta:', error);
+            this._reintentos++;
+            this._programarEnvio(this.ESPERAS_MS[Math.min(this._reintentos - 1, this.ESPERAS_MS.length - 1)]);
+        } finally {
+            this._enVuelo = false;
+            this._pintarGuardado();
+        }
+    },
+
+    _avisarSalidaVacia() {
+        this._esperando.splice(0).forEach(listo => listo());
+    },
+
+    // Resuelve cuando la cola de salida quedó vacía (todo guardado en el servidor).
+    _esperarSalida() {
+        this._cargarSalida();
+        if (!this._salida.size) return Promise.resolve();
+        this._programarEnvio(0);
+        return new Promise(listo => this._esperando.push(listo));
+    },
+
+    _releerDia(fecha) {
+        if (AppState.currentDate !== fecha) return;
+        CacheManager.invalidate(`pedidos:${fecha}`);
+        DataLoader.invalidateFlujo(fecha);
+        AppState.fechaCargada = null;
+        Pedidos.load().catch(() => {});
+    },
+
+    // Se reemplaza lo provisorio por lo que quedó guardado (sin pisar lo que todavía está pendiente).
+    _aplicarResultados(fecha, resultados) {
+        if (AppState.currentDate !== fecha) return;
+        resultados.forEach(r => {
+            if (r.error) return;
+            const eliminados = new Set((r.eliminados || []).map(String));
+            AppState.pedidos = (AppState.pedidos || []).filter(p => {
+                if (eliminados.has(String(p.id))) return false;
+                return !(String(p.producto_id) === String(r.producto_id) && String(p.cliente_id) === String(r.cliente_id));
+            });
+            if (r.pedido) {
+                AppState.pedidos.push({
+                    ...r.pedido,
+                    cliente_nombre: (AppState.clientes || []).find(c => String(c.id) === String(r.cliente_id))?.nombre || '',
+                    producto_nombre: (AppState.productos || []).find(p => String(p.id) === String(r.producto_id))?.nombre || ''
+                });
+            }
+        });
+        this.superponerPendientes();
+        this._guardarCache(fecha);
+        this._totales();
+    },
+
+    _cambiarProveedor(select) {
+        const fecha = AppState.currentDate;
+        const productoId = select.dataset.producto;
+        const proveedorId = select.value;
+        this._proveedorElegido[String(productoId)] = proveedorId;
+        const pedidos = this._pedidosDe(productoId);
+        if (!pedidos.length) return; // se usa cuando se cargue la primera cantidad
+        pedidos.forEach(p => {
+            if (String(p.proveedor_id || '') !== proveedorId) {
+                p.proveedor_id = proveedorId;
+                p.enviado = false;
+            }
+        });
+        this._totales();
+        Pedidos.renderEnvioResumen();
+        this._encolar(async () => {
+            await API.request('pedidos/proveedor-producto', 'POST', { fecha, producto_id: productoId, proveedor_id: proveedorId });
+            this._guardarCache(fecha);
+        });
+    },
+
+    // Editar: la cantidad de cada cliente y el proveedor de ese producto para el día.
+    editar(productoId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        if (!producto) return;
+        const esc = Utils.esc;
+        const kilo = this.esPorKilo(producto);
+        const clientes = this._todosLosClientes();
+        const prov = this._proveedorFila(producto);
+        const proveedores = Pedidos.getProveedoresActivos(AppState.proveedores || []);
+        const filas = clientes.map(c => {
+            const cant = this._cantidad(productoId, c.id);
+            return `<div class="planilla-editar-fila">
+                <label for="pe-${esc(c.id)}">${esc(c.nombre || 'Cliente')}</label>
+                <input type="text" class="form-control" id="pe-${esc(c.id)}" data-cliente="${esc(c.id)}" inputmode="${kilo ? 'decimal' : 'numeric'}" placeholder="0" value="${cant > 0 ? Utils.formatCantidad(cant) : ''}">
+            </div>`;
+        }).join('');
+        const content = `
+            <p class="modal-hint">Cantidad de cada cliente en ${kilo ? 'kilos (podés usar decimales, por ejemplo 12,5)' : 'bultos'}. Dejá vacío el cliente que no lo pidió.</p>
+            <div class="planilla-editar">${filas}</div>
+            <div class="form-group">
+                <label for="pe-proveedor">Proveedor</label>
+                <select id="pe-proveedor" class="form-control">
+                    ${prov.varios ? '<option value="" selected>Dejar como está (varios)</option>' : ''}
+                    <option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}"${prov.id === PedidoProveedorService.SIN_PROVEEDOR_ID ? ' selected' : ''}>Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${esc(p.id)}"${String(p.id) === prov.id ? ' selected' : ''}>${esc(p.nombre)}</option>`).join('')}
+                </select>
+            </div>`;
+        Utils.showModal(`Editar pedido · ${producto.nombre}`, content, () => {
+            const cambios = [];
+            for (const inp of document.querySelectorAll('.planilla-editar input[data-cliente]')) {
+                let cant = inp.value.trim() === '' ? 0 : Utils.parseCantidad(inp.value);
+                if (!Number.isFinite(cant) || cant < 0) {
+                    Utils.showError('Revisá las cantidades: tienen que ser números.');
+                    return true;
+                }
+                if (!kilo) cant = Math.round(cant);
+                if (cant !== this._cantidad(productoId, inp.dataset.cliente)) cambios.push({ clienteId: inp.dataset.cliente, cant });
+            }
+            const nuevoProv = document.getElementById('pe-proveedor').value;
+            if (nuevoProv && nuevoProv !== prov.id) {
+                const sel = document.getElementById(`planilla-prov-${productoId}`);
+                if (sel) { sel.value = nuevoProv; this._cambiarProveedor(sel); }
+                else this._proveedorElegido[String(productoId)] = nuevoProv;
+            }
+            cambios.forEach(({ clienteId, cant }) => {
+                const inp = document.getElementById(`planilla-${productoId}-${clienteId}`);
+                if (!inp) return;
+                inp.value = cant > 0 ? Utils.formatCantidad(cant) : '';
+                this._guardarCelda(inp);
+            });
+            if (cambios.length || (nuevoProv && nuevoProv !== prov.id)) Utils.avisar(`Pedido de ${producto.nombre} actualizado`);
+        }, 'Guardar');
+    },
+
+    async eliminar(productoId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        const pedidos = this._pedidosDe(productoId);
+        if (!producto || !pedidos.length) return;
+        const total = this._cantidad(productoId);
+        const quienes = [...new Set(pedidos.map(p => Utils.nombreCatalogo(p, 'cliente') || 'Cliente'))];
+        const ok = await Utils.showConfirm(`¿Eliminar el pedido de ${producto.nombre} de este día? Se borran ${Utils.formatCantidad(total)} ${this.esPorKilo(producto) ? 'kg' : 'bultos'} de ${quienes.length} cliente(s): ${quienes.join(', ')}.`);
+        if (!ok) return;
+        const fecha = AppState.currentDate;
+        AppState.pedidos = (AppState.pedidos || []).filter(p => String(p.producto_id) !== String(productoId));
+        this._redibujar = false;
+        this.render();
+        Pedidos.renderEnvioResumen();
+        this._encolar(async () => {
+            await API.request('pedidos/eliminar-producto', 'POST', { fecha, producto_id: productoId });
+            this._guardarCache(fecha);
+            Utils.avisar(`Pedido de ${producto.nombre} eliminado`);
+        });
+    }
+};
+
+// Proveedores (Gestión)
+const ProveedoresGestion = {
+    findById(id) {
+        return AppState.proveedores.find(p => String(p.id) === String(id));
+    },
+
+    initActions() {
+        const tbody = document.getElementById('proveedores-tbody');
+        if (!tbody || tbody.dataset.actionsBound === 'true') return;
+
+        tbody.dataset.actionsBound = 'true';
+        tbody.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-proveedor-action]');
+            if (!button || button.disabled) return;
+
+            const action = button.dataset.proveedorAction;
+            const id = button.dataset.proveedorId;
+
+            if (action === 'cuenta') {
+                CuentaCorriente.abrir('proveedor', id);
+            } else if (action === 'edit') {
+                this.edit(id);
+            } else if (action === 'toggle') {
+                this.toggleActivo(id, button.dataset.activo === 'true');
+            } else if (action === 'delete') {
+                this.delete(id);
+            }
+        });
+    },
+
+    async load() {
+        const tbody = document.getElementById('proveedores-tbody');
+        if (!tbody) return;
+
+        this.initActions();
+        const cached = CacheManager.peek('proveedores');
+        const hasStale = AppState.proveedores.length > 0 || cached;
+        if (hasStale) {
+            if (!AppState.proveedores.length && cached) AppState.proveedores = cached;
+            this.render();
+        } else {
+            Utils.showTableLoader(tbody);
+        }
+
+        try {
+            AppState.proveedores = await API.getProveedores();
+            this.render();
+        } catch (error) {
+            console.error('Error loading proveedores:', error);
+            if (!hasStale) Utils.hideTableLoader(tbody);
+            Utils.showError('Error al cargar proveedores');
+        }
+    },
+    
+    render() {
+        const tbody = document.getElementById('proveedores-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        
+        if (AppState.proveedores.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No hay proveedores registrados</td></tr>';
+            return;
+        }
+        
+        let rowsHtml = '';
+        
+        AppState.proveedores.forEach(proveedor => {
+            const esActivo = proveedor.activo === true || proveedor.activo === 'true' || proveedor.activo === 1;
+            const inactiveStyle = !esActivo ? ' style="opacity:0.6;background-color:#f8f9fa;"' : '';
+            
+            rowsHtml += `
+                <tr${inactiveStyle}>
+                    <td>${Utils.esc(proveedor.nombre || '')}</td>
+                    <td>${Utils.esc(proveedor.rubro || '')}</td>
+                    <td>${(proveedor.telefono && !String(proveedor.telefono).startsWith('#')) ? proveedor.telefono : '-'}</td>
+                    <td><span class="status-badge ${esActivo ? 'status-activo' : 'status-inactivo'}">${esActivo ? 'Activo' : 'Inactivo'}</span></td>
+                    <td>
+                        <button type="button" class="btn btn-secondary" data-proveedor-action="cuenta" data-proveedor-id="${proveedor.id}">Cuenta</button>
+                        <button type="button" class="btn btn-secondary" data-proveedor-action="edit" data-proveedor-id="${proveedor.id}">Editar</button>
+                        <button type="button" class="btn ${esActivo ? 'btn-secondary' : 'btn-primary'}" data-proveedor-action="toggle" data-proveedor-id="${proveedor.id}" data-activo="${esActivo}">${esActivo ? 'Desactivar' : 'Activar'}</button>
+                        <button type="button" class="btn btn-danger" data-proveedor-action="delete" data-proveedor-id="${proveedor.id}">Eliminar</button>
+                    </td>
+                </tr>
+            `;
+        });
+        
+        tbody.innerHTML = rowsHtml;
+    },
+    
+    async add() {
+        const content = `
+            <div class="form-group">
+                <label>Nombre del proveedor</label>
+                <input type="text" id="modal-proveedor-nombre" class="form-control" placeholder="Ej: Verdulería Central" required>
+            </div>
+            <div class="form-group">
+                <label>Rubro</label>
+                <select id="modal-proveedor-rubro" class="form-control" required>
+                    <option value="">Seleccionar...</option>
+                    <option value="Verdura">Verdura</option>
+                    <option value="Bebida">Bebida</option>
+                    <option value="Mixto">Mixto</option>
+                    <option value="Anexos">Anexos</option>
+                    <option value="Otro">Otro</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Teléfono (WhatsApp)</label>
+                <input type="tel" id="modal-proveedor-telefono" class="form-control" placeholder="Ej: 11 2345-6789">
+                <small>Necesario para enviar pedidos por WhatsApp</small>
+            </div>
+        `;
+        
+        Utils.showModal('Agregar proveedor', content, async () => {
+            const nombre = document.getElementById('modal-proveedor-nombre').value.trim();
+            const rubro = document.getElementById('modal-proveedor-rubro').value;
+            const telefono = document.getElementById('modal-proveedor-telefono').value.trim();
+            
+            if (!nombre || !rubro) {
+                Utils.showError('Complete todos los campos obligatorios');
+                return true;
+            }
+            
+            try {
+                const result = await API.createProveedor({
+                    nombre: nombre,
+                    rubro: rubro,
+                    telefono: telefono
+                });
+                const nuevo = {
+                    id: result.id,
+                    nombre,
+                    rubro,
+                    telefono,
+                    activo: true,
+                    saldo: 0,
+                    ...result
+                };
+                Utils.upsertInList(AppState.proveedores, nuevo);
+                CacheManager.set('proveedores', AppState.proveedores);
+                ProveedoresGestion.render();
+                Utils.showSuccess('Proveedor agregado correctamente');
+            } catch (error) {
+                console.error('Error creating proveedor:', error);
+                Utils.showError('Error al crear proveedor: ' + error.message);
+            }
+        });
+    },
+    
+    async edit(id) {
+        const proveedor = this.findById(id);
+        if (!proveedor) {
+            Utils.showError('Proveedor no encontrado');
+            return;
+        }
+        
+        const esActivo = proveedor.activo === true || proveedor.activo === 'true' || proveedor.activo === 1;
+
+        const content = `
+            <div class="form-group">
+                <label>Nombre del proveedor</label>
+                <input type="text" id="modal-proveedor-nombre" class="form-control" value="${Utils.esc(proveedor.nombre || '')}" required>
+            </div>
+            <div class="form-group">
+                <label>Rubro</label>
+                <select id="modal-proveedor-rubro" class="form-control" required>
+                    <option value="Verdura" ${proveedor.rubro === 'Verdura' ? 'selected' : ''}>Verdura</option>
+                    <option value="Bebida" ${proveedor.rubro === 'Bebida' ? 'selected' : ''}>Bebida</option>
+                    <option value="Mixto" ${proveedor.rubro === 'Mixto' ? 'selected' : ''}>Mixto</option>
+                    <option value="Anexos" ${proveedor.rubro === 'Anexos' ? 'selected' : ''}>Anexos</option>
+                    <option value="Otro" ${proveedor.rubro === 'Otro' ? 'selected' : ''}>Otro</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Teléfono (WhatsApp)</label>
+                <input type="tel" id="modal-proveedor-telefono" class="form-control" value="${Utils.esc(proveedor.telefono || '')}" placeholder="Ej: 11 2345-6789">
+                <small>Necesario para enviar pedidos por WhatsApp</small>
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="modal-proveedor-activo" ${esActivo ? 'checked' : ''}>
+                    Activo
+                </label>
+            </div>
+        `;
+        
+        Utils.showModal('Editar proveedor', content, async () => {
+            const nombre = document.getElementById('modal-proveedor-nombre').value.trim();
+            const rubro = document.getElementById('modal-proveedor-rubro').value;
+            const telefono = document.getElementById('modal-proveedor-telefono').value.trim();
+            const activo = document.getElementById('modal-proveedor-activo').checked;
+            
+            if (!nombre || !rubro) {
+                Utils.showError('Complete todos los campos obligatorios');
+                return true;
+            }
+
+            const anterior = { ...proveedor };
+            const cambios = Utils.cambiosDe(anterior, { nombre, rubro, telefono, activo });
+            if (!Object.keys(cambios).length) return;
+            const datos = { id, ...cambios };
+            Utils.upsertInList(AppState.proveedores, datos);
+            CacheManager.set('proveedores', AppState.proveedores);
+            ProveedoresGestion.render();
+            Utils.avisar('Proveedor actualizado');
+
+            Utils.enSegundoPlano(async () => {
+                await API.updateProveedor(id, { ...cambios });
+                CacheManager.set('proveedores', AppState.proveedores);
+            }, async (error) => {
+                if (API._esCorteDeConexion(error) && await API.verificarGuardado('proveedores', id, datos)) {
+                    AppState.proveedores = CacheManager.peek('proveedores') || AppState.proveedores;
+                    ProveedoresGestion.render();
+                    return;
+                }
+                Utils.upsertInList(AppState.proveedores, anterior);
+                CacheManager.set('proveedores', AppState.proveedores);
+                ProveedoresGestion.render();
+                Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo guardar el proveedor. Revisá la conexión y volvé a intentar.' : 'No se pudo guardar el proveedor: ' + error.message);
+            });
+        });
+    },
+    
+    async toggleActivo(id, activoActual) {
+        const proveedor = this.findById(id);
+        if (!proveedor) {
+            Utils.showError('Proveedor no encontrado');
+            return;
+        }
+
+        const activoBoolean = activoActual === true || activoActual === 'true' || activoActual === 1;
+        const nuevoEstado = !activoBoolean;
+        const accion = activoBoolean ? 'desactivar' : 'activar';
+        const confirmar = await Utils.showConfirm(`¿Está seguro de ${accion} este proveedor?`);
+        if (!confirmar) return;
+
+        const anterior = { ...proveedor };
+        Utils.upsertInList(AppState.proveedores, { id: proveedor.id, activo: nuevoEstado });
+        CacheManager.set('proveedores', AppState.proveedores);
+        this.render();
+        Utils.avisar(`Proveedor ${activoBoolean ? 'desactivado' : 'activado'}`);
+
+        Utils.enSegundoPlano(async () => {
+            await API.updateProveedor(proveedor.id, { activo: nuevoEstado });
+            CacheManager.set('proveedores', AppState.proveedores);
+        }, async (error) => {
+            if (API._esCorteDeConexion(error) && await API.verificarGuardado('proveedores', proveedor.id, { activo: nuevoEstado })) {
+                AppState.proveedores = CacheManager.peek('proveedores') || AppState.proveedores;
+                this.render();
+                return;
+            }
+            Utils.upsertInList(AppState.proveedores, anterior);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this.render();
+            Utils.showError(API._esCorteDeConexion(error) ? 'No se pudo cambiar el estado del proveedor. Revisá la conexión y volvé a intentar.' : 'No se pudo cambiar el estado del proveedor: ' + error.message);
+        });
+    },
+    
+    async delete(id) {
+        const proveedor = this.findById(id);
+        if (!proveedor) {
+            Utils.showError('Proveedor no encontrado');
+            return;
+        }
+        
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR permanentemente a "${proveedor.nombre}"?\n\nEsta acción NO se puede deshacer.\n\nSolo se puede eliminar si nunca tuvo pedidos, recepciones ni pagos. Si ya trabajó con él, usá Desactivar para conservar el historial.\n\n¿Desea continuar?`;
+        
+        const confirmar = await Utils.showConfirm(confirmMsg);
+        if (!confirmar) return;
+        
+        try {
+            await API.deleteProveedor(id);
+            Utils.removeFromList(AppState.proveedores, id);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this.render();
+            Utils.showSuccess('Proveedor eliminado correctamente');
+        } catch (error) {
+            console.error('Error deleting proveedor:', error);
+            Utils.showError('Error al eliminar proveedor: ' + error.message);
+        }
+    }
+};
+
+const Camiones = {
+    lista: [],
+    _guardando: null,
+    _avisoScript: false,
+
+    enganchar() {
+        const root = document.getElementById('camiones-root');
+        if (!root || root.dataset.listo === '1') return;
+        root.dataset.listo = '1';
+        root.addEventListener('click', (event) => {
+            const btn = event.target.closest('[data-accion]');
+            if (!btn) return;
+            const id = btn.dataset.camion;
+            if (btn.dataset.accion === 'quitar-cliente') this.quitarCliente(id, btn.dataset.cliente);
+            if (btn.dataset.accion === 'quitar-camion') this.quitar(id);
+            if (btn.dataset.accion === 'mover-dia') this.cambiarDeDia(id);
+            if (btn.dataset.accion === 'imprimir') this.imprimir(id);
+            if (btn.dataset.accion === 'excel') this.descargarExcel(id);
+            if (btn.dataset.accion === 'enviar') this.enviar(id);
+        });
+        root.addEventListener('change', (event) => {
+            const el = event.target;
+            if (el.dataset.accion === 'agregar-cliente') this.agregarCliente(el.dataset.camion, el.value);
+            if (el.dataset.accion === 'nombre') this.renombrar(el.dataset.camion, el.value);
+        });
+    },
+
+    async load() {
+        const root = document.getElementById('camiones-root');
+        if (!root) return;
+        const fecha = AppState.currentDate;
+        const token = (this._carga = (this._carga || 0) + 1);
+        this.lista = this._leerLocal(fecha);
+        const pedidosCache = CacheManager.peek(`pedidos:${fecha}`) || CacheManager.peek(`flujo:${fecha}`)?.pedidos;
+        if (Array.isArray(pedidosCache)) {
+            AppState.pedidos = pedidosCache;
+            AppState.fechaCargada = fecha;
+        }
+        this.render();
+
+        this._asegurarPedidos(fecha).then(() => {
+            if (this._carga !== token || AppState.currentDate !== fecha || AppState.currentPage !== 'camiones') return;
+            this.render();
+        }).catch(error => console.error('Error cargando pedidos del camión:', error));
+
+        API.getCamiones(fecha).then(remotos => {
+            if (this._carga !== token || AppState.currentDate !== fecha) return;
+            if (Array.isArray(remotos)) this._firmas[fecha] = this._firma(remotos);
+            if (Array.isArray(remotos) && remotos.length) {
+                this.lista = this._normalizar(remotos);
+                this._guardarLocal(fecha, this.lista);
+                if (AppState.currentPage === 'camiones') this.render();
+            } else if (this.lista.length && Array.isArray(remotos)) {
+                this._persistir(false);
+            }
+        }).catch(() => {});
+    },
+
+    async _asegurarPedidos(fecha) {
+        if (!AppState.clientes.length) {
+            AppState.clientes = CacheManager.get('clientes') || await API.getClientes().catch(() => []);
+        }
+        if (!AppState.productos.length) {
+            AppState.productos = CacheManager.get('productos') || await API.getProductos().catch(() => []);
+        }
+        if (!AppState.proveedores.length) {
+            AppState.proveedores = CacheManager.get('proveedores') || await API.getProveedores().catch(() => []);
+        }
+        const cached = CacheManager.get(`pedidos:${fecha}`) || CacheManager.get(`flujo:${fecha}`)?.pedidos;
+        if (Array.isArray(cached)) {
+            AppState.pedidos = cached;
+            return;
+        }
+        if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.pedidos = [];
+            return;
+        }
+        const flujo = await DataLoader.getFlujo(fecha);
+        if (AppState.currentDate !== fecha) return;
+        AppState.pedidos = flujo.pedidos || [];
+    },
+
+    _pedidos() {
+        const fecha = AppState.currentDate;
+        return (AppState.pedidos || []).filter(pedido => {
+            if (!pedido.fecha) return true;
+            return Utils.fechaIso(pedido.fecha) === fecha;
+        });
+    },
+
+    _clientesDelDia() {
+        const map = new Map();
+        this._pedidos().forEach(pedido => {
+            const id = String(pedido.cliente_id || '');
+            if (!id || map.has(id)) return;
+            map.set(id, Utils.nombreCatalogo(pedido, 'cliente'));
+        });
+        return [...map.entries()]
+            .map(([id, nombre]) => ({ id, nombre }))
+            .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    _nombreCliente(clienteId) {
+        const hit = this._clientesDelDia().find(c => c.id === String(clienteId));
+        if (hit) return hit.nombre;
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === String(clienteId));
+        return cliente?.nombre || '';
+    },
+
+    _clienteConocido(clienteId) {
+        return !!this._nombreCliente(clienteId);
+    },
+
+    _libres(exceptoCamionId) {
+        const enEste = new Set(
+            (this.lista.find(c => String(c.id) === String(exceptoCamionId))?.clientes || []).map(String)
+        );
+        return this._clientesDelDia().filter(c => !enEste.has(c.id)).map(cliente => {
+            const otro = this.lista.find(camion =>
+                String(camion.id) !== String(exceptoCamionId) &&
+                (camion.clientes || []).map(String).includes(cliente.id)
+            );
+            return { ...cliente, nota: otro ? `sale de ${otro.nombre}` : '' };
+        });
+    },
+
+    _sinCamion() {
+        const ocupados = new Set();
+        this.lista.forEach(camion => (camion.clientes || []).forEach(id => ocupados.add(String(id))));
+        return this._clientesDelDia().filter(c => !ocupados.has(c.id));
+    },
+
+    _filas(camion) {
+        const ids = new Set((camion.clientes || []).map(String).filter(id => this._clienteConocido(id)));
+        const grupos = new Map();
+        this._pedidos().forEach(pedido => {
+            const clienteId = String(pedido.cliente_id || '');
+            if (!ids.has(clienteId)) return;
+            const { nombreProveedor, proveedor } = Pedidos.resolverProveedorPedido(pedido);
+            const proveedorId = String(pedido.proveedor_id || proveedor?.id || '');
+            const key = [pedido.producto_id, proveedorId, clienteId].join('|');
+            if (!grupos.has(key)) {
+                const productoCat = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
+                grupos.set(key, {
+                    productoId: pedido.producto_id,
+                    producto: pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto'),
+                    tipo: String(productoCat?.tipo || pedido.tipo || '').toLowerCase(),
+                    clienteId,
+                    cliente: this._nombreCliente(clienteId),
+                    puesto: nombreProveedor,
+                    cantidad: 0
+                });
+            }
+            grupos.get(key).cantidad += parseFloat(pedido.cantidad) || 0;
+        });
+        // Mismo orden que la planilla de pedidos: verduras de la A a la Z, después frutas, bebidas, mercadería y el resto.
+        return [...grupos.values()].filter(fila => fila.cantidad > 0).sort((a, b) => {
+            const producto = Utils.compararProductos({ id: a.productoId, nombre: a.producto }, { id: b.productoId, nombre: b.producto });
+            if (producto) return producto;
+            const puesto = a.puesto.localeCompare(b.puesto, 'es');
+            if (puesto) return puesto;
+            return a.cliente.localeCompare(b.cliente, 'es');
+        });
+    },
+
+    _cant(valor) {
+        const numero = Math.round((parseFloat(valor) || 0) * 100) / 100;
+        if (!numero) return '';
+        return Number.isInteger(numero) ? String(numero) : String(numero);
+    },
+
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    _tabla(camion) {
+        const tieneClientes = (camion.clientes || []).some(id => this._clienteConocido(id));
+        const filas = this._filas(camion);
+        if (!tieneClientes) return '<p class="camion-vacio">Sumá los clientes que van en este camión.</p>';
+        if (!filas.length) return '<p class="camion-vacio">Esos clientes no tienen pedidos en este día.</p>';
+        const total = filas.reduce((sum, fila) => sum + fila.cantidad, 0);
+        const cuerpo = filas.map(fila => `
+            <tr>
+                <td>${this._esc(fila.producto)}</td>
+                <td>${this._esc(fila.cliente)}</td>
+                <td class="num"><strong>${this._cant(fila.cantidad)}</strong></td>
+                <td>${this._esc(fila.puesto)}</td>
+            </tr>
+        `).join('');
+        return `
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Producto</th>
+                            <th>Cliente</th>
+                            <th class="num">Cantidad</th>
+                            <th>Puesto</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${cuerpo}
+                        <tr>
+                            <td colspan="2"><strong>Total</strong></td>
+                            <td class="num"><strong>${this._cant(total)}</strong></td>
+                            <td></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        `;
+    },
+
+    render() {
+        const root = document.getElementById('camiones-root');
+        if (!root) return;
+        const clientes = this._clientesDelDia();
+        if (!clientes.length && !this.lista.length) {
+            root.innerHTML = '<p class="camion-vacio">No hay pedidos cargados para este día. Cargalos en Pedidos del día y volvé acá.</p>';
+            return;
+        }
+        const sueltos = this._sinCamion();
+        const aviso = sueltos.length
+            ? `<div class="camion-sin"><strong>Sin camión:</strong> ${sueltos.map(c => this._esc(c.nombre)).join(', ')}</div>`
+            : '';
+        if (!this.lista.length) {
+            root.innerHTML = aviso + '<p class="camion-vacio">Agregá un camión y sumale los clientes que van juntos.</p>';
+            return;
+        }
+        const tarjetas = this.lista.map(camion => {
+            const libres = this._libres(camion.id);
+            const chips = (camion.clientes || []).filter(id => this._clienteConocido(id)).map(id => `
+                <span class="camion-chip">${this._esc(this._nombreCliente(id))}
+                    <button type="button" data-accion="quitar-cliente" data-camion="${camion.id}" data-cliente="${id}" aria-label="Sacar cliente">×</button>
+                </span>
+            `).join('');
+            const opciones = libres.map(c => `<option value="${c.id}">${this._esc(c.nota ? `${Utils.esc(c.nombre)} · ${Utils.esc(c.nota)}` : c.nombre)}</option>`).join('');
+            return `
+                <article class="camion-card">
+                    <div class="camion-card-top">
+                        <input class="camion-nombre" data-accion="nombre" data-camion="${camion.id}" value="${this._esc(camion.nombre)}">
+                        <button class="btn btn-danger btn-sm" type="button" data-accion="quitar-camion" data-camion="${camion.id}">Quitar camión</button>
+                    </div>
+                    <div class="camion-clientes">
+                        ${chips || '<span>Sin clientes</span>'}
+                        <select class="form-control camion-agregar" data-accion="agregar-cliente" data-camion="${camion.id}">
+                            <option value="">Sumar cliente</option>
+                            ${opciones}
+                        </select>
+                    </div>
+                    ${this._tabla(camion)}
+                    <div class="camion-acciones">
+                        <button class="btn btn-secondary btn-sm" type="button" data-accion="mover-dia" data-camion="${camion.id}" title="Si el camión sale otro día, pasa sus pedidos a ese día">Cambiar de día</button>
+                        <button class="btn btn-secondary btn-sm" type="button" data-accion="imprimir" data-camion="${camion.id}">Imprimir</button>
+                        <button class="btn btn-secondary btn-sm" type="button" data-accion="excel" data-camion="${camion.id}">Excel</button>
+                        <button class="btn btn-whatsapp btn-sm" type="button" data-accion="enviar" data-camion="${camion.id}">WhatsApp</button>
+                    </div>
+                </article>
+            `;
+        }).join('');
+        root.innerHTML = aviso + `<div class="camion-lista">${tarjetas}</div>`;
+    },
+
+    // Si el camión sale otro día, sus pedidos van con él: se pasan los pedidos de sus clientes (y el camión) al día nuevo.
+    async cambiarDeDia(id) {
+        const camion = this.lista.find(c => String(c.id) === String(id));
+        if (!camion) return;
+        const desde = AppState.currentDate;
+        if (DiaOperativo.diaCerrado(desde)) return Utils.showError('Este día ya está cerrado: no se pueden mover sus pedidos.');
+        const clientes = (camion.clientes || []).map(String);
+        if (!clientes.length) return Utils.showError('Este camión todavía no tiene clientes.');
+        let pedidos = [];
+        try {
+            pedidos = ((await API.getPedidos(desde)) || []).filter(p => clientes.includes(String(p.cliente_id)));
+        } catch (error) {
+            return Utils.showError('No se pudieron leer los pedidos del día. Revisá la conexión.');
+        }
+        if (!pedidos.length) return Utils.showError('Los clientes de este camión no tienen pedidos en este día.');
+
+        const siguiente = new Date(desde + 'T12:00:00');
+        siguiente.setDate(siguiente.getDate() + 1);
+        const dos = n => String(n).padStart(2, '0');
+        const manana = `${siguiente.getFullYear()}-${dos(siguiente.getMonth() + 1)}-${dos(siguiente.getDate())}`;
+        const content = `
+            <p class="modal-hint"><strong>${this._esc(camion.nombre)}</strong>: ${clientes.length} cliente${clientes.length === 1 ? '' : 's'} y ${pedidos.length} pedido${pedidos.length === 1 ? '' : 's'} del ${Utils.formatDate(desde)}.</p>
+            <div class="form-group">
+                <label for="mover-dia-fecha">Pasarlos al día</label>
+                <input type="date" id="mover-dia-fecha" class="form-control" value="${manana}">
+            </div>
+            <small class="modal-hint">Se mueven los pedidos de esos clientes y el camión. Quedan pendientes de enviar al proveedor. Si ese día ya hay un pedido del mismo cliente y producto, se suman.</small>`;
+        Utils.showModal('Cambiar el camión de día', content, async () => {
+            const hasta = (document.getElementById('mover-dia-fecha') || {}).value || '';
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(hasta) || hasta === desde) {
+                Utils.showError('Elegí un día distinto del actual.');
+                throw new Error('Día inválido');
+            }
+            let resultado;
+            try {
+                resultado = await API.request('pedidos/mover', 'POST', { desde, hasta, cliente_ids: clientes, camion_id: camion.id });
+            } catch (error) {
+                Utils.showError(error && error.message ? error.message : 'No se pudieron mover los pedidos.');
+                throw error;
+            }
+            // Los dos días cambiaron: se descarta lo que se tenía guardado de ellos.
+            [desde, hasta].forEach(f => {
+                CacheManager.invalidate(`pedidos:${f}`);
+                CacheManager.invalidate(`flujo:${f}`);
+                CacheManager.invalidate(`precios:${f}`);
+                CacheManager.invalidate(`recepcion:${f}`);
+                DataLoader.invalidateFlujo(f);
+            });
+            API._invalidateFlujo();
+            AppState.fechaCargada = null;
+            this.lista = this.lista.filter(c => String(c.id) !== String(camion.id));
+            this._guardarLocal(desde, this.lista.map((c, index) => ({ id: c.id, nombre: c.nombre, orden: index + 1, clientes: c.clientes || [] })));
+            this._firmas[desde] = this._firma(this.lista);
+            try { localStorage.removeItem('sg_camiones:' + hasta); } catch (error) { /* sin almacenamiento */ }
+            delete this._firmas[hasta];
+            this.render();
+            DiaOperativo.refreshSoon();
+            const sumados = resultado && resultado.combinados ? ` (${resultado.combinados === 1 ? '1 se sumó' : resultado.combinados + ' se sumaron'} a pedidos que ya había)` : '';
+            Utils.showSuccess(`Se pasó ${this._esc(camion.nombre)} al ${Utils.formatDate(hasta)}: ${pedidos.length} pedido${pedidos.length === 1 ? '' : 's'}${sumados}. Elegí ese día para verlos.`);
+        }, 'Cambiar de día');
+    },
+
+    agregar() {
+        const numero = this.lista.length + 1;
+        this.lista.push({
+            id: 'c-' + Date.now(),
+            nombre: 'Camión ' + numero,
+            orden: numero,
+            clientes: []
+        });
+        this._persistir();
+    },
+
+    async quitar(id) {
+        const camion = this.lista.find(c => String(c.id) === String(id));
+        if (!camion) return;
+        const ok = await Utils.showConfirm(`¿Quitar ${camion.nombre}? Los clientes quedan sin camión.`);
+        if (!ok) return;
+        this.lista = this.lista.filter(c => String(c.id) !== String(id));
+        this._persistir();
+    },
+
+    renombrar(id, nombre) {
+        const camion = this.lista.find(c => String(c.id) === String(id));
+        if (!camion) return;
+        const limpio = String(nombre || '').trim();
+        if (!limpio) return;
+        camion.nombre = limpio;
+        this._persistir(false);
+    },
+
+    agregarCliente(camionId, clienteId) {
+        if (!clienteId) return;
+        const id = String(clienteId);
+        this.lista.forEach(camion => {
+            camion.clientes = (camion.clientes || []).map(String).filter(actual => actual !== id);
+        });
+        const camion = this.lista.find(c => String(c.id) === String(camionId));
+        if (!camion) return;
+        camion.clientes.push(id);
+        this._persistir();
+    },
+
+    quitarCliente(camionId, clienteId) {
+        const camion = this.lista.find(c => String(c.id) === String(camionId));
+        if (!camion) return;
+        camion.clientes = (camion.clientes || []).filter(id => String(id) !== String(clienteId));
+        this._persistir();
+    },
+
+    _normalizar(lista) {
+        return (lista || []).map((camion, index) => {
+            let clientes = camion.clientes;
+            if (typeof clientes === 'string') {
+                try { clientes = JSON.parse(clientes); } catch (error) { clientes = []; }
+            }
+            return {
+                id: camion.id || ('c-' + index),
+                nombre: camion.nombre || ('Camión ' + (index + 1)),
+                orden: Number(camion.orden) || index + 1,
+                clientes: Array.isArray(clientes) ? clientes.map(String) : []
+            };
+        });
+    },
+
+    _leerLocal(fecha) {
+        try {
+            const raw = localStorage.getItem('sg_camiones:' + fecha);
+            const data = raw ? JSON.parse(raw) : [];
+            return this._normalizar(Array.isArray(data) ? data : []);
+        } catch (error) {
+            return [];
+        }
+    },
+
+    _guardarLocal(fecha, lista) {
+        localStorage.setItem('sg_camiones:' + fecha, JSON.stringify(lista));
+    },
+
+    // Cómo estaban los camiones de cada día la última vez que se leyeron o guardaron. Al guardar se
+    // manda: si otra persona los cambió mientras tanto, el servidor no pisa su trabajo.
+    _firmas: {},
+    _cola: Promise.resolve(),
+
+    _firma(lista) {
+        return JSON.stringify((lista || []).map(c => [
+            String(c.id || ''),
+            String(c.nombre || ''),
+            (Array.isArray(c.clientes) ? c.clientes : []).map(String)
+        ]));
+    },
+
+    async _recargarPorCambioAjeno(fecha) {
+        const remotos = await API.getCamiones(fecha).catch(() => null);
+        if (!Array.isArray(remotos)) return;
+        this._firmas[fecha] = this._firma(remotos);
+        if (AppState.currentDate !== fecha) return;
+        this.lista = this._normalizar(remotos);
+        this._guardarLocal(fecha, this.lista);
+        if (AppState.currentPage === 'camiones') this.render();
+        Utils.showWarning('Otra persona cambió los camiones de este día mientras armabas los tuyos. Se actualizaron con lo último: revisalos y volvé a hacer tu cambio.');
+    },
+
+    _persistir(pintar = true) {
+        const fecha = AppState.currentDate;
+        const payload = this.lista.map((camion, index) => ({
+            id: camion.id,
+            nombre: camion.nombre,
+            orden: index + 1,
+            clientes: camion.clientes || []
+        }));
+        this._guardarLocal(fecha, payload);
+        if (pintar) this.render();
+        clearTimeout(this._guardando);
+        this._guardando = setTimeout(() => {
+            // De a uno: cada guardado usa la foto que dejó el anterior.
+            this._cola = this._cola.then(async () => {
+                Sync.escribiendo++;
+                try {
+                    const resultado = await API.guardarCamiones(fecha, payload, this._firmas[fecha]);
+                    if (resultado && Array.isArray(resultado.firma)) this._firmas[fecha] = JSON.stringify(resultado.firma);
+                } catch (error) {
+                    if (String(error && error.message || '').includes('CAMIONES_CAMBIADOS')) {
+                        await this._recargarPorCambioAjeno(fecha);
+                        return;
+                    }
+                    if (this._avisoScript) return;
+                    this._avisoScript = true;
+                    Utils.avisar('Quedó en esta compu. Publicá el script para verlo en otro dispositivo.');
+                } finally {
+                    Sync.escribiendo = Math.max(0, Sync.escribiendo - 1);
+                }
+            });
+        }, 400);
+    },
+
+    imprimir(camionId) {
+        const lista = camionId
+            ? this.lista.filter(c => String(c.id) === String(camionId))
+            : this.lista;
+        if (!lista.length) {
+            Utils.showError('Agregá un camión primero.');
+            return;
+        }
+        Utils.openPrintHtml(this._documento(lista));
+    },
+
+    imprimirTodos() {
+        this.imprimir(null);
+    },
+
+    // Excel de la hoja de carga: un libro con una hoja por camión, con el mismo diseño que el PDF
+    // (encabezado azul, filas alternadas, totales resaltados) y listo para imprimir en A4 apaisado.
+    async _cargarExcelJS() {
+        if (window.ExcelJS) return window.ExcelJS;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo cargar el generador de Excel'));
+            document.head.appendChild(script);
+        });
+        if (!window.ExcelJS) throw new Error('No se pudo cargar el generador de Excel');
+        return window.ExcelJS;
+    },
+
+    async descargarExcel(camionId) {
+        const lista = camionId
+            ? this.lista.filter(c => String(c.id) === String(camionId))
+            : this.lista;
+        if (!lista.length) {
+            Utils.showError('Agregá un camión primero.');
+            return;
+        }
+        try {
+            const ExcelJS = await this._cargarExcelJS();
+            const libro = new ExcelJS.Workbook();
+            libro.creator = 'Luciano Cargas';
+            const AZUL = 'FF1A73E8', AZUL_CLARO = 'FFE8F1FD', GRIS = 'FFF1F5F9', BORDE = 'FFCBD5E1', BLANCO = 'FFFFFFFF';
+            const relleno = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+            const borde = { bottom: { style: 'thin', color: { argb: BORDE } } };
+            const usados = new Set();
+
+            lista.forEach((camion, i) => {
+                const { clientes, productos, total } = this._matriz(camion);
+                const nombre = String(camion.nombre || `Camión ${i + 1}`).replace(/[\\/?*\[\]:]/g, ' ').trim().slice(0, 28) || `Camión ${i + 1}`;
+                let unico = nombre;
+                for (let n = 2; usados.has(unico.toLowerCase()); n++) unico = `${nombre} ${n}`;
+                usados.add(unico.toLowerCase());
+
+                const hoja = libro.addWorksheet(unico, {
+                    views: [{ state: 'frozen', ySplit: 4, showGridLines: false }],
+                    pageSetup: { paperSize: 9, orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 } }
+                });
+                const colTotal = clientes.length + 2;
+                const colProv = clientes.length + 3;
+                const ultima = colProv;
+                hoja.getColumn(1).width = 32;
+                clientes.forEach((_, k) => { hoja.getColumn(k + 2).width = 13; });
+                hoja.getColumn(colTotal).width = 11;
+                hoja.getColumn(colProv).width = 24;
+
+                // Título
+                hoja.mergeCells(1, 1, 1, ultima);
+                const titulo = hoja.getCell(1, 1);
+                titulo.value = `Luciano Cargas · Hoja de carga · ${camion.nombre}`;
+                titulo.font = { name: 'Calibri', size: 18, bold: true, color: { argb: BLANCO } };
+                titulo.fill = relleno(AZUL);
+                titulo.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+                hoja.getRow(1).height = 32;
+
+                hoja.mergeCells(2, 1, 2, ultima);
+                const fechaCelda = hoja.getCell(2, 1);
+                fechaCelda.value = `Fecha de carga: ${this._fechaHoja()}`;
+                fechaCelda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF475569' } };
+                fechaCelda.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+                hoja.getRow(2).height = 22;
+                hoja.getRow(3).height = 6;
+
+                // Encabezado de la tabla
+                const cabecera = hoja.getRow(4);
+                cabecera.values = ['Producto', ...clientes.map(c => c.nombre), 'Total', 'Proveedor'];
+                cabecera.height = 34;
+                cabecera.eachCell((celda, col) => {
+                    celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: BLANCO } };
+                    celda.fill = relleno(AZUL);
+                    celda.alignment = { vertical: 'middle', horizontal: col === 1 || col === colProv ? 'left' : 'center', wrapText: true, indent: col === 1 || col === colProv ? 1 : 0 };
+                });
+
+                // Filas de productos
+                if (!productos.length) {
+                    hoja.mergeCells(5, 1, 5, ultima);
+                    const vacia = hoja.getCell(5, 1);
+                    vacia.value = 'Este camión no tiene pedidos.';
+                    vacia.font = { name: 'Calibri', size: 12, italic: true, color: { argb: 'FF64748B' } };
+                    vacia.alignment = { horizontal: 'center', vertical: 'middle' };
+                    hoja.getRow(5).height = 28;
+                }
+                productos.forEach((row, k) => {
+                    const fila = hoja.getRow(5 + k);
+                    fila.values = [row.producto, ...clientes.map(c => row.cants[c.id] || null), row.total, row.puesto];
+                    fila.height = 24;
+                    fila.eachCell({ includeEmpty: true }, (celda, col) => {
+                        if (col > ultima) return;
+                        celda.fill = relleno(k % 2 ? GRIS : BLANCO);
+                        celda.border = borde;
+                        celda.font = { name: 'Calibri', size: 13, bold: col === 1 || col === colTotal || (col > 1 && col < colTotal), color: { argb: col === colTotal ? AZUL : 'FF0F172A' } };
+                        celda.alignment = { vertical: 'middle', horizontal: col === 1 || col === colProv ? 'left' : 'center', indent: col === 1 || col === colProv ? 1 : 0 };
+                        if (col === colTotal) { celda.fill = relleno(AZUL_CLARO); celda.font = { name: 'Calibri', size: 13, bold: true, color: { argb: AZUL } }; }
+                        if (col === colProv) celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF334155' } };
+                    });
+                });
+
+                // Total a cargar
+                const filaTotal = hoja.getRow(5 + Math.max(productos.length, 1) + 1);
+                filaTotal.height = 28;
+                hoja.mergeCells(filaTotal.number, 1, filaTotal.number, colTotal - 1);
+                const etiqueta = hoja.getCell(filaTotal.number, 1);
+                etiqueta.value = 'Total a cargar';
+                etiqueta.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+                etiqueta.fill = relleno(AZUL);
+                etiqueta.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+                const valor = hoja.getCell(filaTotal.number, colTotal);
+                valor.value = total;
+                valor.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+                valor.fill = relleno(AZUL);
+                valor.alignment = { vertical: 'middle', horizontal: 'center' };
+
+                // Al imprimir, el encabezado se repite en cada hoja.
+                hoja.pageSetup.printTitlesRow = '4:4';
+                hoja.headerFooter.oddFooter = '&CLuciano Cargas · &P de &N';
+            });
+
+            const buffer = await libro.xlsx.writeBuffer();
+            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const enlace = document.createElement('a');
+            enlace.href = url;
+            enlace.download = `hoja-de-carga-${AppState.currentDate || 'dia'}.xlsx`;
+            document.body.appendChild(enlace);
+            enlace.click();
+            enlace.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        } catch (error) {
+            console.error('Error armando el Excel de carga:', error);
+            Utils.showError('No se pudo armar el Excel: ' + error.message);
+        }
+    },
+
+    enviar(camionId) {
+        const lista = camionId
+            ? this.lista.filter(c => String(c.id) === String(camionId))
+            : this.lista;
+        if (!lista.length) {
+            Utils.showError('Agregá un camión primero.');
+            return;
+        }
+        if (lista.every(camion => !this._filas(camion).length)) {
+            Utils.showError('Esos camiones no tienen pedidos para enviar.');
+            return;
+        }
+        const titulo = lista.length === 1 ? lista[0].nombre : 'todos los camiones';
+        const content = `
+            <p class="modal-hint">Se arma un solo PDF de ${this._esc(titulo)}. Cada camión entra en una hoja: los productos van en filas, cada cliente en su columna, el total y el proveedor. Después se abre WhatsApp para enviarlo.</p>
+            <div class="form-group">
+                <label for="modal-camion-telefono">Teléfono de quien carga</label>
+                <input type="tel" id="modal-camion-telefono" class="form-control" placeholder="261...">
+            </div>
+        `;
+        Utils.showModal('Enviar hoja de carga', content, async () => {
+            const telefono = document.getElementById('modal-camion-telefono')?.value.trim();
+            if (!telefono) {
+                Utils.showError('Poné el teléfono.');
+                throw new Error('Falta teléfono');
+            }
+            await this._enviarPdf(lista, telefono);
+        }, 'Enviar PDF');
+    },
+
+    enviarTodos() {
+        this.enviar(null);
+    },
+
+    _fechaHoja() {
+        if (!AppState.currentDate) return '';
+        return new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR', {
+            weekday: 'long',
+            day: '2-digit',
+            month: 'long',
+            year: 'numeric'
+        });
+    },
+
+    _documento(lista) {
+        return this._htmlHoja(lista, true);
+    },
+
+    _porCliente(camion) {
+        const grupos = new Map();
+        this._filas(camion).forEach(fila => {
+            const cliente = fila.cliente || 'Cliente';
+            if (!grupos.has(cliente)) grupos.set(cliente, []);
+            grupos.get(cliente).push(fila);
+        });
+        return [...grupos.entries()].map(([cliente, items]) => ({
+            cliente,
+            items,
+            total: items.reduce((sum, fila) => sum + fila.cantidad, 0)
+        }));
+    },
+
+    _matriz(camion) {
+        const filas = this._filas(camion);
+        const clientes = [];
+        const vistos = new Set();
+        const sumarCliente = (id, nombre) => {
+            const clave = String(id || '');
+            if (!clave || vistos.has(clave)) return;
+            vistos.add(clave);
+            clientes.push({ id: clave, nombre: nombre || this._nombreCliente(clave) || 'Cliente' });
+        };
+        (camion.clientes || []).forEach(id => {
+            const clave = String(id);
+            if (filas.some(fila => fila.clienteId === clave)) sumarCliente(clave, this._nombreCliente(clave));
+        });
+        filas.forEach(fila => sumarCliente(fila.clienteId, fila.cliente));
+        const mapa = new Map();
+        filas.forEach(fila => {
+            const clave = `${fila.producto}\n${fila.puesto}`;
+            if (!mapa.has(clave)) {
+                mapa.set(clave, { producto: fila.producto, puesto: fila.puesto, cants: {} });
+            }
+            const row = mapa.get(clave);
+            row.cants[fila.clienteId] = (row.cants[fila.clienteId] || 0) + fila.cantidad;
+        });
+        const productos = [...mapa.values()].map(row => ({
+            ...row,
+            total: clientes.reduce((sum, cliente) => sum + (row.cants[cliente.id] || 0), 0)
+        }));
+        const total = productos.reduce((sum, row) => sum + row.total, 0);
+        return { clientes, productos, total };
+    },
+
+    // Letra grande y fija: si no entra en una hoja, sigue en la próxima (con el encabezado repetido).
+    // Cada hoja mide exactamente un A4 (794 × 1123 px) para que el PDF corte justo entre hojas.
+    FILAS_POR_HOJA: 30,
+
+    _htmlHoja(lista, imprimir) {
+        const fecha = this._fechaHoja();
+        const fechaCorta = AppState.currentDate
+            ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR')
+            : '';
+        const bloques = lista.map(camion => {
+            const { clientes, productos, total } = this._matriz(camion);
+            const cabeza = clientes.length > 8 ? 10 : 12;
+            const columnas = clientes.map(cliente => `<th class="cli">${this._esc(cliente.nombre)}</th>`).join('');
+            const paginas = [];
+            for (let i = 0; i < Math.max(productos.length, 1); i += this.FILAS_POR_HOJA) paginas.push(productos.slice(i, i + this.FILAS_POR_HOJA));
+            return paginas.map((filas, nPag) => {
+                const ultima = nPag === paginas.length - 1;
+                const cuerpo = productos.length
+                    ? filas.map((row, i) => {
+                        const celdas = clientes.map(cliente => `<td class="n">${this._esc(this._cant(row.cants[cliente.id] || 0))}</td>`).join('');
+                        return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td class="prod">${this._esc(row.producto)}</td>${celdas}<td class="tot">${this._esc(this._cant(row.total))}</td><td class="prov">${this._esc(row.puesto)}</td></tr>`;
+                    }).join('')
+                    : `<tr><td class="vacio" colspan="${clientes.length + 3}">Este camión no tiene pedidos.</td></tr>`;
+                const totales = ultima ? `
+                  <div class="totals-wrap">
+                    <table class="totals-table">
+                      <tr class="saldo">
+                        <td>Total a cargar</td>
+                        <td>${this._esc(this._cant(total))}</td>
+                      </tr>
+                    </table>
+                  </div>` : '<p class="sigue">Sigue en la próxima hoja →</p>';
+                return `
+            <section class="hoja" style="--cabeza:${cabeza}px;">
+              <div class="doc-header">
+                <div class="brand">
+                  <h1>Luciano Cargas</h1>
+                  <p>Hoja de carga</p>
+                </div>
+                <div class="doc-meta">
+                  <strong>Fecha de carga</strong>
+                  ${this._esc(fecha)}
+                </div>
+              </div>
+              <div class="camion-banner">
+                <div class="label">Camión</div>
+                <div class="name">${this._esc(camion.nombre)}</div>
+                ${paginas.length > 1 ? `<div class="pagina">Hoja ${nPag + 1} de ${paginas.length}</div>` : ''}
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th class="prod">Producto</th>
+                    ${columnas}
+                    <th class="tot">Total</th>
+                    <th class="prov">Proveedor</th>
+                  </tr>
+                </thead>
+                <tbody>${cuerpo}</tbody>
+              </table>
+              ${totales}
+              <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas · ${this._esc(fechaCorta)}</div>
+            </section>`;
+            }).join('');
+        }).join('');
+        const imprimirScript = imprimir
+            ? '<script>window.addEventListener("load", function(){ setTimeout(function(){ window.print(); }, 200); });<\/script>'
+            : '';
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Hoja de carga</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #1e293b; background: #fff; width: 794px; }
+                .hoja { width: 794px; height: 1123px; padding: 30px 28px 24px; overflow: hidden; position: relative; break-after: page; page-break-after: always; }
+                .hoja:last-child { break-after: auto; page-break-after: auto; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 22px; font-weight: 700; color: #1a73e8; letter-spacing: -0.3px; line-height: 1; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 3px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.35; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; }
+                .camion-banner { background: #1a73e8; color: #fff; padding: 7px 12px; border-radius: 6px; margin-bottom: 10px; display: flex; align-items: baseline; gap: 10px; }
+                .camion-banner .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; font-weight: 600; }
+                .camion-banner .name { font-size: 18px; font-weight: 700; }
+                .camion-banner .pagina { margin-left: auto; font-size: 13px; font-weight: 600; }
+                table { width: 100%; border-collapse: collapse; }
+                thead th { background: #1a73e8; color: #fff; text-align: center; font-weight: 700; line-height: 1.15; padding: 6px 3px; font-size: var(--cabeza, 12px); }
+                thead th.prod, thead th.prov { text-align: left; padding-left: 6px; text-transform: uppercase; letter-spacing: 0.03em; }
+                thead th.cli { white-space: normal; }
+                tbody td { padding: 0 4px; font-size: 15px; line-height: 1.1; border-bottom: 1px solid #cbd5e1; height: 27px; white-space: nowrap; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f1f5f9; }
+                td.prod { font-weight: 700; text-align: left; width: 190px; max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+                td.n { text-align: center; color: #0f172a; font-weight: 600; }
+                td.tot { text-align: center; width: 56px; font-weight: 800; color: #1a73e8; background: #e8f1fd; }
+                td.prov { text-align: left; font-weight: 600; padding-left: 6px; width: 130px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+                td.vacio { text-align: center; color: #64748b; padding: 12px; }
+                .totals-wrap { margin-top: 10px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 260px; border-collapse: collapse; }
+                .totals-table td { padding: 7px 10px; font-size: 16px; font-weight: 700; border: none; background: #1a73e8; color: #fff; }
+                .totals-table td:first-child { font-weight: 500; }
+                .totals-table td:last-child { text-align: right; }
+                .sigue { margin-top: 10px; text-align: right; font-size: 13px; color: #475569; font-weight: 600; }
+                .footer { position: absolute; left: 28px; right: 28px; bottom: 16px; padding-top: 4px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 10px; color: #94a3b8; }
+                @page { size: A4; margin: 0; }
+                @media print { body { width: auto; } }
+            </style></head><body>${bloques}${imprimirScript}</body></html>`;
+    },
+
+    async _cargarHtml2Canvas() {
+        if (window.html2canvas) return window.html2canvas;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo armar el PDF'));
+            document.head.appendChild(script);
+        });
+        if (!window.html2canvas) throw new Error('No se pudo armar el PDF');
+        return window.html2canvas;
+    },
+
+    async _pdfHoja(lista) {
+        const JsPDF = await Precios._cargarJsPdf();
+        const html2canvas = await this._cargarHtml2Canvas();
+        const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+        const pageW = doc.internal.pageSize.getWidth();
+        const pageH = doc.internal.pageSize.getHeight();
+        const camiones = lista.filter(camion => this._filas(camion).length);
+        const usar = camiones.length ? camiones : lista;
+        for (let i = 0; i < usar.length; i++) {
+            const marco = document.createElement('iframe');
+            marco.setAttribute('aria-hidden', 'true');
+            marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+            document.body.appendChild(marco);
+            const docMarco = marco.contentDocument;
+            docMarco.open();
+            docMarco.write(this._htmlHoja([usar[i]], false));
+            docMarco.close();
+            await new Promise(resolve => setTimeout(resolve, 60));
+            const alto = Math.max(docMarco.body.scrollHeight, 400);
+            marco.style.height = alto + 'px';
+            try {
+                const canvas = await html2canvas(docMarco.body, {
+                    scale: 2,
+                    backgroundColor: '#ffffff',
+                    windowWidth: 794,
+                    width: 794,
+                    height: alto,
+                    useCORS: true
+                });
+                doc.__lienzos = (doc.__lienzos || []).concat(canvas);
+                const img = canvas.toDataURL('image/jpeg', 0.92);
+                const imgH = canvas.height * pageW / canvas.width;
+                if (i > 0) doc.addPage();
+                let resto = imgH;
+                let posicion = 0;
+                doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                resto -= pageH;
+                while (resto > 8) {
+                    posicion -= pageH;
+                    doc.addPage();
+                    doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                    resto -= pageH;
+                }
+            } finally {
+                marco.remove();
+            }
+        }
+        return doc;
+    },
+
+    async _enviarPdf(lista, telefono) {
+        if (!WhatsAppService.normalizePhone(telefono)) {
+            Utils.showError('Ese teléfono no es válido para WhatsApp. Revisalo (ej.: 261 248 2292).');
+            return;
+        }
+        const texto = lista.length === 1
+            ? `Te mando la carga de ${lista[0].nombre}.`
+            : 'Te mando la carga de los camiones.';
+        let doc;
+        try {
+            doc = await this._pdfHoja(lista);
+        } catch (error) {
+            const JsPDF = await Precios._cargarJsPdf();
+            doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            lista.forEach((camion, indice) => {
+                if (indice > 0) doc.addPage();
+                this._dibujarPdf(doc, camion);
+            });
+        }
+        const nombre = lista.length === 1
+            ? `carga-${String(lista[0].nombre).replace(/[^\w\-]+/g, '-')}.pdf`
+            : 'carga-camiones.pdf';
+        const destinatario = lista.length === 1 ? `quien carga ${lista[0].nombre}` : 'quien carga los camiones';
+        await EnvioPdf.enviar({ telefono, texto, doc, nombre, destinatario });
+    },
+
+    async _compartirPdf(archivo, texto) {
+        if (!navigator.share) return 'no';
+        const datos = { files: [archivo], title: 'Hoja de carga', text: texto };
+        if (navigator.canShare && !navigator.canShare(datos)) return 'no';
+        try {
+            await navigator.share(datos);
+            return 'ok';
+        } catch (error) {
+            if (error && error.name === 'AbortError') return 'cancelado';
+            return 'no';
+        }
+    },
+
+    _dibujarPdf(doc, camion) {
+        const pageW = doc.internal.pageSize.getWidth();
+        const pageH = doc.internal.pageSize.getHeight();
+        const m = 14;
+        const ancho = pageW - (m * 2);
+        const matriz = this._matriz(camion);
+        const fecha = this._fechaHoja();
+        const azul = [26, 115, 232];
+        const tinta = [30, 41, 59];
+        const muted = [100, 116, 139];
+        const anchoClientes = Math.max(ancho - 92, 40);
+        const anchoCliente = matriz.clientes.length ? anchoClientes / matriz.clientes.length : anchoClientes;
+        const cols = [
+            { titulo: 'PRODUCTO', ancho: 52, align: 'left', valor: row => row.producto },
+            ...matriz.clientes.map(cliente => ({
+                titulo: cliente.nombre,
+                ancho: anchoCliente,
+                align: 'center',
+                valor: row => this._cant(row.cants[cliente.id] || 0)
+            })),
+            { titulo: 'TOTAL', ancho: 16, align: 'center', valor: row => this._cant(row.total) },
+            { titulo: 'PROVEEDOR', ancho: 24, align: 'left', valor: row => row.puesto }
+        ];
+
+        doc.setFillColor(...azul);
+        doc.rect(0, 0, pageW, 34, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(20);
+        doc.text('Luciano Cargas', m, 15);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(11);
+        doc.text('Hoja de carga', m, 23);
+        doc.setFontSize(10);
+        doc.text(String(fecha || ''), pageW - m, 14, { align: 'right' });
+        doc.text(String(camion.nombre || 'Camión'), pageW - m, 21, { align: 'right' });
+
+        doc.setFillColor(239, 246, 255);
+        doc.roundedRect(m, 42, ancho, 20, 2, 2, 'F');
+        doc.setFillColor(...azul);
+        doc.rect(m, 42, 1.6, 20, 'F');
+        doc.setTextColor(...muted);
+        doc.setFontSize(8);
+        doc.text('CAMIÓN', m + 6, 50);
+        doc.setTextColor(...tinta);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(14);
+        doc.text(String(camion.nombre || 'Camión'), m + 6, 57);
+
+        let y = 70;
+        const pintarCabeza = () => {
+            doc.setFillColor(...azul);
+            doc.rect(m, y, ancho, 9, 'F');
+            doc.setTextColor(255, 255, 255);
+            doc.setFont('helvetica', 'bold');
+            doc.setFontSize(8);
+            let x = m;
+            cols.forEach(col => {
+                const tx = col.align === 'center' ? x + (col.ancho / 2) : x + 3;
+                doc.text(col.titulo, tx, y + 6, { align: col.align === 'center' ? 'center' : 'left' });
+                x += col.ancho;
+            });
+            y += 9;
+        };
+        const pintarFila = (fila, indice) => {
+            if (y > pageH - 32) {
+                doc.addPage();
+                y = 16;
+                pintarCabeza();
+            }
+            if (indice % 2 === 1) {
+                doc.setFillColor(248, 250, 252);
+                doc.rect(m, y, ancho, 8, 'F');
+            }
+            doc.setDrawColor(226, 232, 240);
+            doc.line(m, y + 8, m + ancho, y + 8);
+            doc.setTextColor(...tinta);
+            doc.setFont('helvetica', 'normal');
+            doc.setFontSize(8);
+            let x = m;
+            cols.forEach(col => {
+                const texto = doc.splitTextToSize(String(col.valor(fila) || ''), Math.max(col.ancho - 2, 4))[0] || '';
+                const tx = col.align === 'center' ? x + (col.ancho / 2) : x + 1.5;
+                doc.text(texto, tx, y + 5.4, { align: col.align === 'center' ? 'center' : 'left' });
+                x += col.ancho;
+            });
+            y += 8;
+        };
+        pintarCabeza();
+        matriz.productos.forEach((fila, indice) => pintarFila(fila, indice));
+
+        const total = matriz.total;
+        y += 8;
+        doc.setFillColor(...azul);
+        doc.roundedRect(pageW - m - 74, y, 74, 12, 1.5, 1.5, 'F');
+        doc.setTextColor(255, 255, 255);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(12);
+        doc.text('Total a cargar', pageW - m - 70, y + 7.6);
+        doc.text(this._cant(total), pageW - m - 4, y + 7.6, { align: 'right' });
+
+        doc.setTextColor(...muted);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        doc.text('Documento generado por el Sistema de Gestión Luciano Cargas', pageW / 2, pageH - 10, { align: 'center' });
+    }
+};
+
+// Pedidos
+const Pedidos = {
+    async load() {
+        const tbody = document.getElementById('pedidos-tbody');
+        if (!tbody) return;
+
+        const fecha = AppState.currentDate;
+        const fresco = CacheManager.get(`pedidos:${fecha}`) || CacheManager.get(`flujo:${fecha}`)?.pedidos;
+        const cached = Array.isArray(fresco)
+            ? fresco
+            : (CacheManager.peek(`pedidos:${fecha}`) || CacheManager.peek(`flujo:${fecha}`)?.pedidos);
+        if (Array.isArray(cached)) {
+            AppState.pedidos = cached;
+            AppState.fechaCargada = fecha;
+            this.aplicarEnviadosLocales();
+            this.render();
+            if (Array.isArray(fresco)) return;
+        } else if (AppState.fechaCargada === fecha) {
+            this.aplicarEnviadosLocales();
+            this.render();
+            return;
+        } else if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.pedidos = [];
+            AppState.fechaCargada = fecha;
+            this.render();
+            return;
+        }
+
+        if (!Array.isArray(cached)) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">Buscando pedidos…</td></tr>';
+        }
+        this.ensureDatosProveedor().catch(() => {});
+
+        try {
+            const flujo = await DataLoader.getFlujo(fecha);
+            if (AppState.currentDate !== fecha) return;
+            AppState.pedidos = this._conservarPendientes(flujo.pedidos || []);
+            AppState.fechaCargada = fecha;
+            this.aplicarEnviadosLocales();
+            this.render();
+        } catch (error) {
+            console.error('Error loading pedidos:', error);
+            Utils.hideLoader(tbody);
+        }
+    },
+
+    _conservarPendientes(servidor) {
+        const lista = Array.isArray(servidor) ? servidor.slice() : [];
+        const ids = new Set(lista.map(pedido => String(pedido.id)));
+        (AppState.pedidos || []).forEach(pedido => {
+            if (!String(pedido.id).startsWith('local-')) return;
+            if (ids.has(String(pedido.id))) return;
+            lista.push(pedido);
+        });
+        return lista;
+    },
+
+    encontrarPedido(pedidoId) {
+        const id = String(pedidoId);
+        return (AppState.pedidos || []).find(pedido =>
+            String(pedido.id) === id || String(pedido.idLocal) === id
+        ) || null;
+    },
+    
+    render() {
+        const tbody = document.getElementById('pedidos-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        PlanillaPedidos.render();
+        
+        if (AppState.pedidos.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center;">No hay pedidos para el día de hoy</td></tr>';
+            this.renderEnvioResumen();
+            return;
+        }
+        
+        let rowsHtml = '';
+        
+        AppState.pedidos.forEach(pedido => {
+            const enviado = PedidoProveedorService.isEnviado(pedido);
+            const { proveedor, nombreProveedor } = this.resolverProveedorPedido(pedido);
+            const badgeEnvio = enviado
+                ? '<span class="status-badge status-activo">Enviado</span>'
+                : (this._sinProveedorAProposito(pedido)
+                    ? '<span class="status-badge status-inactivo">No se pide</span>'
+                    : '<span class="status-badge status-pendiente">Pendiente</span>');
+            const celdaProveedor = proveedor
+                ? nombreProveedor
+                : '<span class="pedido-proveedor-vacio">Sin proveedor</span>';
+            rowsHtml += `
+                <tr>
+                    <td data-label="Cliente">${Utils.nombreCatalogo(pedido, 'cliente')}</td>
+                    <td data-label="Producto">${Utils.esc(pedido.producto_nombre || '')}</td>
+                    <td data-label="Tipo">${pedido.tipo || ''}</td>
+                    <td data-label="Cantidad" class="money">${pedido.cantidad || 0}</td>
+                    <td data-label="Proveedor seleccionado">${celdaProveedor}</td>
+                    <td data-label="Pedido a proveedor">${badgeEnvio}</td>
+                    <td data-label="Acciones" class="pedidos-acciones">
+                        <button class="btn btn-secondary btn-sm" type="button" onclick="Pedidos.abrirAcciones('${pedido.id}')">Acciones</button>
+                    </td>
+                </tr>
+            `;
+        });
+        
+        tbody.innerHTML = rowsHtml;
+        this.renderEnvioResumen();
+    },
+
+    renderEnvioResumen() {
+        const box = document.getElementById('pedidos-envio-resumen');
+        const btn = document.getElementById('btn-guardar-pedidos');
+        const pedidos = AppState.pedidos || [];
+        if (!box) return;
+
+        if (pedidos.length === 0) {
+            box.hidden = true;
+            if (btn) {
+                btn.hidden = false;
+                btn.disabled = false;
+                btn.textContent = 'Enviar pendientes a proveedores';
+            }
+            return;
+        }
+
+        const grupos = {};
+        pedidos.forEach(pedido => {
+            if (this._sinProveedorAProposito(pedido)) return;
+            const { nombreProveedor } = this.resolverProveedorPedido(pedido);
+            const nombre = nombreProveedor || 'Sin proveedor';
+            if (!grupos[nombre]) grupos[nombre] = { enviados: 0, total: 0 };
+            grupos[nombre].total += 1;
+            if (PedidoProveedorService.isEnviado(pedido)) grupos[nombre].enviados += 1;
+        });
+
+        const enviados = Object.entries(grupos).filter(([, g]) => g.enviados > 0);
+        const pendientes = Object.entries(grupos).filter(([, g]) => g.enviados < g.total);
+        const nPendientes = pedidos.filter(p => !PedidoProveedorService.isEnviado(p) && !this._sinProveedorAProposito(p)).length;
+
+        const partesEnviados = enviados.map(([nombre, g]) =>
+            `${nombre} (${g.enviados} pedido${g.enviados === 1 ? '' : 's'})`
+        );
+        const partesPendientes = pendientes.map(([nombre, g]) =>
+            `${nombre} (${g.total - g.enviados})`
+        );
+
+        let html = '';
+        if (enviados.length) {
+            html += `<div class="pedidos-envio-ok">WhatsApp enviado a ${partesEnviados.join(', ')}.</div>`;
+        }
+        if (pendientes.length) {
+            html += `<div class="pedidos-envio-pendiente">Todavía falta enviar: ${partesPendientes.join(', ')}.</div>`;
+        } else {
+            html += '<div class="pedidos-envio-ok">Todos los pedidos del día ya se enviaron a los proveedores.</div>';
+        }
+        if (this._ultimosEnvios?.length) {
+            const ultimo = this._ultimosEnvios[0];
+            html += `<div class="pedidos-envio-ultimo">Último envío: ${ultimo.texto}</div>`;
+        }
+
+        box.innerHTML = html;
+        box.hidden = false;
+        box.className = 'pedidos-envio-resumen' + (nPendientes === 0 ? ' is-completo' : '');
+
+        if (btn) {
+            btn.hidden = nPendientes === 0;
+            btn.disabled = false;
+            btn.textContent = `Enviar pendientes a proveedores (${nPendientes})`;
+        }
+    },
+
+    registrarEnvio(nombreProveedor, cantidad, modo) {
+        this._ultimosEnvios = this._ultimosEnvios || [];
+        const hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+        const verbo = modo === 'auto' ? 'se envió WhatsApp' : 'se abrió WhatsApp';
+        this._ultimosEnvios.unshift({
+            texto: `${verbo} a ${nombreProveedor} con ${cantidad} pedido${cantidad === 1 ? '' : 's'} (${hora})`
+        });
+        this._ultimosEnvios = this._ultimosEnvios.slice(0, 3);
+    },
+
+    recordarEnviados(pedidosIds) {
+        this._enviadosLocales = this._enviadosLocales || new Set();
+        (pedidosIds || []).forEach(id => this._enviadosLocales.add(String(id)));
+    },
+
+    aplicarEnviadosLocales() {
+        if (!this._enviadosLocales?.size) return;
+        (AppState.pedidos || []).forEach(pedido => {
+            if (this._enviadosLocales.has(String(pedido.id))) {
+                pedido.enviado = true;
+            }
+        });
+    },
+    
+    async add(clienteIdPrevio = '') {
+        // Cargar datos en paralelo solo si es necesario
+        const promises = [];
+        
+        if (!AppState.clientes || AppState.clientes.length === 0) {
+            promises.push(API.getClientes().then(data => { AppState.clientes = data; }));
+        }
+        
+        if (!AppState.productos || AppState.productos.length === 0) {
+            promises.push(API.getProductos().then(data => { AppState.productos = data; }));
+        }
+
+        if (!AppState.proveedores?.length) {
+            const cache = CacheManager.peek('proveedores');
+            if (Array.isArray(cache)) AppState.proveedores = cache;
+            else promises.push(API.getProveedores().then(data => { AppState.proveedores = data; }));
+        }
+        
+        if (promises.length > 0) {
+            await Promise.all(promises);
+        }
+        
+        // Un cliente desactivado no recibe pedidos nuevos (si lo desactivaron, no se lo ofrece).
+        const esActivo = c => !(c.activo === false || c.activo === 'false' || c.activo === 0 || c.activo === '0');
+        const clientes = AppState.clientes.filter(esActivo);
+        const productos = AppState.productos;
+        const proveedores = this.getProveedoresActivos(AppState.proveedores);
+        
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <select id="modal-cliente" class="form-control">
+                    <option value="">Seleccionar...</option>
+                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(clienteIdPrevio) ? 'selected' : ''}>${Utils.esc(c.nombre)}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Producto</label>
+                <select id="modal-producto" class="form-control">
+                    <option value="">Seleccionar...</option>
+                    ${productos.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)} (${p.tipo})</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Proveedor</label>
+                <select id="modal-proveedor" class="form-control">
+                    <option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}">Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+                <small class="modal-hint">Al elegir el producto se marca su proveedor habitual. Podés cambiarlo para este pedido.</small>
+            </div>
+            <div class="form-group">
+                <label>Cantidad</label>
+                <input type="number" id="modal-cantidad" class="form-control" min="1" value="1">
+            </div>
+            <label class="check-seguir">
+                <input type="checkbox" id="modal-seguir-cargando">
+                Cargar otro pedido después de guardar
+            </label>
+        `;
+        
+        Utils.showModal('Agregar pedido', content, async () => {
+            try {
+                console.log('🔵 Iniciando creación de pedido...');
+                
+                const clienteId = document.getElementById('modal-cliente').value;
+                const productoId = document.getElementById('modal-producto').value;
+                const proveedorId = document.getElementById('modal-proveedor').value;
+                const cantidad = parseInt(document.getElementById('modal-cantidad').value);
+                
+                console.log('🔵 Datos del pedido:', { clienteId, productoId, proveedorId, cantidad });
+                
+                if (!clienteId || !productoId || !(cantidad >= 1)) {
+                    Utils.showError(!clienteId || !productoId ? 'Complete todos los campos' : 'La cantidad tiene que ser 1 o más');
+                    return true;
+                }
+                
+                const producto = productos.find(p => p.id == productoId);
+                
+                if (!producto) {
+                    Utils.showError('Producto no encontrado');
+                    return;
+                }
+                
+                const cliente = clientes.find(c => String(c.id) === String(clienteId));
+                const tempId = 'local-' + Date.now();
+                const nuevoPedido = {
+                    id: tempId,
+                    idLocal: tempId,
+                    fecha: AppState.currentDate,
+                    cliente_id: clienteId,
+                    producto_id: productoId,
+                    cliente_nombre: cliente?.nombre || '',
+                    producto_nombre: producto.nombre,
+                    tipo: producto.tipo,
+                    cantidad,
+                    proveedor_id: proveedorId,
+                    enviado: false
+                };
+                Utils.upsertInList(AppState.pedidos, nuevoPedido);
+                CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+                this.render();
+                Utils.avisar('Pedido agregado');
+                DiaOperativo.refreshSoon();
+
+                const seguirCargando = document.getElementById('modal-seguir-cargando')?.checked;
+                if (seguirCargando) {
+                    setTimeout(() => Pedidos.add(clienteId), 40);
+                }
+
+                const payload = {
+                    fecha: AppState.currentDate,
+                    cliente_id: clienteId,
+                    producto_id: productoId,
+                    tipo: producto.tipo,
+                    cantidad,
+                    proveedor_id: proveedorId
+                };
+                Utils.enSegundoPlano(async () => {
+                    const result = await API.createPedido(payload);
+                    const guardado = (AppState.pedidos || []).find(p => p.id === tempId);
+                    if (!guardado) return;
+                    guardado.id = result.id || tempId;
+                    guardado.idLocal = tempId;
+                    Object.assign(guardado, result, {
+                        cliente_nombre: nuevoPedido.cliente_nombre,
+                        producto_nombre: nuevoPedido.producto_nombre,
+                        tipo: nuevoPedido.tipo,
+                        cantidad,
+                        proveedor_id: proveedorId,
+                        id: result.id || tempId,
+                        idLocal: tempId
+                    });
+                    CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+                    if (AppState.currentPage === 'pedidos') this.render();
+                }, (error) => {
+                    Utils.removeFromList(AppState.pedidos, tempId);
+                    CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+                    if (AppState.currentPage === 'pedidos') Pedidos.render();
+                    Utils.showError('No se pudo guardar el pedido. Se quitó de la lista.'
+                        + (API._esCorteDeConexion(error) ? ' Revisá la conexión.' : ' ' + (error && error.message || '')));
+                });
+            } catch (error) {
+                console.error('❌ Error en creación de pedido:', error);
+                Utils.showError('Error al crear pedido: ' + error.message);
+            }
+        });
+
+        const productoSelect = document.getElementById('modal-producto');
+        const proveedorSelect = document.getElementById('modal-proveedor');
+        productoSelect?.addEventListener('change', () => {
+            const producto = productos.find(p => String(p.id) === String(productoSelect.value));
+            const habitual = producto?.proveedor_default || '';
+            if (!proveedorSelect) return;
+            proveedorSelect.value = [...proveedorSelect.options].some(opcion => opcion.value === String(habitual))
+                ? String(habitual)
+                : PedidoProveedorService.SIN_PROVEEDOR_ID;
+        });
+    },
+    
+    async edit(id) {
+        const pedido = this.encontrarPedido(id);
+        if (!pedido) {
+            Utils.showError('Pedido no encontrado');
+            return;
+        }
+        
+        if (!AppState.clientes?.length) AppState.clientes = await API.getClientes();
+        if (!AppState.productos?.length) AppState.productos = await API.getProductos();
+        // Se ofrecen los clientes activos y, si el pedido ya era de uno desactivado, también ese.
+        const clientes = AppState.clientes.filter(c => !(c.activo === false || c.activo === 'false' || c.activo === 0 || c.activo === '0') || String(c.id) === String(pedido.cliente_id));
+        const productos = AppState.productos;
+        await this.ensureDatosProveedor();
+        const proveedores = this.getProveedoresActivos(AppState.proveedores);
+        const productoActual = productos.find(p => String(p.id) === String(pedido.producto_id));
+        const proveedorActual = pedido.proveedor_id || productoActual?.proveedor_default || '';
+        
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <select id="modal-cliente" class="form-control">
+                    <option value="">Seleccionar...</option>
+                    ${clientes.map(c => `<option value="${c.id}" ${String(c.id) === String(pedido.cliente_id) ? 'selected' : ''}>${Utils.esc(c.nombre)}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Producto</label>
+                <select id="modal-producto" class="form-control">
+                    <option value="">Seleccionar...</option>
+                    ${productos.map(p => `<option value="${p.id}" ${String(p.id) === String(pedido.producto_id) ? 'selected' : ''}>${Utils.esc(p.nombre)} (${p.tipo})</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Cantidad</label>
+                <input type="number" id="modal-cantidad" class="form-control" min="1" value="${pedido.cantidad || 1}">
+            </div>
+            <div class="form-group">
+                <label>Proveedor</label>
+                <select id="modal-proveedor" class="form-control">
+                    <option value="${PedidoProveedorService.SIN_PROVEEDOR_ID}" ${proveedorActual === PedidoProveedorService.SIN_PROVEEDOR_ID || !proveedorActual ? 'selected' : ''}>Sin proveedor</option>
+                    ${proveedores.map(p => `<option value="${p.id}" ${String(p.id) === String(proveedorActual) ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+                <small class="modal-hint">El mismo producto puede pedirse a distintos proveedores. Este cambio vale solo para este pedido.</small>
+            </div>
+        `;
+        
+        Utils.showModal('Editar pedido', content, async () => {
+            const clienteId = document.getElementById('modal-cliente').value;
+            const productoId = document.getElementById('modal-producto').value;
+            const cantidad = parseInt(document.getElementById('modal-cantidad').value);
+            const proveedorId = document.getElementById('modal-proveedor').value;
+            
+            if (!clienteId || !productoId || !(cantidad >= 1)) {
+                Utils.showError(!clienteId || !productoId ? 'Complete todos los campos' : 'La cantidad tiene que ser 1 o más');
+                return true;
+            }
+            
+            const producto = productos.find(p => String(p.id) === String(productoId));
+            const cliente = clientes.find(c => String(c.id) === String(clienteId));
+            const anterior = { ...pedido };
+            // Solo se manda lo que cambió: si dos personas tocan el mismo pedido, no se pisan.
+            const cambios = Utils.cambiosDe(
+                { cliente_id: pedido.cliente_id, producto_id: pedido.producto_id, cantidad: pedido.cantidad, proveedor_id: proveedorActual },
+                { cliente_id: clienteId, producto_id: productoId, cantidad, proveedor_id: proveedorId }
+            );
+            if (!Object.keys(cambios).length) return;
+            if (cambios.producto_id !== undefined) cambios.tipo = producto?.tipo || pedido.tipo;
+            Object.assign(pedido, {
+                cliente_id: clienteId,
+                producto_id: productoId,
+                tipo: producto?.tipo || pedido.tipo,
+                cantidad,
+                proveedor_id: proveedorId,
+                cliente_nombre: cliente?.nombre || pedido.cliente_nombre,
+                producto_nombre: producto?.nombre || pedido.producto_nombre
+            });
+            CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
+            this.render();
+            Utils.avisar('Pedido actualizado');
+
+            Utils.enSegundoPlano(async () => {
+                await API.updatePedido(id, { fecha: pedido.fecha, ...cambios });
+                CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
+            }, () => {
+                Object.assign(pedido, anterior);
+                CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, AppState.pedidos);
+                if (AppState.currentPage === 'pedidos') Pedidos.render();
+                Utils.showError('No se pudo actualizar el pedido.');
+            });
+        });
+    },
+    
+    async delete(id) {
+        const pedido = this.encontrarPedido(id);
+        if (!pedido) return;
+        const idReal = pedido.id;
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        const confirmar = await Utils.showConfirm('¿Está seguro de eliminar este pedido?');
+        if (!confirmar) return;
+        
+        const anterior = { ...pedido };
+        Utils.removeFromList(AppState.pedidos, idReal);
+        CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+        this.render();
+        Utils.avisar('Pedido eliminado');
+        DiaOperativo.refreshSoon();
+
+        if (String(idReal).startsWith('local-')) return;
+
+        Utils.enSegundoPlano(() => API.deletePedido(idReal), () => {
+            if (anterior) Utils.upsertInList(AppState.pedidos, anterior);
+            CacheManager.set(`pedidos:${AppState.currentDate}`, AppState.pedidos);
+            if (AppState.currentPage === 'pedidos') Pedidos.render();
+            Utils.showError('No se pudo eliminar el pedido.');
+        });
+    },
+    
+    async save() {
+        await this.enviarPendientes();
+    },
+
+    async enviarPendientes() {
+        try {
+            // Lo que se acaba de escribir en la planilla tiene que estar guardado antes de pedírselo al proveedor.
+            await PlanillaPedidos.esperarGuardado();
+            await this.ensureDatosProveedor();
+            const pendientes = (AppState.pedidos || []).filter(p => !PedidoProveedorService.isEnviado(p) && !this._sinProveedorAProposito(p));
+            if (pendientes.length === 0) {
+                Utils.showInfo('No hay pedidos pendientes de enviar a proveedores.');
+                return;
+            }
+
+            const grupos = {};
+            pendientes.forEach(pedido => {
+                const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido.producto_id));
+                const proveedorId = pedido.proveedor_id || producto?.proveedor_default || PedidoProveedorService.SIN_PROVEEDOR_ID;
+                if (!grupos[proveedorId]) grupos[proveedorId] = [];
+                grupos[proveedorId].push(pedido);
+            });
+
+            const bloques = Object.keys(grupos).map(proveedorId => {
+                const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+                const nombre = proveedor?.nombre || 'Sin proveedor asignado';
+                const items = this._totalesPorProducto(grupos[proveedorId]).map(linea => `
+                    <li><strong>${Utils.esc(linea.producto)} × ${Utils.formatCantidad(linea.total)}${linea.kilo ? ' kg' : ''}</strong>
+                        <small class="modal-hint">${linea.detalle.map(d => `${Utils.esc(d.cliente)} ${Utils.formatCantidad(d.cantidad)}`).join(' · ')}</small></li>
+                `).join('');
+                const sinTelefono = !proveedor || !proveedor.telefono;
+                return `
+                    <div class="proveedor-pendiente">
+                        <strong>${nombre}</strong>
+                        <ul>${items}</ul>
+                        <button type="button" class="btn btn-primary btn-sm" data-enviar-proveedor="${proveedorId}" ${sinTelefono ? 'disabled' : ''}>
+                            ${sinTelefono ? 'Falta teléfono' : 'Enviar WhatsApp'}
+                        </button>
+                    </div>
+                `;
+            }).join('');
+
+            Utils.showModal('Enviar pedidos pendientes', `<div class="proveedores-pendientes">${bloques}</div><p class="modal-hint">El pago al proveedor se registra después, en Pagar al proveedor.</p>`, null);
+
+            document.querySelectorAll('[data-enviar-proveedor]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const proveedorId = btn.getAttribute('data-enviar-proveedor');
+                    await Utils.withButtonLoader(btn, () => this.enviarGrupoProveedor(proveedorId, grupos[proveedorId]), 'Enviando...');
+                });
+            });
+        } catch (error) {
+            this.handleProveedorError(error);
+        }
+    },
+
+    async enviarGrupoProveedor(proveedorId, pedidosGrupo) {
+        const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+        if (!proveedor || !proveedor.telefono) {
+            Utils.showError('Ese proveedor no tiene teléfono.');
+            return;
+        }
+
+        const mensaje = PedidoProveedorService.construirMensaje(proveedor.nombre, this._itemsMensaje(pedidosGrupo));
+        const modo = await WhatsAppService.sendOrOpen(proveedor.telefono, mensaje, API, AppState.whatsappAutoEnvio);
+        const ids = pedidosGrupo.map(p => p.id);
+        this.recordarEnviados(ids);
+        this.registrarEnvio(proveedor.nombre, pedidosGrupo.length, modo);
+        await PedidoProveedorService.persistirMarcado(ids, {
+            pedidos: AppState.pedidos,
+            productos: AppState.productos,
+            proveedores: AppState.proveedores,
+            api: API,
+            cacheManager: CacheManager,
+            appState: AppState
+        });
+        DataLoader.invalidateFlujo(AppState.currentDate);
+        await this.load();
+        document.getElementById('modal-overlay')?.classList.remove('active');
+    },
+
+    _productoDe(pedido) {
+        return (AppState.productos || []).find(p => String(p.id) === String(pedido?.producto_id)) || null;
+    },
+
+    _itemsMensaje(pedidos) {
+        return (pedidos || []).map(pedido => {
+            const producto = this._productoDe(pedido);
+            return {
+                producto: pedido.producto_nombre || producto?.nombre || 'Producto',
+                cantidad: PlanillaPedidos.esPorKilo(producto) ? `${Utils.formatCantidad(pedido.cantidad)} kg` : pedido.cantidad
+            };
+        });
+    },
+
+    // Un renglón por producto con el total del día y de quién es cada parte.
+    _totalesPorProducto(pedidos) {
+        const porProducto = {};
+        (pedidos || []).forEach(pedido => {
+            const producto = this._productoDe(pedido);
+            const key = String(pedido.producto_id);
+            if (!porProducto[key]) {
+                porProducto[key] = {
+                    producto: pedido.producto_nombre || producto?.nombre || 'Producto',
+                    kilo: PlanillaPedidos.esPorKilo(producto),
+                    total: 0,
+                    detalle: []
+                };
+            }
+            const cantidad = parseFloat(pedido.cantidad) || 0;
+            porProducto[key].total = Math.round((porProducto[key].total + cantidad) * 100) / 100;
+            porProducto[key].detalle.push({ cliente: Utils.nombreCatalogo(pedido, 'cliente') || 'Cliente', cantidad });
+        });
+        return Object.values(porProducto).sort((a, b) => a.producto.localeCompare(b.producto, 'es'));
+    },
+
+    // Los pedidos del día del mismo producto y del mismo proveedor que este: se le piden juntos.
+    // Para un envío nuevo, solo los que faltan mandar; para reenviar, los ya mandados.
+    _grupoMismoProducto(pedido) {
+        const enviado = PedidoProveedorService.isEnviado(pedido);
+        const proveedorDe = p => String(p.proveedor_id || this._productoDe(p)?.proveedor_default || '');
+        const proveedor = proveedorDe(pedido);
+        const grupo = (AppState.pedidos || []).filter(p =>
+            String(p.producto_id) === String(pedido.producto_id) &&
+            PedidoProveedorService.isEnviado(p) === enviado &&
+            proveedorDe(p) === proveedor
+        );
+        return grupo.some(p => String(p.id) === String(pedido.id)) ? grupo : [pedido, ...grupo];
+    },
+
+    // Solo se guarda el proveedor en los pedidos que tenían otro: cada cambio es una ida al servidor.
+    async _asignarProveedorAlGrupo(grupo, proveedorId) {
+        for (const p of grupo) {
+            const actual = String(p.proveedor_id || this._productoDe(p)?.proveedor_default || '');
+            if (actual !== String(proveedorId)) await this.guardarProveedorDelPedido(p, proveedorId);
+        }
+    },
+
+    getProveedoresActivos(proveedores) {
+        return (proveedores || []).filter(p =>
+            p.activo === true || p.activo === 'true' || p.activo === 1
+        );
+    },
+
+    resolverProveedorPedido(pedido) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(pedido?.producto_id));
+        const proveedorId = pedido?.proveedor_id || producto?.proveedor_default || '';
+        const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+        return {
+            producto,
+            proveedor,
+            nombreProveedor: proveedor?.nombre || 'Sin proveedor'
+        };
+    },
+
+    abrirAcciones(pedidoId) {
+        const pedido = this.encontrarPedido(pedidoId);
+        if (!pedido) {
+            Utils.showError('Pedido no encontrado');
+            return;
+        }
+
+        const enviado = PedidoProveedorService.isEnviado(pedido);
+        const { nombreProveedor } = this.resolverProveedorPedido(pedido);
+        const cliente = Utils.nombreCatalogo(pedido, 'cliente');
+        const producto = pedido.producto_nombre || 'Producto';
+        const cantidad = pedido.cantidad || 0;
+        const estadoHtml = enviado
+            ? '<span class="status-badge status-activo">Pedido realizado</span>'
+            : '<span class="status-badge status-pendiente">Pendiente de enviar</span>';
+
+        const botones = [];
+        if (!enviado) {
+            botones.push(`<button type="button" class="btn btn-primary" onclick="Pedidos.seleccionarProveedor('${pedido.id}')">Seleccionar proveedor</button>`);
+        } else {
+            botones.push(`<button type="button" class="btn btn-secondary" onclick="Pedidos.reSeleccionarProveedor('${pedido.id}')">Reenviar WhatsApp</button>`);
+        }
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="Pedidos.cambiarProveedor('${pedido.id}')">Cambiar proveedor</button>`);
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="Pedidos.edit('${pedido.id}')">Editar pedido</button>`);
+        botones.push(`<button type="button" class="btn btn-danger" onclick="Pedidos.delete('${pedido.id}')">Eliminar pedido</button>`);
+
+        const content = `
+            <div class="pedido-acciones-resumen">
+                <div class="pedido-acciones-resumen-top">
+                    <strong>${cliente}</strong>
+                    <div class="pedido-acciones-badges">${estadoHtml}</div>
+                </div>
+                <p>${producto} × ${cantidad}</p>
+                <p class="pedido-acciones-proveedor">Proveedor: ${nombreProveedor}</p>
+            </div>
+            <div class="pedido-acciones-lista">
+                ${botones.join('')}
+            </div>
+        `;
+
+        Utils.showModal('Acciones del pedido', content, null);
+        const cancelBtn = document.getElementById('modal-cancel');
+        if (cancelBtn) cancelBtn.textContent = 'Cerrar';
+    },
+
+    handleProveedorError(error) {
+        if (error instanceof PedidoProveedorError) {
+            if (error.code === 'ALREADY_MARKED') {
+                Utils.showWarning(error.message);
+            } else {
+                Utils.showError(error.message);
+            }
+            return;
+        }
+
+        if (error instanceof WhatsAppError) {
+            Utils.showError(error.message);
+            return;
+        }
+
+        Utils.showError('Error al enviar pedido: ' + error.message);
+    },
+
+    async ensureDatosProveedor() {
+        const promises = [];
+
+        if (!AppState.productos?.length) {
+            promises.push(API.getProductos().then(data => { AppState.productos = data; }));
+        }
+        if (!AppState.proveedores?.length) {
+            promises.push(API.getProveedores().then(data => { AppState.proveedores = data; }));
+        }
+        if (AppState.whatsappAutoEnvio === undefined) {
+            promises.push(
+                API.getWhatsAppStatus()
+                    .catch(() => ({ autoEnvioActivo: false }))
+                    .then(status => {
+                        AppState.whatsappAutoEnvio = !!status.autoEnvioActivo;
+                        AppState.whatsappModo = status.modo || 'manual';
+                    })
+            );
+        }
+
+        if (promises.length > 0) {
+            await Promise.all(promises);
+        }
+    },
+
+    async seleccionarProveedor(pedidoId) {
+        try {
+            await this.ensureDatosProveedor();
+
+            const pedido = this.encontrarPedido(pedidoId);
+            if (!pedido) {
+                Utils.showError('Pedido no encontrado');
+                return;
+            }
+
+            if (PedidoProveedorService.isEnviado(pedido)) {
+                Utils.showWarning('Este pedido ya fue enviado al proveedor');
+                return;
+            }
+
+            this.abrirModalEnviarPedido(pedido, 'seleccionar');
+        } catch (error) {
+            console.error('Error en Pedidos.seleccionarProveedor():', error);
+            this.handleProveedorError(error);
+        }
+    },
+
+    // Cambia el proveedor de un pedido sin mandar nada. "Sin proveedor" queda guardado a propósito:
+    // ese pedido no se le pide a nadie y no cuenta como pendiente de enviar.
+    async cambiarProveedor(pedidoId) {
+        try {
+            await this.ensureDatosProveedor();
+            const pedido = this.encontrarPedido(pedidoId);
+            if (!pedido) {
+                Utils.showError('Pedido no encontrado');
+                return;
+            }
+            const SIN = PedidoProveedorService.SIN_PROVEEDOR_ID;
+            const producto = this._productoDe(pedido);
+            const actual = String(pedido.proveedor_id || producto?.proveedor_default || SIN);
+            const proveedores = this.getProveedoresActivos(AppState.proveedores);
+            const opciones = [`<option value="${SIN}" ${actual === SIN ? 'selected' : ''}>Sin proveedor</option>`]
+                .concat(proveedores.map(p => `<option value="${p.id}" ${String(p.id) === actual ? 'selected' : ''}>${Utils.esc(p.nombre)}</option>`));
+            const content = `
+                <p><strong>${Utils.esc(Utils.nombreCatalogo(pedido, 'cliente'))}</strong> — ${Utils.esc(pedido.producto_nombre || producto?.nombre || 'Producto')} × ${pedido.cantidad || 0}</p>
+                <div class="form-group">
+                    <label for="modal-cambiar-proveedor">Proveedor</label>
+                    <select id="modal-cambiar-proveedor" class="form-control">${opciones.join('')}</select>
+                    <small class="modal-hint">Elegí "Sin proveedor" si este pedido no se le pide a nadie. Vale solo para este pedido.</small>
+                </div>
+            `;
+            Utils.showModal('Cambiar proveedor', content, async () => {
+                const elegido = document.getElementById('modal-cambiar-proveedor').value;
+                if (elegido === actual) return;
+                await this.guardarProveedorDelPedido(pedido, elegido);
+                this.render();
+                const nombre = elegido === SIN
+                    ? 'sin proveedor'
+                    : (proveedores.find(p => String(p.id) === elegido)?.nombre || 'el proveedor elegido');
+                Utils.showSuccess(`El pedido quedó con ${nombre}.`);
+            }, 'Guardar');
+        } catch (error) {
+            console.error('Error en Pedidos.cambiarProveedor():', error);
+            this.handleProveedorError(error);
+        }
+    },
+
+    _sinProveedorAProposito(pedido) {
+        return String(pedido?.proveedor_id || '') === PedidoProveedorService.SIN_PROVEEDOR_ID;
+    },
+
+    async reSeleccionarProveedor(pedidoId) {
+        try {
+            await this.ensureDatosProveedor();
+
+            const pedido = this.encontrarPedido(pedidoId);
+            if (!pedido) {
+                Utils.showError('Pedido no encontrado');
+                return;
+            }
+
+            if (!PedidoProveedorService.isEnviado(pedido)) {
+                Utils.showWarning('Primero tenés que marcar el pedido como realizado');
+                return;
+            }
+
+            this.abrirModalEnviarPedido(pedido, 'reSeleccionar');
+        } catch (error) {
+            console.error('Error en Pedidos.reSeleccionarProveedor():', error);
+            this.handleProveedorError(error);
+        }
+    },
+
+    actualizarPreviewModalProveedor(proveedorId, pedido) {
+        const previewItems = document.getElementById('modal-pedido-preview-items');
+        const previewMensaje = document.getElementById('modal-pedido-preview-mensaje');
+        const hint = document.getElementById('modal-pedido-proveedor-hint');
+        const saveBtn = document.getElementById('modal-save');
+        if (!previewItems || !previewMensaje || !pedido) return;
+
+        const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+        const producto = AppState.productos.find(p => String(p.id) === String(pedido.producto_id));
+        const productoNombre = pedido.producto_nombre || producto?.nombre || '-';
+
+        if (!proveedorId || !proveedor) {
+            previewItems.innerHTML = '<p class="modal-hint">Seleccioná un proveedor.</p>';
+            previewMensaje.value = '';
+            if (hint) hint.textContent = '';
+            if (saveBtn) saveBtn.disabled = true;
+            return;
+        }
+
+        const sinTelefono = !proveedor.telefono || !String(proveedor.telefono).trim();
+        if (hint) {
+            hint.textContent = sinTelefono
+                ? 'Este proveedor no tiene teléfono. Configuralo en Proveedores.'
+                : proveedor.telefono;
+        }
+
+        if (saveBtn) saveBtn.disabled = sinTelefono;
+
+        const grupo = this._grupoMismoProducto(pedido);
+        const [linea] = this._totalesPorProducto(grupo);
+        previewItems.innerHTML = `
+            <p class="modal-hint">Se le pide el total del día de ${Utils.esc(productoNombre)}${grupo.length > 1 ? ` (${grupo.length} pedidos)` : ''}.</p>
+            <table class="modal-pedido-detalle-table">
+                <thead>
+                    <tr>
+                        <th>Cliente</th>
+                        <th>Producto</th>
+                        <th>Cantidad</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${linea.detalle.map(d => `
+                    <tr>
+                        <td>${Utils.esc(d.cliente)}</td>
+                        <td>${Utils.esc(productoNombre)}</td>
+                        <td>${d.cantidad}</td>
+                    </tr>`).join('')}
+                    <tr>
+                        <td><strong>Total del día</strong></td>
+                        <td></td>
+                        <td><strong>${linea.total}</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+        `;
+
+        previewMensaje.value = PedidoProveedorService.construirMensaje(proveedor.nombre, this._itemsMensaje(grupo));
+    },
+
+    bindModalProveedorEvents(proveedorDefault, pedido) {
+        const select = document.getElementById('modal-pedido-proveedor');
+        if (select) {
+            select.value = proveedorDefault;
+            select.addEventListener('change', () => this.actualizarPreviewModalProveedor(select.value, pedido));
+        }
+
+        this.actualizarPreviewModalProveedor(proveedorDefault, pedido);
+    },
+
+    async guardarProveedorDelPedido(pedido, proveedorId) {
+        await API.updatePedido(pedido.id, { fecha: pedido.fecha, proveedor_id: proveedorId });
+        pedido.proveedor_id = proveedorId;
+        const lista = AppState.pedidos || [];
+        const local = lista.find(p => String(p.id) === String(pedido.id));
+        if (local) local.proveedor_id = proveedorId;
+        CacheManager.set(`pedidos:${pedido.fecha || AppState.currentDate}`, lista);
+    },
+
+    abrirModalEnviarPedido(pedido, modo = 'seleccionar') {
+        const esReSeleccion = modo === 'reSeleccionar';
+        const proveedoresActivos = this.getProveedoresActivos(AppState.proveedores);
+        if (proveedoresActivos.length === 0) {
+            Utils.showError('No hay proveedores activos. Agregá proveedores en Configuración.');
+            return;
+        }
+
+        const producto = AppState.productos.find(p => String(p.id) === String(pedido.producto_id));
+
+        const proveedorElegido = pedido.proveedor_id || producto?.proveedor_default || '';
+        const proveedorDefault = proveedorElegido &&
+            proveedoresActivos.some(p => String(p.id) === String(proveedorElegido))
+            ? proveedorElegido
+            : proveedoresActivos[0].id;
+
+        const saveLabel = esReSeleccion
+            ? (AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp')
+            : (AppState.whatsappAutoEnvio ? 'Enviar WhatsApp y marcar' : 'Abrir WhatsApp y marcar');
+
+        const modalTitle = esReSeleccion ? 'Re seleccionar proveedor' : 'Enviar pedido a proveedor';
+
+        const content = `
+            <div class="form-group">
+                <label>Proveedor</label>
+                <select id="modal-pedido-proveedor" class="form-control">
+                    ${proveedoresActivos.map(p =>
+                        `<option value="${p.id}">${Utils.esc(p.nombre)}${p.telefono ? ` (${Utils.esc(p.telefono)})` : ''}</option>`
+                    ).join('')}
+                </select>
+                <small id="modal-pedido-proveedor-hint" class="modal-hint"></small>
+            </div>
+            <div class="form-group">
+                <label>Detalle del pedido</label>
+                <div id="modal-pedido-preview-items" class="modal-pedido-preview-box"></div>
+            </div>
+            <div class="form-group">
+                <label>Mensaje de WhatsApp</label>
+                <textarea id="modal-pedido-preview-mensaje" class="whatsapp-preview form-control" rows="6"></textarea>
+            </div>
+        `;
+
+        Utils.showModal(modalTitle, content, async () => {
+            const proveedorId = document.getElementById('modal-pedido-proveedor').value;
+            const mensaje = document.getElementById('modal-pedido-preview-mensaje').value.trim();
+
+            if (!proveedorId) {
+                Utils.showError('Seleccioná un proveedor');
+                throw new Error('Proveedor requerido');
+            }
+
+            if (!mensaje) {
+                Utils.showError('Escribí un mensaje para WhatsApp');
+                throw new Error('Mensaje requerido');
+            }
+
+            if (esReSeleccion) {
+                await this.ejecutarReSeleccionProveedor(proveedorId, pedido, mensaje);
+            } else {
+                await this.ejecutarEnvioProveedor(proveedorId, pedido, mensaje);
+            }
+        }, saveLabel);
+
+        this.bindModalProveedorEvents(proveedorDefault, pedido);
+    },
+
+    async ejecutarReSeleccionProveedor(proveedorId, pedido, mensaje) {
+        try {
+            const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+
+            if (!proveedor) {
+                throw new PedidoProveedorError('Proveedor no encontrado.', 'NO_PROVEEDOR');
+            }
+
+            if (!proveedor.telefono || !String(proveedor.telefono).trim()) {
+                throw new PedidoProveedorError(
+                    `El proveedor "${proveedor.nombre}" no tiene teléfono configurado.`,
+                    'NO_PHONE'
+                );
+            }
+
+            const grupo = this._grupoMismoProducto(pedido);
+            const modoEnvio = await WhatsAppService.sendOrOpen(
+                proveedor.telefono,
+                mensaje,
+                API,
+                AppState.whatsappAutoEnvio
+            );
+            await this._asignarProveedorAlGrupo(grupo, proveedorId);
+
+            this.recordarEnviados(grupo.map(p => p.id));
+            this.registrarEnvio(proveedor.nombre, grupo.length, modoEnvio);
+            DataLoader.invalidateFlujo(AppState.currentDate);
+            await this.load();
+
+            const mensajeExito = modoEnvio === 'auto'
+                ? `WhatsApp reenviado a ${proveedor.nombre}.`
+                : `WhatsApp abierto para ${proveedor.nombre}. Proveedor actualizado.`;
+
+            Utils.showSuccess(mensajeExito);
+        } catch (error) {
+            this.handleProveedorError(error);
+            throw error;
+        }
+    },
+
+    async ejecutarEnvioProveedor(proveedorId, pedido, mensaje) {
+        try {
+            const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+
+            if (!proveedor) {
+                throw new PedidoProveedorError('Proveedor no encontrado.', 'NO_PROVEEDOR');
+            }
+
+            if (!proveedor.telefono || !String(proveedor.telefono).trim()) {
+                throw new PedidoProveedorError(
+                    `El proveedor "${proveedor.nombre}" no tiene teléfono configurado.`,
+                    'NO_PHONE'
+                );
+            }
+
+            const grupo = this._grupoMismoProducto(pedido);
+
+            const context = {
+                pedidos: AppState.pedidos,
+                productos: AppState.productos,
+                proveedores: AppState.proveedores,
+                api: API,
+                cacheManager: CacheManager,
+                appState: AppState
+            };
+
+            const modoEnvio = await WhatsAppService.sendOrOpen(
+                proveedor.telefono,
+                mensaje,
+                API,
+                AppState.whatsappAutoEnvio
+            );
+
+            await this._asignarProveedorAlGrupo(grupo, proveedorId);
+            const ids = grupo.map(p => p.id);
+            this.recordarEnviados(ids);
+            this.registrarEnvio(proveedor.nombre, ids.length, modoEnvio);
+            await PedidoProveedorService.persistirMarcado(ids, context);
+            DataLoader.invalidateFlujo(AppState.currentDate);
+            await this.load();
+        } catch (error) {
+            this.handleProveedorError(error);
+            throw error;
+        }
+    }
+};
+
+// Recepción
+const Recepcion = {
+    vista: 'hoy',
+    _actionsBound: false,
+    // Filtro por proveedor: con muchos productos, se confirma lo de un proveedor sin recorrer toda la lista.
+    _filtroProveedor: '',
+    // Búsqueda por nombre de producto. Solo oculta filas (no redibuja), así no se pierde lo que ya se escribió en Llegó y Precio real.
+    _filtroProducto: '',
+
+    _normalizarBusqueda(texto) {
+        return String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    },
+
+    filtrarProducto(valor) {
+        this._filtroProducto = this._normalizarBusqueda(valor);
+        this._aplicarFiltroProducto();
+    },
+
+    _aplicarFiltroProducto() {
+        const tbody = document.getElementById('recepcion-tbody');
+        if (!tbody) return;
+        let visible = true;
+        let mostrados = 0;
+        tbody.querySelectorAll('tr').forEach(tr => {
+            if (!tr.classList.contains('recepcion-detalle')) {
+                visible = !this._filtroProducto || (tr.dataset.nombre || '').includes(this._filtroProducto);
+                if (visible) mostrados += 1;
+            }
+            tr.classList.toggle('fila-oculta', !visible);
+        });
+        const cuenta = document.getElementById('recepcion-filtro-cuenta');
+        if (!cuenta) return;
+        const total = (AppState.recepcion || []).length;
+        const filtrando = this._filtroProveedor || this._filtroProducto;
+        cuenta.textContent = filtrando
+            ? (mostrados ? `Mostrando ${mostrados} de ${total} productos` : 'Ningún producto coincide con la búsqueda')
+            : '';
+    },
+
+    _proveedorDe(item) {
+        return String(item.proveedor_id || '') || 'sin-proveedor';
+    },
+
+    filtrarProveedor(valor) {
+        this._filtroProveedor = String(valor || '');
+        this.render();
+    },
+
+    _pintarFiltroProveedor() {
+        const select = document.getElementById('recepcion-filtro-proveedor');
+        if (!select) return;
+        const vistos = new Map();
+        (AppState.recepcion || []).forEach(item => {
+            const id = this._proveedorDe(item);
+            if (!vistos.has(id)) vistos.set(id, { nombre: item.proveedor_nombre || 'Sin proveedor', total: 0, pendientes: 0 });
+            const v = vistos.get(id);
+            v.total += 1;
+            if (!(item.confirmado === true || item.confirmado === 'true')) v.pendientes += 1;
+        });
+        // Si el proveedor elegido ya no está en este día, se vuelve a "Todos".
+        if (this._filtroProveedor && !vistos.has(this._filtroProveedor)) this._filtroProveedor = '';
+        const opciones = [...vistos.entries()].sort((a, b) => a[1].nombre.localeCompare(b[1].nombre, 'es'));
+        select.innerHTML = '<option value="">Todos los proveedores</option>' + opciones.map(([id, v]) =>
+            `<option value="${Utils.esc(id)}">${Utils.esc(v.nombre)} (${v.pendientes ? v.pendientes + ' sin confirmar' : 'todo confirmado'})</option>`
+        ).join('');
+        select.value = this._filtroProveedor;
+    },
+
+    _visibles() {
+        // En el mismo orden en que se cargó el pedido (planilla de pedidos).
+        const lista = (AppState.recepcion || []).slice()
+            .sort((a, b) => Utils.compararProductos({ id: a.producto_id, nombre: a.producto_nombre }, { id: b.producto_id, nombre: b.producto_nombre }));
+        if (!this._filtroProveedor) return lista;
+        return lista.filter(item => this._proveedorDe(item) === this._filtroProveedor);
+    },
+
+    // ---- Cuánto de lo que llegó le toca a cada cliente ----
+    // Por defecto se reparte en proporción a lo pedido; se puede ajustar a mano cliente por cliente
+    // (por ejemplo, "este vino de menos: se lo descuento a uno solo").
+    _pedidosDia: [],
+    _pedidosDiaFecha: '',
+
+    // Vista "planilla": una tabla tipo Excel con los clientes en columnas y lo que le toca a cada uno cargado a mano.
+    // Solo en pantallas anchas (por debajo de 1100px la tabla se ve como tarjetas y no entra).
+    get _planilla() {
+        let guardado = true;
+        try { guardado = localStorage.getItem('recepcion-vista') !== 'simple'; } catch (e) { /* sin almacenamiento */ }
+        return guardado && window.matchMedia('(min-width: 1101px)').matches;
+    },
+
+    // Tamaño de la planilla (zoom) y pantalla completa: para ver todos los clientes sin desplazarse.
+    get _zoom() {
+        let z = '90';
+        try { z = localStorage.getItem('recepcion-zoom') || '90'; } catch (e) { /* sin almacenamiento */ }
+        return ['100', '90', '80', '70', '60', '50'].includes(z) ? z : '90';
+    },
+
+    get _pantallaCompleta() {
+        try { return localStorage.getItem('recepcion-full') === '1'; } catch (e) { return false; }
+    },
+
+    cambiarZoom(valor) {
+        try { localStorage.setItem('recepcion-zoom', String(valor)); } catch (e) { /* sin almacenamiento */ }
+        this._pintarCabecera(this._planilla);
+    },
+
+    pantallaCompleta(forzar) {
+        const nuevo = typeof forzar === 'boolean' ? forzar : !this._pantallaCompleta;
+        try { localStorage.setItem('recepcion-full', nuevo ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+        this._pintarCabecera(this._planilla);
+    },
+
+    cambiarVista() {
+        this._flush();
+        try { localStorage.setItem('recepcion-vista', this._planilla ? 'simple' : 'planilla'); } catch (e) { /* sin almacenamiento */ }
+        this.render();
+    },
+
+    // En la planilla una fila puede recibir de cualquier cliente que pidió el producto (aunque se lo haya
+    // pedido a otro proveedor): "pidió" cuenta lo pedido a ESE proveedor y "base" sirve para repartir
+    // automático solo lo ya guardado sin reparto (una fila agregada con "+ Proveedor" no tiene pedidos propios).
+    _clientesDe(clave) {
+        if (this._pedidosDiaFecha !== AppState.currentDate) return [];
+        const { productoId, proveedorId } = this._partesClave(clave);
+        const producto = this.findById(AppState.productos || [], productoId);
+        const porCliente = new Map();
+        const planilla = this._planilla;
+        (this._pedidosDia || []).forEach(pedido => {
+            if (String(pedido.producto_id) !== String(productoId)) return;
+            const delProveedor = proveedorId === null || this._proveedorDePedido(pedido, producto) === proveedorId;
+            if (!delProveedor && !planilla) return;
+            const id = String(pedido.cliente_id);
+            if (!porCliente.has(id)) {
+                porCliente.set(id, { cliente_id: id, nombre: pedido.cliente_nombre || '', cantidadPedida: 0, base: 0 });
+            }
+            const cantidad = parseFloat(pedido.cantidad) || 0;
+            const cli = porCliente.get(id);
+            if (delProveedor) cli.cantidadPedida += cantidad;
+            cli.base += cantidad;
+        });
+        const clientes = [...porCliente.values()];
+        clientes.forEach(c => {
+            if (!c.nombre) {
+                const cli = (AppState.clientes || []).find(x => String(x.id) === c.cliente_id);
+                c.nombre = cli?.nombre || 'Cliente';
+            }
+        });
+        return clientes.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    // Reparto en proporción a lo pedido: { cliente_id: cantidad }.
+    _repartoAuto(clientes, llego) {
+        const mapa = {};
+        clientes.forEach(c => { mapa[String(c.cliente_id)] = 0; });
+        // Una fila sin pedidos propios (otro proveedor agregado a mano) se reparte según lo pedido en total.
+        const conPedido = clientes.some(c => c.cantidadPedida > 0);
+        const lineas = clientes
+            .map(c => ({ cliente_id: c.cliente_id, cantidadPedida: conPedido ? c.cantidadPedida : (c.base || 0) }))
+            .filter(l => l.cantidadPedida > 0);
+        Precios.repartirRecibido(lineas, Number(llego) || 0).forEach(l => { mapa[String(l.cliente_id)] = l.cantidad; });
+        return mapa;
+    },
+
+    // El reparto guardado solo vale si cubre a todos los clientes y suma exactamente lo que llegó.
+    _repartoValido(reparto, clientes, llego) {
+        if (!reparto || typeof reparto !== 'object') return false;
+        if (!clientes.length || !clientes.every(c => reparto[c.cliente_id] !== undefined)) return false;
+        const suma = clientes.reduce((t, c) => t + (Number(reparto[c.cliente_id]) || 0), 0);
+        return Math.abs(suma - (Number(llego) || 0)) <= 0.05;
+    },
+
+    _repartoDe(item) {
+        const clientes = this._clientesDe(this._claveDe(item));
+        if (this._repartoValido(item.reparto, clientes, item.llego)) return item.reparto;
+        return this._repartoAuto(clientes, item.llego);
+    },
+
+    _inputsReparto(productoId, raiz) {
+        // En el cuadro de "Editar" los campos son otros (modal-reparto) para no mezclarse con los de la tabla.
+        const base = raiz || document;
+        const clase = raiz ? '.modal-reparto' : '.recepcion-reparto';
+        return [...base.querySelectorAll(`${clase}[data-producto-id="${productoId}"]`)];
+    },
+
+    // Lo que se ve en pantalla como reparto, o null si es el automático (no hace falta guardarlo).
+    _repartoDeLaPantalla(productoId, llego, raiz) {
+        const inputs = this._inputsReparto(productoId, raiz);
+        if (!inputs.length) return null;
+        const clientes = this._clientesDe(productoId);
+        const auto = this._repartoAuto(clientes, llego);
+        const mapa = {};
+        let distinto = false;
+        inputs.forEach(input => {
+            const id = input.getAttribute('data-cliente-id');
+            const n = Utils.parseCantidad(input.value);
+            mapa[id] = isNaN(n) ? 0 : Math.max(0, n);
+            if (Math.abs(mapa[id] - (auto[id] || 0)) > 0.005) distinto = true;
+        });
+        // En la planilla lo cargado a mano es siempre el reparto (no existe uno automático que respetar).
+        return distinto || this._planilla ? mapa : null;
+    },
+
+    // Al cambiar el total, cada cliente vuelve a su parte proporcional.
+    _rellenarReparto(productoId, llego, raiz) {
+        const clientes = this._clientesDe(productoId);
+        const auto = this._repartoAuto(clientes, llego);
+        this._inputsReparto(productoId, raiz).forEach(input => {
+            const id = input.getAttribute('data-cliente-id');
+            input.value = llego > 0 ? Utils.formatCantidadInput(auto[id] || 0) : '';
+        });
+    },
+
+    // Al tocar la parte de un cliente, el total pasa a ser la suma de todos.
+    _sumarReparto(productoId, raiz) {
+        let suma = 0;
+        let hayAlgo = false;
+        this._inputsReparto(productoId, raiz).forEach(input => {
+            const n = Utils.parseCantidad(input.value);
+            if (!isNaN(n)) { suma += n; hayAlgo = true; }
+        });
+        return hayAlgo ? Math.round(suma * 100) / 100 : '';
+    },
+
+    // Un producto que todavía nadie tocó viene con lo pedido (se da por llegado todo): solo se cambia
+    // lo que no coincide. Si alguien ya cargó algo (aunque sea un 0), se respeta lo cargado.
+    _sinCargar(item) {
+        const confirmada = item.confirmado === true || item.confirmado === 'true';
+        if (confirmada || Number(item.llego) > 0) return false;
+        if (this._leerBorrador(AppState.currentDate)[this._claveDe(item)]) return false;
+        return Number(item.pedido_total) > 0;
+    },
+
+    // Si el producto vino de más de un proveedor "a mano", lo que llegó se reparte entre todos los clientes juntos.
+    _tieneExtras(productoId) {
+        return (AppState.recepcion || []).some(r => String(r.producto_id) === String(productoId) && r.extra);
+    },
+
+    // En rojo lo que no coincide con lo pedido (llegó de menos o de más y se repartió por porcentaje), para verlo sin revisar uno por uno.
+    _esDistinto(valor, pedida) {
+        if (valor === '' || valor === null || valor === undefined) return false;
+        const n = typeof valor === 'number' ? valor : Utils.parseCantidad(valor);
+        return !isNaN(n) && n >= 0 && Math.abs(n - (Number(pedida) || 0)) > 0.005;
+    },
+
+    // Planilla: un producto puede tener varias filas (una por proveedor). Cada cliente tiene que recibir en
+    // total lo que pidió, sumando lo de todas las filas: en rojo si no coincide.
+    _marcarDistintosPlanilla(clave) {
+        const item = this._item(clave);
+        if (!item) return;
+        const filas = (AppState.recepcion || []).filter(r => String(r.producto_id) === String(item.producto_id));
+        const pedidoPorCliente = {};
+        this._clientesDe(clave).forEach(c => { pedidoPorCliente[c.cliente_id] = c.base || 0; });
+        const recibido = {};
+        const celdas = [];
+        filas.forEach(fila => {
+            this._inputsReparto(this._claveDe(fila)).forEach(input => {
+                const id = input.getAttribute('data-cliente-id');
+                const n = Utils.parseCantidad(input.value);
+                recibido[id] = (recibido[id] || 0) + (isNaN(n) ? 0 : n);
+                celdas.push({ input, id });
+            });
+        });
+        celdas.forEach(({ input, id }) => {
+            const hayCarga = filas.some(f => this._inputsReparto(this._claveDe(f)).some(i => i.getAttribute('data-cliente-id') === id && i.value !== ''));
+            input.classList.toggle('recepcion-distinto', hayCarga && this._esDistinto(recibido[id] || 0, pedidoPorCliente[id] || 0));
+        });
+        const pedidoTotal = Object.values(pedidoPorCliente).reduce((t, n) => t + n, 0);
+        const llegoTotal = filas.reduce((t, f) => {
+            const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${this._claveDe(f)}"]`);
+            const n = Utils.parseCantidad(llegoInput?.value);
+            return t + (isNaN(n) ? 0 : n);
+        }, 0);
+        filas.forEach(f => {
+            const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${this._claveDe(f)}"]`);
+            if (llegoInput) llegoInput.classList.toggle('recepcion-distinto', llegoInput.value !== '' && this._esDistinto(llegoTotal, pedidoTotal));
+        });
+    },
+
+    _marcarDistintos(productoId) {
+        if (this._planilla) return this._marcarDistintosPlanilla(productoId);
+        const clientes = this._clientesDe(productoId);
+        if (!clientes.length) return;
+        const pedidas = Object.fromEntries(clientes.map(c => [String(c.cliente_id), Number(c.cantidadPedida) || 0]));
+        this._inputsReparto(productoId).forEach(input => {
+            input.classList.toggle('recepcion-distinto', this._esDistinto(input.value, pedidas[input.getAttribute('data-cliente-id')]));
+        });
+        const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${productoId}"]`);
+        if (llegoInput) {
+            const pedidoTotal = clientes.reduce((t, c) => t + (Number(c.cantidadPedida) || 0), 0);
+            llegoInput.classList.toggle('recepcion-distinto', this._esDistinto(llegoInput.value, pedidoTotal));
+        }
+    },
+
+    _htmlReparto(item, confirmada) {
+        if (this._tieneExtras(item.producto_id)) return '';
+        const clientes = this._clientesDe(this._claveDe(item));
+        if (!clientes.length) return '';
+        const sinCargar = this._sinCargar(item);
+        const reparto = sinCargar
+            ? Object.fromEntries(clientes.map(c => [c.cliente_id, c.cantidadPedida]))
+            : this._repartoDe(item);
+        const mostrar = confirmada || sinCargar || Number(item.llego) > 0;
+        const filas = clientes.map(c => `
+            <label class="recepcion-cli">
+                <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
+                <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
+                <input type="number" step="any" min="0" class="recepcion-reparto${mostrar && this._esDistinto(reparto[c.cliente_id] || 0, c.cantidadPedida) ? ' recepcion-distinto' : ''}" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${mostrar ? Utils.formatCantidadInput(reparto[c.cliente_id] || 0) : ''}" placeholder="0"${confirmada ? ' disabled' : ''} title="Cuánto le toca de lo que llegó">
+            </label>`).join('');
+        return `<tr class="recepcion-detalle${confirmada ? ' recepcion-row-confirmada' : ''}"><td colspan="6"><div class="recepcion-cli-lista"><span class="recepcion-cli-titulo">Para cada cliente:</span>${filas}</div></td></tr>`;
+    },
+
+    findById(list, id) {
+        if (!list || id === null || id === undefined) return null;
+        return list.find(item => String(item.id) === String(id)) || null;
+    },
+
+    findRecepcionForProducto(recepciones, productoId) {
+        return recepciones.find(r => String(r.producto_id) === String(productoId)) || null;
+    },
+
+    // Un producto puede venir de más de un proveedor el mismo día: entonces tiene una fila por proveedor.
+    // La "clave" de la fila es el id del producto o, si tiene varios proveedores, "producto::proveedor".
+    _claveDe(item) {
+        return String(item.clave || item.producto_id);
+    },
+
+    // Las filas que vienen tal cual de la planilla no traen clave: si un producto tiene más de una
+    // (una por proveedor), cada una se identifica con producto y proveedor.
+    _conClaves(lista) {
+        const cuenta = {};
+        (lista || []).forEach(r => { cuenta[String(r.producto_id)] = (cuenta[String(r.producto_id)] || 0) + 1; });
+        return (lista || []).map(r => {
+            if (r.clave) return r;
+            const varias = cuenta[String(r.producto_id)] > 1;
+            return { ...r, clave: varias ? `${r.producto_id}::${r.proveedor_id || ''}` : String(r.producto_id) };
+        });
+    },
+
+    _item(clave) {
+        return (AppState.recepcion || []).find(r => this._claveDe(r) === String(clave)) || null;
+    },
+
+    _partesClave(clave) {
+        const texto = String(clave);
+        const i = texto.indexOf('::');
+        return i === -1
+            ? { productoId: texto, proveedorId: null }
+            : { productoId: texto.slice(0, i), proveedorId: texto.slice(i + 2) };
+    },
+
+    // Proveedor de un pedido: el elegido en Pedidos o, si no tiene, el habitual del producto.
+    _proveedorDePedido(pedido, producto) {
+        return String(pedido.proveedor_id || producto?.proveedor_default || '');
+    },
+
+    // Reparte las filas guardadas de un producto entre sus proveedores. Cada una va con la de su
+    // proveedor; si el producto tiene un solo proveedor y la fila quedó con otro (se cambió en
+    // Pedidos después), esa fila pasa a ser la suya.
+    _asignarFilas(filas, proveedores) {
+        const asignadas = {};
+        const usadas = new Set();
+        proveedores.forEach(prov => {
+            const fila = filas.find(f => !usadas.has(f) && String(f.proveedor_id || '') === prov);
+            if (fila) { usadas.add(fila); asignadas[prov] = fila; }
+        });
+        if (proveedores.length === 1 && !asignadas[proveedores[0]]) {
+            const fila = filas.find(f => !usadas.has(f) && !proveedores.includes(String(f.proveedor_id || '')));
+            if (fila) asignadas[proveedores[0]] = fila;
+        }
+        return asignadas;
+    },
+
+    // Una fila agregada con "+ Proveedor" queda escondida si después los pedidos pasan a ese mismo
+    // proveedor, y la lista de precios dejaba de contar ese producto (no se le cobraba al cliente).
+    // Si para un proveedor de los pedidos solo hay una fila "extra", esa fila pasa a ser la suya.
+    _extrasComoPropias(filas, proveedores) {
+        const esExtra = r => r.extra === true || r.extra === 'true';
+        return filas.map(f => {
+            if (!esExtra(f)) return f;
+            const prov = String(f.proveedor_id || '');
+            if (!proveedores.includes(prov)) return f;
+            const hayPropia = filas.some(o => o !== f && !esExtra(o) && String(o.proveedor_id || '') === prov);
+            const otraExtraAntes = filas.some(o => o !== f && esExtra(o) && String(o.proveedor_id || '') === prov && filas.indexOf(o) < filas.indexOf(f));
+            return hayPropia || otraExtraAntes ? f : { ...f, extra: false };
+        });
+    },
+
+    // Reparto a mano de una fila ya confirmada, o null si no lo tiene o no cierra con lo que llegó.
+    // Una fila en 0 (ese proveedor no trajo nada) vale como reparto vacío.
+    _repartoManualDe(fila) {
+        const confirmada = fila.confirmado === true || fila.confirmado === 'true' || fila.confirmado === 1;
+        if (!confirmada) return null;
+        const llego = parseFloat(fila.llego) || 0;
+        const reparto = fila.reparto && typeof fila.reparto === 'object' ? fila.reparto : null;
+        if (!reparto) return llego === 0 ? {} : null;
+        const suma = Object.values(reparto).reduce((t, n) => t + (Number(n) || 0), 0);
+        return Math.abs(suma - llego) <= 0.05 ? reparto : null;
+    },
+
+    // Todas las filas del producto están confirmadas y con lo que le tocó a cada cliente cargado a mano.
+    _todasConRepartoManual(filas) {
+        return filas.length > 0 && filas.every(f => this._repartoManualDe(f) !== null);
+    },
+
+    // Todas las filas de un producto juntas (para las pantallas que miran el producto entero):
+    // lo que llegó se suma, el precio es el promedio ponderado y está confirmado si lo están todas.
+    // A este cliente no le tocó nada de lo que llegó de ese producto (se repartió a mano a otros): no se le cobra,
+    // así que no hace falta su precio. Es la misma regla que usa el servidor para dejar cerrar el día.
+    _clienteSinParte(clienteId, productoId) {
+        const filas = (AppState.recepcion || []).filter(r => String(r.producto_id) === String(productoId));
+        if (!filas.length) return false;
+        if (!filas.every(r => r.confirmado === true || r.confirmado === 'true' || r.confirmado === 1)) return false;
+        let total = 0;
+        for (const r of filas) {
+            const llego = parseFloat(r.llego) || 0;
+            if (llego <= 0) continue;
+            let reparto = r.reparto;
+            if (typeof reparto === 'string') { try { reparto = JSON.parse(reparto); } catch (e) { reparto = null; } }
+            if (!reparto || typeof reparto !== 'object') return false;
+            const suma = Object.values(reparto).reduce((t, n) => t + (Number(n) || 0), 0);
+            if (Math.abs(suma - llego) > 0.05) return false;
+            total += Number(reparto[String(clienteId)]) || 0;
+        }
+        return total <= 0.004;
+    },
+
+    // Las filas de recepción de un producto, una por proveedor (dos del mismo proveedor son la misma mercadería repetida:
+    // vale la confirmada). Las "extra" son proveedores agregados a mano y cuentan todas.
+    _filasUnicas(filas, productoId) {
+        const vistas = new Map();
+        (filas || []).filter(r => String(r.producto_id) === String(productoId)).forEach(r => {
+            if (r.extra === true || r.extra === 'true') { vistas.set(Symbol('extra'), r); return; }
+            const k = String(r.proveedor_id || '');
+            const previa = vistas.get(k);
+            const conf = x => x.confirmado === true || x.confirmado === 'true' || x.confirmado === 1;
+            if (!previa || (conf(r) && !conf(previa))) vistas.set(k, r);
+        });
+        return [...vistas.values()];
+    },
+
+    agregadoDe(filas, productoId) {
+        let propias = (filas || []).filter(r => String(r.producto_id) === String(productoId));
+        // Dos filas del mismo proveedor (y que no son un "extra") son la misma mercadería repetida: vale una sola,
+        // la confirmada si la hay. Si no, se sumaría lo que llegó dos veces y el producto nunca quedaría confirmado.
+        const vistas = new Map();
+        propias.forEach(r => {
+            if (r.extra === true || r.extra === 'true') { vistas.set(Symbol('extra'), r); return; }
+            const k = String(r.proveedor_id || '');
+            const previa = vistas.get(k);
+            const conf = x => x.confirmado === true || x.confirmado === 'true' || x.confirmado === 1;
+            if (!previa || (conf(r) && !conf(previa))) vistas.set(k, r);
+        });
+        propias = [...vistas.values()];
+        if (propias.length <= 1) return propias[0] || null;
+        let llego = 0;
+        let costo = 0;
+        propias.forEach(r => {
+            const l = parseFloat(r.llego) || 0;
+            llego += l;
+            costo += l * (Utils.parsePrice(r.precio_real) || 0);
+        });
+        return {
+            ...propias[0],
+            llego,
+            precio_real: llego > 0 ? Math.round(costo / llego) : (Utils.parsePrice(propias[0].precio_real) || 0),
+            confirmado: propias.every(r => r.confirmado === true || r.confirmado === 'true' || r.confirmado === 1)
+        };
+    },
+
+    _prepararDiaPendiente() {
+        const heading = document.querySelector('#recepcion .page-header h2');
+        const hint = document.querySelector('#recepcion .dia-operativo-hint');
+        if (this.vista !== 'pendientes') {
+            if (heading) heading.textContent = 'Confirmación de lo que llegó';
+            if (hint) {
+                hint.innerHTML = 'Confirmá <strong>cada producto</strong> cuando llegue. Al confirmar se arma la lista de precios al cliente con lo que llegó. Los que falten podés confirmarlos otro día (poné 0 en "Llegó" si no vino).';
+            }
+            return false;
+        }
+
+        if (heading) heading.textContent = 'Confirmar recepción (pendientes)';
+        if (hint) {
+            hint.innerHTML = 'Elegí el día que todavía no recibiste. Sirve para confirmar hoy lo que se pidió ayer.';
+        }
+
+        const dias = (DiaOperativo.diasPendientes || []).filter(d => d.estado === 'recepcion_pendiente');
+        if (!dias.length || dias.some(d => d.fecha === AppState.currentDate)) return false;
+
+        const fecha = dias[0].fecha;
+        DiaOperativo.workDate = fecha;
+        AppState.currentDate = fecha;
+        sessionStorage.setItem('sg_work_date', fecha);
+        DiaOperativo.renderSelectors();
+        return true;
+    },
+
+    initActions() {
+        if (this._actionsBound) return;
+        const tbody = document.getElementById('recepcion-tbody');
+        if (!tbody) return;
+
+        tbody.addEventListener('click', async (e) => {
+            const btnConfirmar = e.target.closest('.btn-confirmar-recepcion-item');
+            if (btnConfirmar && !btnConfirmar.disabled) {
+                e.preventDefault();
+                const productoId = btnConfirmar.getAttribute('data-producto-id');
+                if (productoId) {
+                    await Utils.withButtonLoader(btnConfirmar, () => this.confirmarProducto(productoId), 'Confirmando...');
+                }
+                return;
+            }
+
+            const btnDividir = e.target.closest('.btn-dividir-proveedor');
+            if (btnDividir) {
+                e.preventDefault();
+                this.agregarProveedor(btnDividir.getAttribute('data-producto-id'));
+                return;
+            }
+
+            const btnQuitar = e.target.closest('.btn-quitar-proveedor-recepcion');
+            if (btnQuitar && !btnQuitar.disabled) {
+                e.preventDefault();
+                await Utils.withButtonLoader(btnQuitar, () => this.quitarProveedor(btnQuitar.getAttribute('data-producto-id')), 'Quitando...');
+                return;
+            }
+
+            const btnEditar = e.target.closest('.btn-editar-recepcion-item');
+            if (btnEditar && !btnEditar.disabled) {
+                e.preventDefault();
+                const productoId = btnEditar.getAttribute('data-producto-id');
+                if (productoId) {
+                    this.editarProducto(productoId);
+                }
+                return;
+            }
+
+            const btnEliminar = e.target.closest('.btn-eliminar-recepcion-item');
+            if (btnEliminar && !btnEliminar.disabled) {
+                e.preventDefault();
+                const productoId = btnEliminar.getAttribute('data-producto-id');
+                if (productoId) {
+                    await Utils.withButtonLoader(btnEliminar, () => this.eliminarProducto(productoId), 'Eliminando...');
+                }
+            }
+        });
+
+        const guardarCampo = (e) => {
+            const input = e.target.closest('.recepcion-llego, .recepcion-precio, .recepcion-reparto');
+            if (!input || input.disabled) return;
+            const productoId = input.getAttribute('data-producto-id');
+            if (!productoId) return;
+            if (input.classList.contains('recepcion-reparto')) {
+                // El total pasa a ser la suma de lo que le toca a cada cliente.
+                const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${productoId}"]`);
+                if (llegoInput) llegoInput.value = this._sumarReparto(productoId);
+            } else if (input.classList.contains('recepcion-llego')) {
+                const n = Utils.parseCantidad(input.value);
+                this._rellenarReparto(productoId, isNaN(n) ? 0 : Math.max(0, n));
+            }
+            this._marcarDistintos(productoId);
+            const { llego, precio, reparto } = this.getValoresProducto(productoId);
+            this._aplicarCambio(productoId, llego, precio, reparto);
+        };
+        tbody.addEventListener('input', guardarCampo);
+        tbody.addEventListener('change', guardarCampo);
+        // Flechas arriba/abajo: pasan al mismo campo (llegó, precio o reparto) de la fila siguiente/anterior.
+        tbody.addEventListener('keydown', (e) => {
+            const teclas = ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'Enter'];
+            if (!teclas.includes(e.key)) return;
+            const clase = ['recepcion-llego', 'recepcion-precio', 'recepcion-reparto'].find(c => e.target.classList?.contains(c));
+            if (!clase) return;
+            const libre = c => !c.disabled && c.offsetParent !== null;
+            if (this._planilla && this._moverEnPlanilla(e, clase, tbody, libre)) return;
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            e.preventDefault();
+            const campos = [...tbody.querySelectorAll('.' + clase)].filter(libre);
+            const destino = campos[campos.indexOf(e.target) + (e.key === 'ArrowDown' ? 1 : -1)];
+            if (destino) { destino.focus(); destino.select(); }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && document.body.classList.contains('recepcion-full') && !document.querySelector('.modal-overlay.active, #custom-confirm-accept')) this.pantallaCompleta(false);
+        });
+        // Como en una planilla: al entrar en una celda queda todo seleccionado y lo que se escribe reemplaza.
+        tbody.addEventListener('focusin', (e) => {
+            if (!this._planilla || !e.target.matches?.('.recepcion-reparto, .recepcion-precio')) return;
+            setTimeout(() => { if (document.activeElement === e.target) e.target.select(); }, 0);
+        });
+
+        if (!this._salidaEnganchada) {
+            this._salidaEnganchada = true;
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') this._flush();
+            });
+            window.addEventListener('pagehide', () => this._flush());
+        }
+        this._actionsBound = true;
+    },
+
+    // Flechas y Enter dentro de la planilla: arriba/abajo (Enter baja) siguen en la misma columna;
+    // izquierda/derecha pasan a la celda de al lado de la misma fila. Devuelve true si movió.
+    _moverEnPlanilla(e, clase, tbody, libre) {
+        const fila = e.target.closest('tr');
+        let destino = null;
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+            const celdas = [...fila.querySelectorAll('.recepcion-precio, .recepcion-reparto')].filter(libre);
+            destino = celdas[celdas.indexOf(e.target) + (e.key === 'ArrowRight' ? 1 : -1)];
+        } else {
+            const mismos = c => clase === 'recepcion-reparto'
+                ? c.getAttribute('data-cliente-id') === e.target.getAttribute('data-cliente-id')
+                : true;
+            const campos = [...tbody.querySelectorAll('.' + clase)].filter(c => libre(c) && mismos(c) && !c.closest('tr').classList.contains('fila-oculta'));
+            destino = campos[campos.indexOf(e.target) + (e.key === 'ArrowUp' ? -1 : 1)];
+        }
+        e.preventDefault();
+        if (destino) { destino.focus(); destino.select(); }
+        return true;
+    },
+
+    // Si la fila guardada en la planilla de recepción quedó con otro proveedor que el de los pedidos del
+    // día (por ejemplo, se cambió en Pedidos después), se corrige. Se intenta una vez por producto y día.
+    _corregirProveedores(fecha, correcciones) {
+        this._proveedorCorregido = this._proveedorCorregido || new Set();
+        const items = (correcciones || []).filter(c => {
+            const clave = fecha + '|' + c.producto_id + '|' + c.proveedor_id;
+            if (this._proveedorCorregido.has(clave)) return false;
+            this._proveedorCorregido.add(clave);
+            return true;
+        });
+        if (!items.length) return;
+        API.saveRecepcion({ fecha, items }).catch(error => console.warn('No se pudo corregir el proveedor de la recepción:', error));
+    },
+
+    _claveBorrador(fecha) {
+        return 'sg_recepcion_borrador:' + fecha;
+    },
+
+    _leerBorrador(fecha) {
+        try {
+            const raw = localStorage.getItem(this._claveBorrador(fecha));
+            const data = raw ? JSON.parse(raw) : {};
+            return data && typeof data === 'object' ? data : {};
+        } catch (error) {
+            return {};
+        }
+    },
+
+    _guardarBorrador(fecha, map) {
+        localStorage.setItem(this._claveBorrador(fecha), JSON.stringify(map || {}));
+    },
+
+    _ponerBorrador(fecha, productoId, llego, precio, reparto) {
+        const map = this._leerBorrador(fecha);
+        map[String(productoId)] = { llego, precio, reparto: reparto || null };
+        this._guardarBorrador(fecha, map);
+    },
+
+    _quitarBorrador(fecha, productoId) {
+        const map = this._leerBorrador(fecha);
+        if (!map[String(productoId)]) return;
+        delete map[String(productoId)];
+        this._guardarBorrador(fecha, map);
+    },
+
+    _fusionarBorrador(lista, fecha) {
+        const map = this._leerBorrador(fecha);
+        return (lista || []).map(item => {
+            const confirmado = item.confirmado === true || item.confirmado === 'true';
+            const borrador = map[this._claveDe(item)];
+            if (!borrador || confirmado) return item;
+            return { ...item, llego: borrador.llego, precio_real: borrador.precio, reparto: borrador.reparto || null };
+        });
+    },
+
+    _reflejarEnCache(fecha) {
+        const recepcion = AppState.recepcion || [];
+        CacheManager.set(`recepcion:${fecha}`, recepcion);
+        const flujo = CacheManager.peek(`flujo:${fecha}`) || {
+            fecha,
+            pedidos: AppState.pedidos || [],
+            recepcion,
+            precios: AppState.precios || []
+        };
+        flujo.recepcion = recepcion;
+        CacheManager.set(`flujo:${fecha}`, flujo);
+        if (Array.isArray(flujo.pedidos) && flujo.pedidos.length) CacheManager.set(`pedidos:${fecha}`, flujo.pedidos);
+        if (Array.isArray(flujo.precios)) CacheManager.set(`precios:${fecha}`, flujo.precios);
+    },
+
+    _aplicarCambio(productoId, llego, precio, reparto) {
+        const fecha = AppState.currentDate;
+        this._ponerBorrador(fecha, productoId, llego, precio, reparto);
+        const idx = (AppState.recepcion || []).findIndex(r => this._claveDe(r) === String(productoId));
+        if (idx !== -1) {
+            AppState.recepcion[idx] = {
+                ...AppState.recepcion[idx],
+                llego,
+                precio_real: precio,
+                reparto: reparto || null
+            };
+        }
+        this._reflejarEnCache(fecha);
+        this._programarGuardado();
+    },
+
+    _programarGuardado() {
+        clearTimeout(this._guardarTimer);
+        this._guardarTimer = setTimeout(() => this._guardarEnServidor(), 500);
+    },
+
+    _flush() {
+        if (!this._guardarTimer) return;
+        clearTimeout(this._guardarTimer);
+        this._guardarTimer = null;
+        this._guardarEnServidor();
+    },
+
+    async _guardarEnServidor() {
+        this._guardarTimer = null;
+        const fecha = AppState.currentDate;
+        const map = this._leerBorrador(fecha);
+        const items = Object.keys(map).map(clave => {
+            const item = (AppState.recepcion || []).find(r => this._claveDe(r) === String(clave));
+            if (item && (item.confirmado === true || item.confirmado === 'true')) return null;
+            return {
+                producto_id: item?.producto_id || this._partesClave(clave).productoId,
+                llego: map[clave].llego,
+                precio_real: map[clave].precio,
+                reparto: map[clave].reparto || null,
+                pedido_total: item?.pedido_total || 0,
+                proveedor_id: item?.proveedor_id || this._partesClave(clave).proveedorId || '',
+                solo_si_pendiente: true,
+                ...(item?.extra ? { extra: true } : {})
+            };
+        }).filter(Boolean);
+        if (!items.length) return;
+
+        const marca = JSON.stringify(map);
+        try {
+            await API.saveRecepcion({ fecha, items });
+            if (AppState.currentDate === fecha) this._reflejarEnCache(fecha);
+            if (JSON.stringify(this._leerBorrador(fecha)) !== marca) this._programarGuardado();
+        } catch (error) {
+            console.error('Error guardando recepción:', error);
+        }
+    },
+
+    _subtotal(llego, precio) {
+        return (parseFloat(llego) || 0) * (Utils.parsePrice(precio) || 0);
+    },
+
+    _capturarEdiciones() {
+        const map = {};
+        document.querySelectorAll('#recepcion-tbody .recepcion-llego').forEach(input => {
+            const productoId = input.getAttribute('data-producto-id');
+            if (!productoId) return;
+            const precioInput = document.querySelector(`#recepcion-tbody .recepcion-precio[data-producto-id="${productoId}"]`);
+            const llegoEdicion = Utils.parseCantidad(input.value) || 0;
+            map[String(productoId)] = {
+                llego: llegoEdicion,
+                precio: Utils.parsePrice(precioInput?.value || 0),
+                reparto: this._repartoDeLaPantalla(productoId, llegoEdicion)
+            };
+        });
+        return map;
+    },
+
+    _ajustarSaldoProveedor(proveedorId, delta) {
+        if (!proveedorId || !delta) return;
+        const id = String(proveedorId);
+        const prov = (AppState.proveedores || []).find(p => String(p.id) === id);
+        if (prov) {
+            prov.saldo = (Utils.parsePrice(prov.saldo) || 0) + delta;
+        }
+        Pagos._montosHoy = Pagos._montosHoy || {};
+        Pagos._montosHoy[id] = Math.max(0, (Pagos._montosHoy[id] || 0) + delta);
+        CacheManager.invalidate('proveedores');
+        CacheManager.invalidatePattern('bootstrap:');
+        CacheManager.invalidatePattern('dashboard');
+        if (AppState.currentPage === 'pagos' || AppState.currentPage === 'pagos-pendientes') {
+            Pagos.render(AppState.proveedores);
+        }
+    },
+
+    async load() {
+        const tbody = document.getElementById('recepcion-tbody');
+        if (!tbody) return;
+
+        this.initActions();
+        const cambioDia = this._prepararDiaPendiente();
+        if (cambioDia) AppState.recepcion = [];
+        const fecha = AppState.currentDate;
+        const token = DataLoader._flujoToken;
+        // Lo que hay en pantalla y en memoria es de _fechaPantalla: si se cambió de día, no se
+        // arrastra nada (cantidades, precios ni "confirmado") a las filas del día nuevo.
+        const mismoDia = this._fechaPantalla === fecha;
+        if (!mismoDia) AppState.recepcion = [];
+        if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.recepcion = [];
+            this._fechaPantalla = fecha;
+            AppState.fechaCargada = fecha;
+            this.render();
+            return;
+        }
+
+        const flujoLocal = DataLoader.armarFlujoLocal(fecha);
+        const flujoRecordado = flujoLocal || CacheManager.peek(`flujo:${fecha}`);
+        if (flujoRecordado && !flujoLocal) {
+            AppState.recepcion = this._fusionarBorrador(this._conClaves(flujoRecordado.recepcion || []), fecha);
+            if (Array.isArray(flujoRecordado.pedidos)) {
+                AppState.pedidos = flujoRecordado.pedidos;
+                this._pedidosDia = flujoRecordado.pedidos;
+                this._pedidosDiaFecha = fecha;
+            }
+            this.render();
+        } else if (AppState.fechaCargada === fecha && (AppState.recepcion || []).length) {
+            AppState.recepcion = this._fusionarBorrador(AppState.recepcion, fecha);
+            this.render();
+        } else if (!flujoLocal && AppState.fechaCargada !== fecha) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px;color:#666;">Buscando recepción…</td></tr>';
+        }
+
+        try {
+            if (!AppState.productos?.length || !AppState.proveedores?.length) {
+                CacheManager.hydrateAppStateFromCache();
+            }
+
+            const flujo = await DataLoader.getFlujo(fecha);
+            if (token !== DataLoader._flujoToken) return;
+            const ediciones = mismoDia ? this._capturarEdiciones() : {};
+            const recepciones = flujo.recepcion || [];
+            const pedidos = flujo.pedidos || [];
+            this._pedidosDia = pedidos;
+            this._pedidosDiaFecha = fecha;
+            const productos = AppState.productos?.length
+                ? AppState.productos
+                : await API.getProductos();
+            const proveedores = AppState.proveedores?.length
+                ? AppState.proveedores
+                : await API.getProveedores();
+            AppState.productos = productos;
+            AppState.proveedores = proveedores;
+
+            // Un producto puede venir de más de un proveedor el mismo día (los pedidos de cada cliente
+            // tienen su proveedor): cada proveedor tiene su propia fila.
+            const pedidosPorProducto = {};
+            pedidos.forEach(pedido => {
+                const producto = this.findById(productos, pedido.producto_id);
+                const grupo = pedidosPorProducto[pedido.producto_id] || (pedidosPorProducto[pedido.producto_id] = {
+                    producto_id: pedido.producto_id,
+                    producto_nombre: producto?.nombre || pedido.producto_nombre || '',
+                    porProveedor: {}
+                });
+                if (!grupo.producto_nombre && producto) grupo.producto_nombre = producto.nombre;
+                const prov = this._proveedorDePedido(pedido, producto);
+                grupo.porProveedor[prov] = (grupo.porProveedor[prov] || 0) + (parseFloat(pedido.cantidad) || 0);
+            });
+
+            const recepcionesFinales = [];
+            const correcciones = [];
+            let pendiente = false;
+
+            Object.keys(pedidosPorProducto).forEach(productoId => {
+                const pedidoInfo = pedidosPorProducto[productoId];
+                const producto = this.findById(productos, productoId);
+                const proveedoresDelProducto = Object.keys(pedidoInfo.porProveedor)
+                    .sort((a, b) => pedidoInfo.porProveedor[b] - pedidoInfo.porProveedor[a]);
+                const filasGuardadas = this._extrasComoPropias(recepciones.filter(r => String(r.producto_id) === String(productoId)), proveedoresDelProducto);
+                const esExtra = r => r.extra === true || r.extra === 'true';
+                const asignadas = this._asignarFilas(filasGuardadas.filter(r => !esExtra(r)), proveedoresDelProducto);
+                // Proveedores agregados a mano para este producto (la mercadería vino de más de uno).
+                const extras = filasGuardadas.filter(esExtra)
+                    .filter(r => !proveedoresDelProducto.includes(String(r.proveedor_id || '')));
+                const variosProveedores = proveedoresDelProducto.length + extras.length > 1;
+                const entradas = proveedoresDelProducto.map(prov => ({ prov, extra: false }))
+                    .concat(extras.map(fila => ({ prov: String(fila.proveedor_id || ''), extra: true, fila })));
+
+                entradas.forEach(entrada => {
+                    const proveedorPedidoId = entrada.prov;
+                    const clave = variosProveedores ? `${productoId}::${proveedorPedidoId}` : String(productoId);
+                    const proveedor = proveedorPedidoId ? this.findById(proveedores, proveedorPedidoId) : null;
+                    const rec = entrada.extra ? entrada.fila : (asignadas[proveedorPedidoId] || null);
+                    const local = (AppState.recepcion || []).find(r => this._claveDe(r) === clave);
+                    const confirmado = rec?.confirmado === true || rec?.confirmado === 'true';
+                    const edicion = ediciones[clave];
+                    const borrador = this._leerBorrador(fecha)[clave];
+                    const conservarLocal = local && (local.confirmado === true || local.confirmado === 'true') && !confirmado;
+                    let llego = rec?.llego ?? 0;
+                    let precioReal = rec?.precio_real ?? 0;
+                    let reparto = rec?.reparto || null;
+                    if (confirmado) {
+                        this._quitarBorrador(fecha, clave);
+                    } else if (borrador) {
+                        const precioServidor = Utils.parsePrice(precioReal) || 0;
+                        const precioBorrador = Utils.parsePrice(borrador.precio) || 0;
+                        if (Number(borrador.llego) !== Number(llego) || precioBorrador !== precioServidor) pendiente = true;
+                        llego = borrador.llego;
+                        precioReal = borrador.precio;
+                        reparto = borrador.reparto || null;
+                    } else if (conservarLocal) {
+                        llego = local.llego ?? llego;
+                        precioReal = local.precio_real ?? precioReal;
+                        reparto = local.reparto || reparto;
+                    } else if (edicion) {
+                        llego = edicion.llego;
+                        precioReal = edicion.precio;
+                        reparto = edicion.reparto || null;
+                    }
+
+                    // La fila guardada sigue al proveedor de los pedidos: si quedó con otro, se corrige.
+                    if (!entrada.extra && rec && proveedorPedidoId && String(rec.proveedor_id || '') !== proveedorPedidoId) {
+                        correcciones.push({ producto_id: productoId, proveedor_id: proveedorPedidoId, solo_proveedor: true });
+                    }
+
+                    recepcionesFinales.push({
+                        id: rec?.id || local?.id || ('temp-' + clave),
+                        clave,
+                        producto_id: productoId,
+                        producto_nombre: producto?.nombre || pedidoInfo.producto_nombre || 'Sin nombre',
+                        pedido_total: entrada.extra ? 0 : pedidoInfo.porProveedor[proveedorPedidoId],
+                        extra: entrada.extra,
+                        llego,
+                        precio_real: precioReal,
+                        reparto,
+                        proveedor_nombre: proveedor?.nombre || (proveedorPedidoId ? '' : (rec?.proveedor_nombre || local?.proveedor_nombre || '')),
+                        proveedor_id: proveedorPedidoId || rec?.proveedor_id || local?.proveedor_id || '',
+                        confirmado: confirmado || conservarLocal
+                    });
+                });
+            });
+
+            AppState.recepcion = recepcionesFinales;
+            this._fechaPantalla = fecha;
+            this._reflejarEnCache(fecha);
+            this.render();
+            if (pendiente) this._programarGuardado();
+            this._corregirProveedores(fecha, correcciones);
+        } catch (error) {
+            console.error('Error loading recepcion:', error);
+            if ((AppState.recepcion || []).length) {
+                AppState.recepcion = this._fusionarBorrador(AppState.recepcion, fecha);
+                this.render();
+                return;
+            }
+            Utils.hideTableLoader(tbody);
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 30px; color: #d32f2f;">Error al cargar recepción. Por favor, intenta nuevamente.</td></tr>';
+        }
+    },
+    
+    render() {
+        // Las columnas de Llegó de la planilla del día se repintan cada vez que cambia la recepción.
+        setTimeout(() => { try { PlanillaPedidos._pintarLlegada(); } catch (e) { /* la planilla no está en pantalla */ } }, 0);
+        const tbody = document.getElementById('recepcion-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        this._pintarFiltroProveedor();
+        const planilla = this._planilla;
+        this._pintarCabecera(planilla);
+        
+        if (AppState.recepcion.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;">No hay recepciones para el día seleccionado</td></tr>';
+            return;
+        }
+
+        const visibles = this._visibles();
+        if (planilla) {
+            this._renderPlanilla(visibles, tbody);
+            return;
+        }
+        let rowsHtml = '';
+        
+        visibles.forEach(item => {
+            const confirmada = item.confirmado === true || item.confirmado === 'true';
+            const rowClass = confirmada ? ' class="recepcion-row-confirmada"' : '';
+            const disabled = confirmada ? ' disabled' : '';
+            const accionCell = confirmada
+                ? `<div class="recepcion-acciones-group">
+                    <span class="status-badge status-activo">Confirmado</span>
+                    <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${this._claveDe(item)}">Editar</button>
+                    <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${this._claveDe(item)}">Eliminar</button>
+                   </div>`
+                : `<button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${this._claveDe(item)}">Confirmar</button>`
+                    + (item.extra ? ` <button type="button" class="btn btn-danger btn-sm btn-quitar-proveedor-recepcion" data-producto-id="${this._claveDe(item)}">Quitar</button>` : '');
+
+            // Sin confirmar y sin cargar, los campos quedan vacíos (el 0 es solo de ayuda): así se escribe
+            // directo, sin borrar un 0 en cada producto. Vacío vale lo mismo que 0 al confirmar.
+            const llegoValor = confirmada || Number(item.llego) > 0
+                ? (item.llego || 0)
+                : (this._sinCargar(item) ? Utils.formatCantidadInput(item.pedido_total) : '');
+            const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
+            rowsHtml += `
+                <tr${rowClass} data-nombre="${Utils.esc(this._normalizarBusqueda(item.producto_nombre))}">
+                    <td>${Utils.esc(item.producto_nombre || '')}${!confirmada && !item.extra ? ` <button type="button" class="btn btn-secondary btn-sm btn-dividir-proveedor" data-producto-id="${this._claveDe(item)}" title="Agregar otro proveedor de este producto">+ Proveedor</button>` : ''}</td>
+                    <td>${item.extra ? '—' : (item.pedido_total || 0)}</td>
+                    <td><input type="number" step="any" class="recepcion-llego" data-id="${item.id}" data-producto-id="${this._claveDe(item)}" value="${llegoValor}" placeholder="0" min="0"${disabled}></td>
+                    <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${this._claveDe(item)}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
+                    <td>${Utils.esc(item.proveedor_nombre || '')}</td>
+                    <td class="recepcion-acciones">${accionCell}</td>
+                </tr>
+                ${this._htmlReparto(item, confirmada)}
+            `;
+        });
+        
+        tbody.innerHTML = rowsHtml;
+        Utils.enablePriceInputs(tbody);
+        tbody.querySelectorAll('.recepcion-llego').forEach(input => this._marcarDistintos(input.getAttribute('data-producto-id')));
+        this._aplicarFiltroProducto();
+    },
+    
+    // ---- Vista planilla ----
+    // Mismas columnas que la planilla de pedidos: todos los clientes activos (y los que tienen pedido ese día),
+    // de la A a la Z, aunque no hayan pedido nada. Así cada casillero está siempre en el mismo lugar.
+    _clientesColumnas(visibles) {
+        const porId = new Map();
+        (AppState.clientes || [])
+            .filter(c => c.activo !== false && c.activo !== 'false')
+            .forEach(c => porId.set(String(c.id), { id: String(c.id), nombre: c.nombre || 'Cliente' }));
+        (this._pedidosDia || []).forEach(p => {
+            const id = String(p.cliente_id);
+            if (porId.has(id)) return;
+            const cli = (AppState.clientes || []).find(x => String(x.id) === id);
+            porId.set(id, { id, nombre: p.cliente_nombre || cli?.nombre || 'Cliente' });
+        });
+        return [...porId.values()].sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    // Mismas filas que la planilla de pedidos: todos los productos, en el mismo orden y con los mismos grupos
+    // (verdura, fruta, bebida...), aunque no tengan pedido ese día (quedan como fila vacía).
+    _filasFijas(visibles, columnas) {
+        const porProducto = new Map();
+        visibles.forEach(item => {
+            const clave = String(item.producto_id);
+            if (!porProducto.has(clave)) porProducto.set(clave, []);
+            porProducto.get(clave).push(item);
+        });
+        const productos = (AppState.productos || []).slice().sort((a, b) =>
+            Utils.compararProductos({ id: a.id, nombre: a.nombre }, { id: b.id, nombre: b.nombre }));
+        const celdasVacias = (n) => '<td></td>'.repeat(n);
+        const vistos = new Set();
+        let html = '';
+        PlanillaPedidos.GRUPOS.forEach(grupo => {
+            const lista = productos.filter(p => PlanillaPedidos._tipoDe(p) === grupo.tipo);
+            if (!lista.length) return;
+            html += `<tr class="rp-grupo rp-grupo-${grupo.tipo}" data-nombre=""><th colspan="${columnas.length + 6}" scope="rowgroup">${Utils.esc(grupo.nombre)}</th></tr>`;
+            lista.forEach(producto => {
+                const items = porProducto.get(String(producto.id));
+                if (items) {
+                    vistos.add(String(producto.id));
+                    html += items.map(item => this._filaPlanilla(item, columnas)).join('');
+                    return;
+                }
+                html += `<tr class="rp-vacia" data-nombre="${Utils.esc(this._normalizarBusqueda(producto.nombre))}">
+                    <td class="rp-prod"><div class="rp-prod-celda"><span class="rp-prod-nombre">${Utils.esc(producto.nombre || '')}</span></div></td>
+                    ${celdasVacias(4)}${'<td class="rp-na" aria-hidden="true"></td>'.repeat(columnas.length)}${celdasVacias(1)}
+                </tr>`;
+            });
+        });
+        // Algo de la recepción que no figura en el catálogo (producto borrado): se muestra igual, al final.
+        visibles.filter(item => !vistos.has(String(item.producto_id))).forEach(item => {
+            html += this._filaPlanilla(item, columnas);
+        });
+        return html;
+    },
+
+    _pintarCabecera(planilla) {
+        const thead = document.getElementById('recepcion-thead');
+        const contenedor = document.getElementById('recepcion-tabla');
+        const boton = document.getElementById('recepcion-btn-vista');
+        if (contenedor) {
+            contenedor.classList.toggle('recepcion-planilla', planilla);
+            contenedor.style.setProperty('--rp-zoom', String(Number(this._zoom) / 100));
+        }
+        const completa = planilla && this._pantallaCompleta;
+        document.body.classList.toggle('recepcion-full', completa);
+        document.querySelectorAll('.rp-solo-planilla').forEach(el => { el.hidden = !planilla; });
+        const zoom = document.getElementById('recepcion-zoom');
+        if (zoom) zoom.value = this._zoom;
+        const btnFull = document.getElementById('recepcion-btn-full');
+        if (btnFull) btnFull.textContent = completa ? 'Salir de pantalla completa' : 'Pantalla completa';
+        if (boton) {
+            boton.textContent = planilla ? 'Ver lista simple' : 'Ver planilla';
+            boton.hidden = !planilla && !window.matchMedia('(min-width: 1101px)').matches;
+        }
+        if (!thead) return;
+        if (!planilla) {
+            thead.innerHTML = `<tr>
+                <th>Producto</th>
+                <th>Pedido</th>
+                <th>Llegó</th>
+                <th title="Costo por unidad que te cobró el proveedor">Precio real <span class="th-hint">(costo / u)</span></th>
+                <th>Proveedor</th>
+                <th>Acción</th>
+            </tr>`;
+        }
+    },
+
+    _renderPlanilla(visibles, tbody) {
+        const columnas = this._clientesColumnas(visibles);
+        const thead = document.getElementById('recepcion-thead');
+        if (thead) {
+            thead.innerHTML = `<tr>
+                <th class="rp-prod">Producto</th>
+                <th>Proveedor</th>
+                <th>Pedido</th>
+                <th>Llegó</th>
+                <th title="Costo por unidad que te cobró el proveedor">Precio <span class="th-hint">(costo / u)</span></th>
+                ${columnas.map(c => `<th class="rp-cli" title="${Utils.esc(c.nombre)}"><span>${Utils.esc(c.nombre)}</span></th>`).join('')}
+                <th class="rp-acc">Acción</th>
+            </tr>`;
+        }
+        // Con un proveedor elegido solo se ven sus productos; sin filtro, la estructura es fija.
+        tbody.innerHTML = this._filtroProveedor
+            ? visibles.map(item => this._filaPlanilla(item, columnas)).join('')
+            : this._filasFijas(visibles, columnas);
+        Utils.enablePriceInputs(tbody);
+        tbody.querySelectorAll('.recepcion-llego').forEach(input => this._marcarDistintos(input.getAttribute('data-producto-id')));
+        this._aplicarFiltroProducto();
+    },
+
+    _filaPlanilla(item, columnas) {
+        const clave = this._claveDe(item);
+        const confirmada = item.confirmado === true || item.confirmado === 'true';
+        const disabled = confirmada ? ' disabled' : '';
+        const clientes = this._clientesDe(clave);
+        const porId = Object.fromEntries(clientes.map(c => [c.cliente_id, c]));
+        const sinCargar = this._sinCargar(item);
+        const reparto = sinCargar
+            ? Object.fromEntries(clientes.map(c => [c.cliente_id, c.cantidadPedida]))
+            : this._repartoDe(item);
+        const mostrar = confirmada || sinCargar || Number(item.llego) > 0;
+        const llegoValor = mostrar ? Utils.formatCantidadInput(
+            sinCargar ? item.pedido_total : (clientes.length ? Object.values(reparto).reduce((t, n) => t + (Number(n) || 0), 0) : item.llego)
+        ) : '';
+        const precioValor = confirmada || Utils.parsePrice(item.precio_real) > 0 ? Utils.formatPrice(item.precio_real || 0) : '';
+        const acciones = confirmada
+            ? `<div class="recepcion-acciones-group">
+                <span class="status-badge status-activo" title="Confirmado">✓</span>
+                <button type="button" class="btn btn-secondary btn-sm btn-editar-recepcion-item" data-producto-id="${clave}">Editar</button>
+                <button type="button" class="btn btn-danger btn-sm btn-eliminar-recepcion-item" data-producto-id="${clave}" title="Eliminar la recepción de este producto">✕</button>
+               </div>`
+            : `<div class="recepcion-acciones-group"><button type="button" class="btn btn-primary btn-sm btn-confirmar-recepcion-item" data-producto-id="${clave}">Confirmar</button>`
+                + (item.extra ? `<button type="button" class="btn btn-danger btn-sm btn-quitar-proveedor-recepcion" data-producto-id="${clave}">Quitar</button>` : '')
+                + '</div>';
+        const celdas = columnas.map(col => {
+            const c = porId[col.id];
+            if (!c) return '<td class="rp-na" aria-hidden="true"></td>';
+            const valor = mostrar ? Utils.formatCantidadInput(reparto[col.id] || 0) : '';
+            return `<td class="rp-cel"><input type="number" step="any" min="0" class="recepcion-reparto" data-producto-id="${clave}" data-cliente-id="${Utils.esc(col.id)}" value="${valor}" placeholder="0"${disabled} title="${Utils.esc(col.nombre)}: cuánto le toca de lo que llegó">${c.cantidadPedida > 0 ? `<small class="rp-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</small>` : ''}</td>`;
+        }).join('');
+        return `
+            <tr${confirmada ? ' class="recepcion-row-confirmada"' : ''} data-nombre="${Utils.esc(this._normalizarBusqueda(item.producto_nombre))}">
+                <td class="rp-prod"><div class="rp-prod-celda"><span class="rp-prod-nombre">${item.extra ? `<span class="rp-sub">↳</span> ${Utils.esc(item.producto_nombre || '')}` : Utils.esc(item.producto_nombre || '')}</span>${!confirmada && !item.extra ? `<button type="button" class="btn btn-secondary btn-sm btn-dividir-proveedor" data-producto-id="${clave}" title="Agregar otro proveedor de este producto">+ Proveedor</button>` : ''}</div></td>
+                <td>${Utils.esc(item.proveedor_nombre || '')}</td>
+                <td>${item.extra ? '—' : Utils.formatCantidad(item.pedido_total || 0)}</td>
+                <td><input type="number" step="any" class="recepcion-llego rp-total" data-id="${item.id}" data-producto-id="${clave}" value="${llegoValor}" placeholder="0" readonly tabindex="-1" title="Es la suma de lo que le toca a cada cliente"></td>
+                <td><input type="text" class="recepcion-precio" data-id="${item.id}" data-producto-id="${clave}" data-price-input="true" value="${precioValor}" placeholder="0"${disabled} title="Lo que te cobró el proveedor por unidad"></td>
+                ${celdas}
+                <td class="recepcion-acciones rp-acc">${acciones}</td>
+            </tr>`;
+    },
+
+    async save() {
+        const items = [];
+        const productos = await API.getProductos();
+        
+        document.querySelectorAll('.recepcion-llego').forEach(input => {
+            const productoId = input.getAttribute('data-producto-id');
+            const llego = Utils.parseCantidad(input.value) || 0;
+            const id = input.getAttribute('data-id');
+            const precioInput = document.querySelector(`.recepcion-precio[data-id="${id}"]`);
+            const precio = Utils.parsePrice(precioInput ? precioInput.value : 0);
+            
+            const fila = this._item(productoId);
+            items.push({
+                producto_id: fila?.producto_id || this._partesClave(productoId).productoId,
+                proveedor_id: fila?.proveedor_id || '',
+                solo_si_pendiente: true,
+                ...(fila?.extra ? { extra: true } : {}),
+                llego: llego,
+                precio_real: precio,
+                reparto: this._repartoDeLaPantalla(productoId, llego)
+            });
+        });
+        
+        if (items.length === 0) {
+            Utils.showError('No hay datos para guardar');
+            return;
+        }
+        
+        try {
+            await API.saveRecepcion({
+                fecha: AppState.currentDate,
+                items: items
+            });
+            
+            Utils.showSuccess('Borrador guardado (sin confirmar)');
+            await DiaOperativo.refresh();
+            await this.load();
+        } catch (error) {
+            console.error('Error saving recepcion:', error);
+            Utils.showError('Error al guardar recepción: ' + error.message);
+        }
+    },
+
+    async confirmarCompletos() {
+        // Con un proveedor o una búsqueda, se confirma solo lo que se ve en pantalla.
+        const pendientes = this._visibles()
+            .filter(item => !this._filtroProducto || this._normalizarBusqueda(item.producto_nombre).includes(this._filtroProducto))
+            .filter(item => item.confirmado !== true && item.confirmado !== 'true');
+        if (pendientes.length === 0) {
+            Utils.showInfo('No hay productos pendientes de confirmar.');
+            return;
+        }
+
+        // Solo se confirma lo que tiene cantidad y precio cargados. Un producto en 0 no se da por
+        // "no llegó" en bloque: eso se confirma de a uno, a propósito.
+        const listos = [];
+        const incompletos = [];
+        const sinCargar = [];
+        pendientes.forEach(item => {
+            const { llego, precio, reparto } = this.getValoresProducto(this._claveDe(item));
+            const nombre = item.producto_nombre || 'producto';
+            if (!(llego > 0)) sinCargar.push(nombre);
+            else if (precio <= 0) incompletos.push(nombre);
+            else listos.push({ item, llego, precio, reparto });
+        });
+
+        if (listos.length === 0) {
+            Utils.showError('Cargá lo que llegó y el precio real de cada producto. Si algo no llegó, confirmalo con su propio botón Confirmar.');
+            return;
+        }
+
+        const aviso = (incompletos.length ? `\n\nQuedan sin confirmar (falta precio): ${incompletos.join(', ')}` : '')
+            + (sinCargar.length ? `\n\nSin cargar, no se confirman (si no llegaron, confirmalos uno por uno): ${sinCargar.join(', ')}` : '');
+        const ok = await Utils.showConfirm(`¿Confirmar ${listos.length} producto(s) con lo que llegó?${aviso}`);
+        if (!ok) return;
+
+        const anteriores = listos.map(entrada => ({ ...entrada.item }));
+        listos.forEach(entrada => {
+            const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === this._claveDe(entrada.item));
+            if (idx !== -1) {
+                AppState.recepcion[idx] = {
+                    ...AppState.recepcion[idx],
+                    llego: entrada.llego,
+                    precio_real: entrada.precio,
+                    reparto: entrada.reparto || null,
+                    confirmado: true
+                };
+            }
+            this._ajustarSaldoProveedor(entrada.item.proveedor_id, this._subtotal(entrada.llego, entrada.precio));
+        });
+        CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+        CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this.render();
+        Utils.avisar(`Se confirmaron ${listos.length} producto(s)`);
+        DiaOperativo.refreshSoon();
+
+        Utils.enSegundoPlano(async () => {
+            for (const entrada of listos) {
+                await API.confirmarRecepcionItem({
+                    fecha: AppState.currentDate,
+                    producto_id: entrada.item.producto_id,
+                    llego: entrada.llego,
+                    precio_real: entrada.precio,
+                    reparto: entrada.reparto || null,
+                    proveedor_id: entrada.item.proveedor_id,
+                    pedido_total: entrada.item.pedido_total,
+                    ...(entrada.item.extra ? { extra: true } : {})
+                });
+            }
+            this._armarListaPrecios();
+        }, () => {
+            listos.forEach(entrada => {
+                this._ajustarSaldoProveedor(entrada.item.proveedor_id, -this._subtotal(entrada.llego, entrada.precio));
+            });
+            anteriores.forEach(anterior => {
+                const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === this._claveDe(anterior));
+                if (idx !== -1) AppState.recepcion[idx] = anterior;
+            });
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+            this.render();
+            Utils.showError('No se pudo confirmar la recepción. Volvé a intentarlo.');
+        });
+    },
+
+    getValoresProducto(productoId) {
+        const llegoInput = document.querySelector(`.recepcion-llego[data-producto-id="${productoId}"]`);
+        const precioInput = document.querySelector(`.recepcion-precio[data-producto-id="${productoId}"]`);
+        const llego = Utils.parseCantidad(llegoInput?.value);
+        const precio = Utils.parsePrice(precioInput?.value || 0);
+        const llegoFinal = isNaN(llego) ? 0 : Math.max(0, llego);
+        return { llego: llegoFinal, precio, reparto: this._repartoDeLaPantalla(productoId, llegoFinal) };
+    },
+
+    async confirmarProducto(productoId, valores = null) {
+        const item = AppState.recepcion.find(r => this._claveDe(r) === String(productoId));
+        if (!item) {
+            Utils.showError('Producto no encontrado');
+            return;
+        }
+        if (item.confirmado === true || item.confirmado === 'true') {
+            Utils.showInfo('Este producto ya está confirmado');
+            return;
+        }
+
+        const { llego, precio, reparto } = valores || this.getValoresProducto(productoId);
+        if (llego > 0 && precio <= 0) {
+            Utils.showError('Ingresá el precio real antes de confirmar');
+            return;
+        }
+
+        const nombre = item.producto_nombre || 'producto';
+        const fechaLabel = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        const msgLlego = llego === 0
+            ? 'No llegó mercadería (0 unidades).'
+            : `Llegó: ${llego} · Precio real: ${Utils.formatCurrency(precio)}`;
+
+        const confirmar = await Utils.showConfirm(
+            `¿Confirmar recepción de "${nombre}"?\nPedido del ${fechaLabel}\n${msgLlego}\n\nPodrás corregirlo después con "Editar".`
+        );
+        if (!confirmar) return;
+
+        const anterior = { ...item };
+        const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
+        if (idx !== -1) {
+            AppState.recepcion[idx] = {
+                ...AppState.recepcion[idx],
+                llego,
+                precio_real: precio,
+                reparto: reparto || null,
+                confirmado: true
+            };
+        }
+        this._ajustarSaldoProveedor(item.proveedor_id, this._subtotal(llego, precio));
+        CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+        CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this.render();
+        Utils.avisar(`"${nombre}" confirmado`);
+        DiaOperativo.refreshSoon();
+
+        Utils.enSegundoPlano(async () => {
+            await API.confirmarRecepcionItem({
+                fecha: AppState.currentDate,
+                producto_id: item.producto_id,
+                llego,
+                precio_real: precio,
+                reparto: reparto || null,
+                proveedor_id: item.proveedor_id,
+                pedido_total: item.pedido_total,
+                ...(item.extra ? { extra: true } : {})
+            });
+            this._armarListaPrecios();
+        }, () => {
+            const actual = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
+            if (actual !== -1) AppState.recepcion[actual] = anterior;
+            this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(llego, precio));
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+            this.render();
+            Utils.showError('No se pudo confirmar "' + nombre + '".');
+        });
+    },
+
+    async editarProducto(productoId) {
+        const item = AppState.recepcion.find(r => this._claveDe(r) === String(productoId));
+        if (!item) {
+            Utils.showError('Producto no encontrado');
+            return;
+        }
+
+        const nombre = item.producto_nombre || 'producto';
+        const nombreSafe = nombre.replace(/"/g, '&quot;');
+        const clientesModal = this._clientesDe(productoId);
+        const repartoModal = this._repartoDe(item);
+        const content = `
+            <div class="form-group">
+                <label>Producto</label>
+                <input type="text" class="form-control" value="${nombreSafe}" disabled>
+            </div>
+            <div class="form-group">
+                <label>Pedido</label>
+                <input type="text" class="form-control" value="${item.pedido_total || 0}" disabled>
+            </div>
+            <div class="form-group">
+                <label>Llegó (total)</label>
+                <input type="number" step="any" id="modal-recepcion-llego" class="form-control" min="0" value="${item.llego || 0}">
+            </div>
+            ${clientesModal.length ? `
+            <div class="form-group">
+                <label>Para cada cliente</label>
+                <div id="modal-recepcion-reparto" class="recepcion-cli-modal">
+                    ${clientesModal.map(c => `
+                    <label class="recepcion-cli">
+                        <span class="recepcion-cli-nombre">${Utils.esc(c.nombre)}</span>
+                        <span class="recepcion-cli-pidio">pidió ${Utils.formatCantidad(c.cantidadPedida)}</span>
+                        <input type="number" step="any" min="0" class="modal-reparto" data-producto-id="${this._claveDe(item)}" data-cliente-id="${Utils.esc(c.cliente_id)}" value="${Utils.formatCantidadInput(repartoModal[c.cliente_id] || 0)}">
+                    </label>`).join('')}
+                </div>
+                <small class="modal-hint">${this._planilla ? 'Cargá lo que le toca a cada cliente: el total se ajusta solo.' : 'Si cambiás el total, se reparte en proporción a lo pedido. Si cambiás lo de un cliente, el total se ajusta solo.'}</small>
+            </div>` : ''}
+            <div class="form-group">
+                <label>Precio real (costo por unidad)</label>
+                <input type="text" id="modal-recepcion-precio" class="form-control" data-price-input="true" value="${Utils.formatPrice(item.precio_real || 0)}" placeholder="Costo del proveedor" title="Lo que te cobró el proveedor por unidad">
+                <small class="modal-hint">Lo que te cobró el proveedor por unidad. No es el precio al cliente.</small>
+            </div>
+        `;
+
+        Utils.showModal('Editar recepción', content, async () => {
+            const llego = Utils.parseCantidad(document.getElementById('modal-recepcion-llego').value);
+            const precio = Utils.parsePrice(document.getElementById('modal-recepcion-precio').value);
+
+            if (isNaN(llego) || llego < 0) {
+                Utils.showError('Ingresá una cantidad válida en "Llegó"');
+                throw new Error('Cantidad inválida');
+            }
+            const modalBody = document.getElementById('modal-body');
+            const reparto = this._repartoDeLaPantalla(productoId, llego, modalBody);
+            if (llego > 0 && precio <= 0) {
+                Utils.showError('Ingresá el precio real cuando llegó mercadería');
+                throw new Error('Precio real requerido');
+            }
+
+            const yaConfirmado = item.confirmado === true || item.confirmado === 'true';
+            const anterior = { llego: item.llego, precio_real: item.precio_real, reparto: item.reparto || null };
+            const delta = (yaConfirmado ? this._subtotal(llego, precio) : 0) - (yaConfirmado ? this._subtotal(item.llego, item.precio_real) : 0);
+            const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
+            if (idx !== -1) {
+                AppState.recepcion[idx] = {
+                    ...AppState.recepcion[idx],
+                    llego,
+                    precio_real: precio,
+                    reparto: reparto || null
+                };
+            }
+            this._ajustarSaldoProveedor(item.proveedor_id, delta);
+            this._ponerBorrador(AppState.currentDate, productoId, llego, precio, reparto);
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+            CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+            this.render();
+            Utils.avisar(`Recepción de "${nombre}" actualizada`);
+
+            Utils.enSegundoPlano(async () => {
+                await API.saveRecepcion({
+                    fecha: AppState.currentDate,
+                    items: [{
+                        producto_id: item.producto_id,
+                        llego,
+                        precio_real: precio,
+                        reparto: reparto || null,
+                        pedido_total: item.pedido_total,
+                        proveedor_id: item.proveedor_id
+                    }]
+                });
+                if (yaConfirmado) this._armarListaPrecios();
+            }, () => {
+                const actual = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
+                if (actual !== -1) {
+                    AppState.recepcion[actual] = {
+                        ...AppState.recepcion[actual],
+                        llego: anterior.llego,
+                        precio_real: anterior.precio_real,
+                        reparto: anterior.reparto
+                    };
+                }
+                this._ajustarSaldoProveedor(item.proveedor_id, -delta);
+                this._ponerBorrador(AppState.currentDate, productoId, anterior.llego, anterior.precio_real, anterior.reparto);
+                CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+                this.render();
+                Utils.showError('No se pudo guardar la recepción.');
+            });
+        });
+
+        // Dentro del cuadro: el total y lo de cada cliente se mantienen de acuerdo entre sí.
+        // (Los listeners van en elementos del cuadro, que se crean de nuevo cada vez que se abre.)
+        const cuerpo = document.getElementById('modal-body');
+        const totalModal = document.getElementById('modal-recepcion-llego');
+        const listaModal = document.getElementById('modal-recepcion-reparto');
+        if (cuerpo && totalModal && listaModal) {
+            totalModal.addEventListener('input', () => {
+                const n = Utils.parseCantidad(totalModal.value);
+                const auto = this._repartoAuto(clientesModal, isNaN(n) ? 0 : n);
+                this._inputsReparto(productoId, cuerpo).forEach(input => {
+                    input.value = Utils.formatCantidadInput(auto[input.getAttribute('data-cliente-id')] || 0);
+                });
+            });
+            listaModal.addEventListener('input', () => {
+                totalModal.value = this._sumarReparto(productoId, cuerpo);
+            });
+        }
+    },
+
+    // La mercadería de un producto puede venir de más de un proveedor sin que coincida con lo pedido
+    // por cada cliente: se agrega una fila por proveedor con lo que llegó de cada uno.
+    agregarProveedor(clave) {
+        const item = this._item(clave);
+        if (!item) return;
+        const usados = new Set((AppState.recepcion || [])
+            .filter(r => String(r.producto_id) === String(item.producto_id))
+            .map(r => String(r.proveedor_id || '')));
+        const disponibles = Pedidos.getProveedoresActivos(AppState.proveedores || []).filter(p => !usados.has(String(p.id)));
+        if (!disponibles.length) {
+            Utils.showInfo('Ya están todos los proveedores de este producto.');
+            return;
+        }
+        const content = `
+            <p class="modal-hint">Agregá otro proveedor de "${Utils.esc(item.producto_nombre || '')}". Después cargá cuánto llegó de cada uno y a qué precio.</p>
+            <div class="form-group">
+                <label for="modal-recepcion-proveedor-extra">Proveedor</label>
+                <select id="modal-recepcion-proveedor-extra" class="form-control">
+                    ${disponibles.map(p => `<option value="${Utils.esc(p.id)}">${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+            </div>`;
+        Utils.showModal('Agregar proveedor', content, async () => {
+            const proveedorId = document.getElementById('modal-recepcion-proveedor-extra').value;
+            if (!proveedorId) return true;
+            await API.saveRecepcion({
+                fecha: AppState.currentDate,
+                items: [{ producto_id: item.producto_id, proveedor_id: proveedorId, pedido_total: 0, llego: 0, precio_real: 0, extra: true }]
+            });
+            await this.load();
+        }, 'Agregar');
+    },
+
+    async quitarProveedor(clave) {
+        const item = this._item(clave);
+        if (!item || !item.extra) return;
+        try {
+            await API.deleteRecepcionItem({
+                fecha: AppState.currentDate,
+                producto_id: item.producto_id,
+                proveedor_id: item.proveedor_id || ''
+            });
+            this._quitarBorrador(AppState.currentDate, clave);
+            await this.load();
+        } catch (error) {
+            Utils.showError('No se pudo quitar el proveedor: ' + error.message);
+        }
+    },
+
+    async eliminarProducto(productoId) {
+        const item = AppState.recepcion.find(r => this._claveDe(r) === String(productoId));
+        if (!item) {
+            Utils.showError('Producto no encontrado');
+            return;
+        }
+
+        const nombre = item.producto_nombre || 'producto';
+
+        // Pedir confirmación ANTES de mostrar el loader
+        const confirmar = await Utils.showConfirm(
+            `¿Eliminar la recepción de "${nombre}"?\n\nSe borrarán los datos cargados (llegó y precio). El producto seguirá en el pedido del día.`
+        );
+        if (!confirmar) return;
+
+        const estabaConfirmado = item.confirmado === true || item.confirmado === 'true';
+        const anterior = { ...item };
+        if (estabaConfirmado) {
+            this._ajustarSaldoProveedor(item.proveedor_id, -this._subtotal(item.llego, item.precio_real));
+        }
+        const idx = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
+        if (idx !== -1) {
+            AppState.recepcion[idx] = {
+                ...AppState.recepcion[idx],
+                id: 'temp-' + productoId,
+                llego: 0,
+                precio_real: 0,
+                confirmado: false
+            };
+        }
+        CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+        CacheManager.invalidate(`flujo:${AppState.currentDate}`);
+        this._ponerBorrador(AppState.currentDate, productoId, 0, 0);
+        this.render();
+        Utils.avisar(`Recepción de "${nombre}" eliminada`);
+        DiaOperativo.refreshSoon();
+
+        Utils.enSegundoPlano(async () => {
+            await API.deleteRecepcionItem({
+                fecha: AppState.currentDate,
+                producto_id: item.producto_id,
+                proveedor_id: item.proveedor_id || ''
+            });
+            if (estabaConfirmado) this._armarListaPrecios();
+        }, () => {
+            const actual = AppState.recepcion.findIndex(r => this._claveDe(r) === String(productoId));
+            if (actual !== -1) AppState.recepcion[actual] = anterior;
+            if (estabaConfirmado) {
+                this._ajustarSaldoProveedor(anterior.proveedor_id, this._subtotal(anterior.llego, anterior.precio_real));
+            }
+            CacheManager.set(`recepcion:${AppState.currentDate}`, AppState.recepcion);
+            this._ponerBorrador(AppState.currentDate, productoId, anterior.llego, anterior.precio_real);
+            this.render();
+            Utils.showError('No se pudo eliminar la recepción.');
+        });
+    },
+
+    // Una por vez: si se confirma de seguido, las corridas superpuestas se pisaban entre sí
+    // (cada una guardaba lo que había leído antes de que terminara la otra).
+    _armarListaPrecios() {
+        const corrida = (this._colaLista || Promise.resolve()).then(() => this._armarListaPreciosAhora());
+        this._colaLista = corrida.catch(() => {});
+        return corrida;
+    },
+
+    async _armarListaPreciosAhora() {
+        try {
+            return await Precios.armarLista({ silencioso: true, ajustarNoConfirmados: true });
+        } catch (error) {
+            // Un producto de varios proveedores no cuenta como confirmado hasta que lo está cada uno:
+            // mientras falten filas la lista todavía no se puede armar, y no es un error.
+            if (/No se encontraron productos con recepción confirmada|No hay recepciones confirmadas|No hay pedidos para armar/.test(String(error && error.message))) return null;
+            console.error('Error armando lista de precios:', error);
+            Utils.showWarning('La recepción quedó guardada, pero no se pudo armar la lista de precios. Podés usar Armar lista en Precios al cliente.');
+            return null;
+        }
+    },
+
+    _textoListaPrecios(lista) {
+        if (!lista) return '';
+        const aviso = lista.aviso ? ` ${lista.aviso}` : '';
+        return ` La lista de precios quedó armada.${aviso}`;
+    }
+};
+
+// Comisión de reparto: cada producto tiene su regla. Por defecto usa la comisión general del día;
+// también puede no llevar, llevar un monto fijo por unidad o un porcentaje de la cantidad (la sandía
+// va por kilo: de 500 kg al 10 % se cobra la comisión general por 50 bultos).
+const Comisiones = {
+    TIPOS: [
+        { valor: '', texto: 'Automática (según el tipo de producto)' },
+        { valor: 'general', texto: 'General del día' },
+        { valor: 'ninguna', texto: 'Sin comisión' },
+        { valor: 'monto', texto: 'Monto fijo por unidad' },
+        { valor: 'porcentaje', texto: 'Porcentaje de la cantidad' }
+    ],
+
+    porcentaje(valor) {
+        const n = parseFloat(String(valor ?? '').replace(',', '.'));
+        return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n * 100) / 100, 100) : 0;
+    },
+
+    // Si el producto no tiene una regla propia, la comisión sale de su tipo: verduras y frutas llevan la
+    // comisión fija (la general del día); bebidas y mercadería no llevan. Zapallo criollo y sandía no llevan
+    // la fija: tienen su propia comisión (por porcentaje) que se elige en el producto.
+    EXCEPTUADOS: ['zapallo criollo', 'sandia'],
+
+    defectoDe(producto) {
+        const tipo = PlanillaPedidos._tipoDe(producto);
+        if (tipo === 'bebida' || tipo === 'mercaderia') return { tipo: 'ninguna' };
+        if (tipo === 'verdura' || tipo === 'fruta') {
+            const nombre = FiltroTabla._normalizar(producto && producto.nombre);
+            if (this.EXCEPTUADOS.some(e => nombre.includes(e))) return { tipo: 'ninguna', sinDefinir: true };
+        }
+        return { tipo: '' };
+    },
+
+    // tipo/valor: lo que se aplica de verdad. guardado: lo que tiene elegido el producto ('' = automática).
+    reglaDe(productoId) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        let guardado = String(producto?.comision_tipo || '').toLowerCase();
+        if (!this.TIPOS.some(t => t.valor === guardado)) guardado = '';
+        if (guardado === '') {
+            const defecto = this.defectoDe(producto);
+            return { tipo: defecto.tipo, valor: 0, guardado, automatica: true, sinDefinir: !!defecto.sinDefinir };
+        }
+        const tipo = guardado === 'general' ? '' : guardado;
+        const valor = tipo === 'porcentaje' ? this.porcentaje(producto.comision_valor)
+            : tipo === 'monto' ? (Utils.parsePrice(producto.comision_valor) || 0) : 0;
+        return { tipo, valor, guardado, automatica: false, sinDefinir: false };
+    },
+
+    // Comisión por unidad de una línea según la regla del producto y la comisión general del día.
+    // Porcentaje: cada unidad paga ese porcentaje de la general (500 kg al 10 % = 50 bultos).
+    deLinea(productoId, precioCliente, general) {
+        const regla = this.reglaDe(productoId);
+        if (regla.tipo === 'ninguna') return { comision_unitaria: 0, comision_pct: 0 };
+        if (regla.tipo === 'monto') return { comision_unitaria: regla.valor, comision_pct: 0 };
+        if (regla.tipo === 'porcentaje') {
+            return { comision_unitaria: Math.round((Utils.parsePrice(general) || 0) * regla.valor) / 100, comision_pct: regla.valor };
+        }
+        return { comision_unitaria: Utils.parsePrice(general) || 0, comision_pct: 0 };
+    },
+
+    texto(regla, general) {
+        if (regla.sinDefinir) return 'Sin definir: elegí su comisión (porcentaje)';
+        if (regla.tipo === 'ninguna') return regla.automatica ? 'Sin comisión (automático)' : 'Sin comisión';
+        if (regla.tipo === 'monto') return `${Utils.formatCurrency(regla.valor)} por unidad`;
+        if (regla.tipo === 'porcentaje') {
+            const porUnidad = Math.round((Utils.parsePrice(general) || 0) * regla.valor) / 100;
+            return `${String(regla.valor).replace('.', ',')} % de la cantidad (${Utils.formatComision(porUnidad)} por unidad)`;
+        }
+        return `General (${Utils.formatCurrency(Utils.parsePrice(general) || 0)})`;
+    },
+
+    // La comisión se le muestra al cliente aparte, como una línea al final: "1200 bultos × $500".
+    // Los productos con porcentaje suman sus bultos (500 kg al 10 % = 50 bultos) a la general; los de
+    // monto fijo van en su propia línea. El total es el mismo que se cobra (línea por línea).
+    resumen(lineas) {
+        const grupos = new Map();
+        (lineas || []).forEach(l => {
+            const cantidad = parseFloat(l.cantidad) || 0;
+            const unitaria = Utils.parseComision(l.comision_unitaria) || 0;
+            if (cantidad <= 0 || unitaria <= 0) return;
+            const pct = this.porcentaje(l.comision_pct);
+            const tarifa = pct > 0 ? Math.round(unitaria * 10000 / pct) / 100 : unitaria;
+            const bultos = pct > 0 ? cantidad * pct / 100 : cantidad;
+            const g = grupos.get(tarifa) || { tarifa, bultos: 0, total: 0 };
+            g.bultos += bultos;
+            g.total += Math.round(cantidad * unitaria);
+            grupos.set(tarifa, g);
+        });
+        return [...grupos.values()]
+            .map(g => ({ ...g, bultos: Math.round(g.bultos * 100) / 100 }))
+            .sort((a, b) => b.total - a.total);
+    },
+
+    bultosTexto(n) {
+        return String(n).replace('.', ',');
+    },
+
+    textoCorto(producto) {
+        const regla = this.reglaDe(producto.id);
+        if (regla.sinDefinir) return 'Sin definir';
+        if (regla.tipo === 'ninguna') return 'Sin comisión';
+        if (regla.tipo === 'monto') return Utils.formatCurrency(regla.valor);
+        if (regla.tipo === 'porcentaje') return `${String(regla.valor).replace('.', ',')} % de la cantidad`;
+        return 'General';
+    },
+
+    // Campos del formulario de producto (agregar y editar).
+    camposHtml(producto = {}) {
+        const regla = producto.id ? this.reglaDe(producto.id) : { tipo: '', valor: 0, guardado: '' };
+        return `
+            <div class="form-group">
+                <label class="checkbox-label" for="modal-producto-por-kilo">
+                    <input type="checkbox" id="modal-producto-por-kilo" ${PlanillaPedidos.esPorKilo(producto) ? 'checked' : ''}>
+                    Se vende por kilo
+                </label>
+                <small>Marcalo si se pide en kilos y puede llevar decimales (por ejemplo Sandía o Zapallo plomo). El resto se pide en bultos enteros.</small>
+            </div>
+            <div class="form-group">
+                <label for="modal-producto-comision-tipo">Comisión de reparto</label>
+                <select id="modal-producto-comision-tipo" class="form-control">
+                    ${this.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.guardado ? 'selected' : ''}>${t.texto}</option>`).join('')}
+                </select>
+                <small>Automática: verduras y frutas llevan la comisión fija; bebidas y mercadería, no. Zapallo criollo y sandía llevan su propio porcentaje.</small>
+            </div>
+            <div class="form-group" id="modal-producto-comision-grupo" ${regla.tipo === 'monto' || regla.tipo === 'porcentaje' ? '' : 'hidden'}>
+                <label for="modal-producto-comision-valor" id="modal-producto-comision-label">${regla.tipo === 'porcentaje' ? 'Porcentaje de la cantidad (%)' : 'Monto por unidad ($)'}</label>
+                <input type="text" id="modal-producto-comision-valor" class="form-control" inputmode="decimal" value="${regla.valor ? String(regla.valor).replace('.', ',') : ''}" placeholder="${regla.tipo === 'porcentaje' ? 'Ej: 10' : 'Ej: 500'}">
+                <small id="modal-producto-comision-ayuda" ${regla.tipo === 'porcentaje' ? '' : 'hidden'}>Ej: 10 → de 500 kg se cobra la comisión general por 50 bultos.</small>
+            </div>
+        `;
+    },
+
+    activarCampos() {
+        const select = document.getElementById('modal-producto-comision-tipo');
+        if (!select) return;
+        select.addEventListener('change', () => {
+            const grupo = document.getElementById('modal-producto-comision-grupo');
+            const label = document.getElementById('modal-producto-comision-label');
+            const input = document.getElementById('modal-producto-comision-valor');
+            const conValor = select.value === 'monto' || select.value === 'porcentaje';
+            grupo.hidden = !conValor;
+            label.textContent = select.value === 'porcentaje' ? 'Porcentaje de la cantidad (%)' : 'Monto por unidad ($)';
+            document.getElementById('modal-producto-comision-ayuda').hidden = select.value !== 'porcentaje';
+            input.placeholder = select.value === 'porcentaje' ? 'Ej: 10' : 'Ej: 500';
+            if (conValor) input.focus();
+        });
+    },
+
+    // Lee el formulario. Devuelve null (y avisa) si falta el valor.
+    leerCampos() {
+        const tipo = document.getElementById('modal-producto-comision-tipo')?.value || '';
+        const crudo = document.getElementById('modal-producto-comision-valor')?.value || '';
+        const valor = tipo === 'porcentaje' ? this.porcentaje(crudo) : tipo === 'monto' ? (Utils.parsePrice(crudo) || 0) : '';
+        if ((tipo === 'monto' || tipo === 'porcentaje') && !(valor > 0)) {
+            Utils.showError(tipo === 'porcentaje' ? 'Poné el porcentaje de comisión (por ejemplo 10).' : 'Poné el monto de comisión por unidad.');
+            return null;
+        }
+        const porKilo = !!document.getElementById('modal-producto-por-kilo')?.checked;
+        return { comision_tipo: tipo, comision_valor: valor, por_kilo: porKilo };
+    }
+};
+
+// Precios
+const Precios = {
+    selectedClienteId: null,
+    comisionPorUnidad: 350,
+    // Varias personas cargan precios a la vez: al guardar se mandan solo las líneas que tocó
+    // este usuario. Si se mandaran todas, pisaría con lo viejo de su pantalla lo que cargó otro.
+    _tocadas: new Set(),
+    _comisionEditada: false,
+    recepciones: [], // Para obtener precio_real
+
+    // "cliente": la tabla de siempre para cargar precios. "planilla": todo el día de un vistazo.
+    vista: (() => { try { return localStorage.getItem('precios-vista') || 'cliente'; } catch (e) { return 'cliente'; } })(),
+
+    cambiarVista(vista) {
+        this.vista = vista === 'planilla' ? 'planilla' : 'cliente';
+        try { localStorage.setItem('precios-vista', this.vista); } catch (e) { /* sin almacenamiento */ }
+        this.renderPlanilla();
+    },
+
+    // Productos en filas y clientes en columnas: cuánto lleva cada uno, el total, el precio
+    // (lo que cobró el proveedor), el puesto y el precio total. Como la planilla que usaban en Excel.
+    _datosPlanilla() {
+        const precios = AppState.precios || [];
+        const clientesMap = new Map();
+        const productosMap = new Map();
+        precios.forEach(p => {
+            const cantidad = parseFloat(p.cantidad) || 0;
+            if (cantidad <= 0) return;
+            const cid = String(p.cliente_id);
+            if (!clientesMap.has(cid)) clientesMap.set(cid, { id: cid, nombre: Utils.nombreCatalogo(p, 'cliente') || 'Cliente' });
+            const pid = String(p.producto_id);
+            if (!productosMap.has(pid)) {
+                const recepcion = Recepcion.agregadoDe(this.recepciones, pid);
+                const producto = (AppState.productos || []).find(x => String(x.id) === pid);
+                const provId = String(recepcion?.proveedor_id || producto?.proveedor_default || '');
+                const proveedor = (AppState.proveedores || []).find(x => String(x.id) === provId);
+                productosMap.set(pid, {
+                    id: pid,
+                    producto: Utils.nombreCatalogo(p, 'producto') || 'Producto',
+                    precio: Utils.parsePrice(recepcion?.precio_real) || 0,
+                    puesto: proveedor?.nombre || recepcion?.proveedor_nombre || '',
+                    cants: {},
+                    total: 0
+                });
+            }
+            const fila = productosMap.get(pid);
+            fila.cants[cid] = Math.round(((fila.cants[cid] || 0) + cantidad) * 100) / 100;
+            fila.total = Math.round((fila.total + cantidad) * 100) / 100;
+        });
+        const clientes = [...clientesMap.values()].sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+        const productos = [...productosMap.values()]
+            .map(f => ({ ...f, precioTotal: Math.round(f.total * f.precio) }))
+            .sort((a, b) => Utils.compararProductos({ id: a.id, nombre: a.producto }, { id: b.id, nombre: b.producto }));
+        return { clientes, productos, total: productos.reduce((s, f) => s + f.precioTotal, 0) };
+    },
+
+    renderPlanilla() {
+        const planilla = document.getElementById('precios-planilla');
+        const vistaCliente = document.getElementById('precios-vista-cliente');
+        if (!planilla) return;
+        const enPlanilla = this.vista === 'planilla';
+        planilla.hidden = !enPlanilla;
+        if (vistaCliente) vistaCliente.hidden = enPlanilla;
+        document.getElementById('btn-precios-vista-cliente')?.classList.toggle('activo', !enPlanilla);
+        document.getElementById('btn-precios-vista-planilla')?.classList.toggle('activo', enPlanilla);
+        if (!enPlanilla) return;
+
+        const tabla = document.getElementById('precios-planilla-tabla');
+        const { clientes, productos, total } = this._datosPlanilla();
+        if (!productos.length) {
+            tabla.innerHTML = '<tbody><tr><td style="padding:30px;color:#666;">Todavía no hay productos confirmados en la recepción de este día.</td></tr></tbody>';
+            return;
+        }
+        const cant = n => (n ? String(n).replace('.', ',') : '');
+        const fecha = AppState.currentDate ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR') : '';
+        tabla.innerHTML = `
+            <thead>
+                <tr>
+                    <th class="pl-producto">${Utils.esc(fecha)} · Producto</th>
+                    ${clientes.map(c => `<th>${Utils.esc(c.nombre)}</th>`).join('')}
+                    <th class="pl-total">Total cant.</th>
+                    <th>Precio</th>
+                    <th>Puesto</th>
+                    <th>Precio total</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${productos.map(f => `
+                <tr>
+                    <td class="pl-producto">${Utils.esc(f.producto)}</td>
+                    ${clientes.map(c => `<td>${cant(f.cants[c.id])}</td>`).join('')}
+                    <td class="pl-total">${cant(f.total)}</td>
+                    <td class="pl-dinero">${f.precio ? Utils.formatCurrency(f.precio) : '—'}</td>
+                    <td class="pl-puesto">${Utils.esc(f.puesto || '—')}</td>
+                    <td class="pl-dinero">${f.precio ? Utils.formatCurrency(f.precioTotal) : '—'}</td>
+                </tr>`).join('')}
+            </tbody>
+            <tfoot>
+                <tr>
+                    <td class="pl-producto">Total</td>
+                    ${clientes.map(() => '<td></td>').join('')}
+                    <td class="pl-total"></td>
+                    <td></td>
+                    <td></td>
+                    <td class="pl-dinero">${Utils.formatCurrency(total)}</td>
+                </tr>
+            </tfoot>
+        `;
+    },
+
+    async descargarPlanillaExcel() {
+        try {
+            const XLSX = await Dashboard._cargarXlsx();
+            const { clientes, productos, total } = this._datosPlanilla();
+            if (!productos.length) {
+                Utils.showInfo('Todavía no hay productos confirmados en la recepción de este día.');
+                return;
+            }
+            const fecha = AppState.currentDate ? new Date(AppState.currentDate + 'T12:00:00') : '';
+            const filas = [
+                [fecha, ...clientes.map(c => c.nombre), 'TOTAL', 'PRECIO', 'PUESTO', 'PRECIO TOTAL'],
+                ['PRODUCTO', ...clientes.map(() => 'CANT'), 'CANT', '', '', ''],
+                ...productos.map(f => [f.producto, ...clientes.map(c => f.cants[c.id] || ''), f.total, f.precio || '', f.puesto, f.precio ? f.precioTotal : '']),
+                [],
+                ['TOTAL', ...clientes.map(() => ''), '', '', '', total]
+            ];
+            const hoja = XLSX.utils.aoa_to_sheet(filas, { cellDates: true, dateNF: 'dd/mm/yyyy' });
+            const colPrecio = clientes.length + 2;
+            const rango = XLSX.utils.decode_range(hoja['!ref']);
+            for (let r = 2; r <= rango.e.r; r++) {
+                [colPrecio, colPrecio + 2].forEach(c => {
+                    const celda = hoja[XLSX.utils.encode_cell({ r, c })];
+                    if (celda && typeof celda.v === 'number') celda.z = '"$" #,##0';
+                });
+            }
+            hoja['!cols'] = [{ wch: 26 }, ...clientes.map(() => ({ wch: 10 })), { wch: 10 }, { wch: 12 }, { wch: 18 }, { wch: 14 }];
+            const libro = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(libro, hoja, 'Planilla');
+            XLSX.writeFile(libro, `planilla-${AppState.currentDate || 'dia'}.xlsx`);
+        } catch (error) {
+            console.error('Error armando la planilla:', error);
+            Utils.showError('No se pudo armar el Excel: ' + error.message);
+        }
+    },
+    
+    // Una vez por día y por sesión: quita de la lista las líneas cuyo pedido ya no existe.
+    _limpiadas: new Set(),
+    _limpiarSinPedido(fecha) {
+        if (this._limpiadas.has(fecha) || DiaOperativo.diaCerrado(fecha)) return;
+        this._limpiadas.add(fecha);
+        API.limpiarPreciosHuerfanos(fecha).then(res => {
+            if (res && res.quitadas > 0 && AppState.currentDate === fecha) {
+                AppState.fechaCargada = null;
+                AppState.precios = [];
+                CacheManager.invalidate(`precios:${fecha}`);
+                if (AppState.currentPage === 'precios') this.load();
+            }
+        }).catch(error => {
+            this._limpiadas.delete(fecha);
+            console.warn('No se pudieron limpiar líneas sin pedido:', error);
+        });
+    },
+
+    async load() {
+        await this._cargar();
+        // Pedidos que se cargaron o cambiaron después de confirmar la recepción no tenían línea de precio.
+        this.completarFaltantes(AppState.currentDate);
+    },
+
+    // Crea las líneas de precio que faltan: pedidos con mercadería recibida (recepción confirmada con
+    // "llegó" > 0) y sin línea. La lista solo se armaba al confirmar la recepción, así que un pedido
+    // agregado o cambiado después quedaba sin precio, se enviaba igual y no se podía cargar ni cerrar el día.
+    // Se reintenta solo si lo que falta cambió: si armar la lista no los resuelve (por ejemplo falta confirmar
+    // a otro proveedor), no se queda en bucle.
+    _completando: false,
+    _completarPendiente: null,
+    _faltantesIntentados: new Map(),
+    async completarFaltantes(fecha, fresco = false) {
+        if (!fecha) return;
+        if (this._completando) {
+            this._completarPendiente = fecha;
+            return;
+        }
+        if (DiaOperativo.diaCerrado(fecha) || DiaOperativo.diaSinPedidos(fecha)) return;
+        this._completando = true;
+        try {
+            // Tras cambiar pedidos, lo guardado en memoria puede ser anterior al cambio.
+            if (fresco) {
+                CacheManager.invalidate(`pedidos:${fecha}`);
+                CacheManager.invalidate(`precios:${fecha}`);
+            }
+            const [pedidos, recepciones, precios] = await Promise.all([
+                API.getPedidos(fecha),
+                API.getRecepcion(fecha),
+                API.getPreciosCliente(fecha)
+            ]);
+            const confirmada = r => r.confirmado === true || r.confirmado === 'true';
+            const llegoPorProducto = {};
+            (recepciones || []).filter(confirmada).forEach(r => {
+                llegoPorProducto[String(r.producto_id)] = (llegoPorProducto[String(r.producto_id)] || 0) + (parseFloat(r.llego) || 0);
+            });
+            const conLinea = new Set((precios || []).map(p => `${p.cliente_id}|${p.producto_id}`));
+            const faltan = (pedidos || [])
+                .filter(p => (parseFloat(p.cantidad) || 0) > 0
+                    && llegoPorProducto[String(p.producto_id)] > 0
+                    && !conLinea.has(`${p.cliente_id}|${p.producto_id}`))
+                .map(p => `${p.cliente_id}|${p.producto_id}`)
+                .sort()
+                .join(',');
+            if (!faltan || this._faltantesIntentados.get(fecha) === faltan) return;
+            this._faltantesIntentados.set(fecha, faltan);
+            const lista = await Recepcion._armarListaPrecios();
+            if (lista) Utils.avisar('Se agregaron a la lista de precios pedidos que no la tenían');
+        } catch (error) {
+            console.warn('No se pudo completar la lista de precios:', error);
+        } finally {
+            this._completando = false;
+            const pendiente = this._completarPendiente;
+            this._completarPendiente = null;
+            if (pendiente) this.completarFaltantes(pendiente);
+        }
+    },
+
+    async _cargar() {
+        const tbody = document.getElementById('precios-tbody');
+        if (!tbody) return;
+
+        const fecha = AppState.currentDate;
+        if (DiaOperativo.diaSinPedidos(fecha)) {
+            AppState.precios = [];
+            AppState.fechaCargada = fecha;
+            this.recepciones = [];
+            this.render();
+            return;
+        }
+        this._limpiarSinPedido(fecha);
+
+        const preciosFrescos = CacheManager.get(`precios:${fecha}`);
+        const cachedPrecios = preciosFrescos || CacheManager.peek(`precios:${fecha}`);
+        const flujoLocal = DataLoader.armarFlujoLocal(fecha);
+        if (flujoLocal) {
+            AppState.precios = flujoLocal.precios || [];
+            this.recepciones = flujoLocal.recepcion || [];
+            AppState.fechaCargada = fecha;
+            this._sincronizarComision();
+            this.render();
+            this.loadClientesFilter();
+            return;
+        }
+
+        const hasStale = AppState.fechaCargada === fecha || AppState.precios.length > 0 || cachedPrecios;
+        if (hasStale) {
+            if (!AppState.precios.length && cachedPrecios) AppState.precios = cachedPrecios;
+            this.recepciones = CacheManager.peek(`recepcion:${fecha}`) || this.recepciones;
+            this._sincronizarComision();
+            this.render();
+            if (Array.isArray(preciosFrescos) || AppState.fechaCargada === fecha) {
+                this.loadClientesFilter();
+                return;
+            }
+        } else {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#666;">Buscando precios…</td></tr>';
+        }
+
+        try {
+            const flujo = await DataLoader.getFlujo(fecha);
+            AppState.precios = flujo.precios || [];
+            this.recepciones = flujo.recepcion || [];
+            
+            await this.loadClientesFilter();
+            
+            // Restaurar filtro si existe (solo si el elemento existe en el DOM)
+            const filtroCliente = document.getElementById('precios-filtro-cliente');
+            const savedClienteId = localStorage.getItem('precios-selected-cliente');
+            if (savedClienteId && filtroCliente) {
+                this.selectedClienteId = savedClienteId;
+                filtroCliente.value = savedClienteId;
+            }
+            this._mostrarClienteElegido();
+            
+            this._sincronizarComision();
+            this.render();
+        } catch (error) {
+            console.error('Error loading precios:', error);
+            Utils.hideTableLoader(tbody);
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 30px; color: #d32f2f;">Error al cargar precios. Por favor, intenta nuevamente.</td></tr>';
+        }
+    },
+    
+    async loadClientesFilter() {
+        const select = document.getElementById('precios-filtro-cliente');
+        if (!select) return;
+        
+        try {
+            const clientes = AppState.clientes?.length
+                ? AppState.clientes
+                : await API.getClientes();
+            const activeClientes = clientes.filter(c => c.activo !== false);
+            
+            // Mantener la opción "Todos los clientes"
+            const currentValue = select.value;
+            select.innerHTML = '<option value="">Todos los clientes</option>';
+            
+            activeClientes.forEach(cliente => {
+                const option = document.createElement('option');
+                option.value = cliente.id;
+                option.textContent = cliente.nombre;
+                select.appendChild(option);
+            });
+            
+            // Restaurar valor seleccionado
+            if (currentValue) {
+                select.value = currentValue;
+            }
+        } catch (error) {
+            console.error('Error loading clientes for filter:', error);
+        }
+    },
+    
+    filterByCliente(clienteId) {
+        this.selectedClienteId = clienteId;
+        localStorage.setItem('precios-selected-cliente', clienteId || '');
+        this.render();
+    },
+    
+    // Buscador de la tabla: además de filtrar filas, lista en vivo los clientes que coinciden; al elegir uno la tabla muestra solo ese.
+    _norm(texto) {
+        return String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    },
+
+    _mostrarClienteElegido() {
+        const input = document.getElementById('precios-buscador');
+        if (!input) return;
+        const cliente = this.selectedClienteId
+            ? (AppState.clientes || []).find(c => String(c.id) === String(this.selectedClienteId))
+            : null;
+        input.value = cliente ? cliente.nombre : '';
+    },
+
+    _ocultarSugerencias() {
+        const lista = document.getElementById('precios-cliente-sugerencias');
+        if (lista) { lista.hidden = true; lista.innerHTML = ''; }
+    },
+
+    _mostrarSugerencias(texto) {
+        const lista = document.getElementById('precios-cliente-sugerencias');
+        if (!lista) return;
+        const q = this._norm(texto);
+        const coinciden = q
+            ? (AppState.clientes || []).filter(c => c.activo !== false && this._norm(c.nombre).includes(q))
+            : [];
+        lista.innerHTML = '';
+        if (!coinciden.length) { lista.hidden = true; return; }
+        coinciden.forEach(c => {
+            const op = document.createElement('div');
+            op.className = 'opcion';
+            op.dataset.id = c.id;
+            op.textContent = c.nombre;
+            op.addEventListener('mousedown', (e) => { e.preventDefault(); this.elegirCliente(c.id); });
+            lista.appendChild(op);
+        });
+        lista.hidden = false;
+    },
+
+    elegirCliente(clienteId) {
+        const select = document.getElementById('precios-filtro-cliente');
+        if (select) select.value = clienteId || '';
+        this.filterByCliente(clienteId || null);
+        this._mostrarClienteElegido();
+        this._ocultarSugerencias();
+    },
+
+    _teclaBuscador(e) {
+        const lista = document.getElementById('precios-cliente-sugerencias');
+        if (!lista || lista.hidden) return;
+        const ops = Array.from(lista.querySelectorAll('.opcion'));
+        const i = ops.findIndex(o => o.classList.contains('activa'));
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            const nuevo = e.key === 'ArrowDown' ? (i + 1) % ops.length : (i <= 0 ? ops.length - 1 : i - 1);
+            ops.forEach(o => o.classList.remove('activa'));
+            ops[nuevo].classList.add('activa');
+            ops[nuevo].scrollIntoView({ block: 'nearest' });
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            const elegido = i >= 0 ? ops[i] : (ops.length === 1 ? ops[0] : null);
+            if (elegido) this.elegirCliente(elegido.dataset.id);
+        } else if (e.key === 'Escape') {
+            this._ocultarSugerencias();
+        }
+    },
+
+    updateComision() {
+        const comisionInput = document.getElementById('precios-comision');
+        if (comisionInput) {
+            const antes = this.comisionPorUnidad;
+            this.comisionPorUnidad = Utils.parsePrice(comisionInput.value) || 0;
+            if (this.comisionPorUnidad !== antes) this._comisionEditada = true;
+            comisionInput.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
+            localStorage.setItem('precios-comision', this.comisionPorUnidad.toString());
+            if (this.comisionPorUnidad !== antes) {
+                // Sin rearmar la tabla: si no, el campo de precio que se acaba de tocar desaparece.
+                this.refrescarCalculo();
+                this.renderComisionesProducto();
+                clearTimeout(this._comisionTimer);
+                this._comisionTimer = setTimeout(() => this._guardarComision(), 1200);
+            }
+        }
+    },
+
+    // La comisión del día es la que está guardada en sus líneas de precios. Se lee en cada carga de la
+    // pantalla (también cuando los datos ya estaban en memoria): si no, el campo quedaba en 350 y las
+    // cuentas y el próximo guardado usaban ese valor viejo.
+    _sincronizarComision() {
+        if (this._comisionTimer && this._comisionEditada) return; // el usuario la está cambiando
+        const guardada = this._lineaGeneral(AppState.precios);
+        if (guardada) {
+            this.comisionPorUnidad = Utils.parsePrice(guardada.comision_unitaria);
+        } else {
+            let enNavegador = null;
+            try { enNavegador = localStorage.getItem('precios-comision'); } catch (error) { /* sin almacenamiento */ }
+            if (enNavegador !== null && enNavegador !== '') this.comisionPorUnidad = Utils.parsePrice(enNavegador) || 0;
+        }
+        const input = document.getElementById('precios-comision');
+        if (input && document.activeElement !== input) {
+            input.value = this.comisionPorUnidad > 0 ? Utils.formatPrice(this.comisionPorUnidad) : '';
+        }
+    },
+
+    // Una línea de un producto que usa la comisión general (de ahí se lee la del día).
+    _lineaGeneral(lineas) {
+        return (lineas || []).find(p => Comisiones.reglaDe(p.producto_id).tipo === '' && Utils.parsePrice(p.comision_unitaria) > 0);
+    },
+
+    // Comisión por unidad de una línea. En un día cerrado vale lo que quedó guardado (es lo que se
+    // cobró); en un día abierto sale de la regla del producto.
+    // Costo por unidad de la mercadería de una línea (cliente + producto), tal como se cargó en la recepción.
+    // Con un solo proveedor es exactamente el precio real que se puso al confirmar. Si el producto llegó de más de un
+    // proveedor a distinto precio y se repartió a mano, es el promedio de lo que recibió ESE cliente de cada uno
+    // (antes era el promedio de todo lo que llegó, igual para todos los clientes).
+    _costoDeLinea(precio) {
+        const agregado = Recepcion.agregadoDe(this.recepciones, precio.producto_id);
+        const confirmada = agregado && (agregado.confirmado === true || agregado.confirmado === 'true' || agregado.confirmado === 1);
+        if (!confirmada) return { costo: 0, detalle: [] };
+        const base = Utils.parsePrice(agregado.precio_real || 0);
+        const filas = Recepcion._filasUnicas(this.recepciones, precio.producto_id);
+        if (filas.length < 2) return { costo: base, detalle: [] };
+        let cantidad = 0;
+        let total = 0;
+        const detalle = [];
+        for (const fila of filas) {
+            if (!((parseFloat(fila.llego) || 0) > 0)) continue;
+            let reparto = fila.reparto;
+            if (typeof reparto === 'string') { try { reparto = JSON.parse(reparto); } catch (e) { reparto = null; } }
+            // Sin un reparto cargado a mano no se sabe cuánto de cada proveedor recibió este cliente.
+            if (!reparto || typeof reparto !== 'object') return { costo: base, detalle: [] };
+            const parte = Number(reparto[String(precio.cliente_id)]) || 0;
+            if (!(parte > 0)) continue;
+            const costo = Utils.parsePrice(fila.precio_real) || 0;
+            cantidad += parte;
+            total += parte * costo;
+            detalle.push({ proveedor: fila.proveedor_nombre || '', cantidad: parte, costo });
+        }
+        if (!(cantidad > 0)) return { costo: base, detalle: [] };
+        return { costo: Math.round(total / cantidad), detalle };
+    },
+
+    _textoMezcla(costoLinea) {
+        const partes = costoLinea.detalle.map(d => `${Utils.formatCantidad(d.cantidad)} a ${Utils.formatCurrency(d.costo)}${d.proveedor ? ' (' + d.proveedor + ')' : ''}`);
+        return `Llegó de más de un proveedor: ${partes.join(' + ')}. El costo es el promedio de lo que recibió este cliente.`;
+    },
+
+    _comisionLinea(precio, precioCliente = precio.precio_cliente) {
+        if (DiaOperativo.diaCerrado(AppState.currentDate)) {
+            return { comision_unitaria: Utils.parseComision(precio.comision_unitaria) || 0, comision_pct: Comisiones.porcentaje(precio.comision_pct) };
+        }
+        return Comisiones.deLinea(precio.producto_id, precioCliente, this.comisionPorUnidad);
+    },
+
+    // La comisión general es una por día: se guarda sola apenas se cambia, en todas las líneas del día
+    // de los productos que usan la general o un porcentaje de ella (aunque haya un cliente filtrado)
+    // y sin tocar los precios. Los de sin comisión o monto fijo no cambian.
+    _guardarComision() {
+        this._comisionTimer = null;
+        const fecha = AppState.currentDate;
+        const comision = this.comisionPorUnidad;
+        const lineas = (AppState.precios || []).filter(p =>
+            (!p.fecha || Utils.fechaIso(p.fecha) === fecha) && ['', 'porcentaje'].includes(Comisiones.reglaDe(p.producto_id).tipo));
+        if (!lineas.length || DiaOperativo.diaCerrado(fecha)) {
+            this._comisionEditada = false;
+            return;
+        }
+        lineas.forEach(p => Object.assign(p, Comisiones.deLinea(p.producto_id, p.precio_cliente, comision)));
+        this.sincronizarCobranza();
+        this.refrescarCalculo();
+        CacheManager.set(`precios:${fecha}`, AppState.precios);
+        const items = lineas.map(p => ({
+            cliente_id: p.cliente_id,
+            producto_id: p.producto_id,
+            cantidad: p.cantidad || 0,
+            precio_cliente: Utils.parsePrice(p.precio_cliente) || 0,
+            comision_unitaria: p.comision_unitaria,
+            comision_pct: p.comision_pct,
+            solo_comision: true
+        }));
+        this._comisionEditada = false;
+        Utils.enSegundoPlano(async () => {
+            await API.savePreciosCliente({ fecha, comision_por_unidad: comision, items });
+            CacheManager.set(`precios:${fecha}`, AppState.precios);
+            Utils.avisar(`Comisión general de ${Utils.formatCurrency(comision)} guardada (y los productos con porcentaje)`);
+        }, (error) => {
+            this._comisionEditada = true;
+            Utils.showError('No se pudo guardar la comisión: ' + (error && error.message || 'revisá la conexión') + '. Tocá "Guardar precios" para reintentar.');
+        });
+    },
+
+    render() {
+        const tbody = document.getElementById('precios-tbody');
+        const tfoot = document.getElementById('precios-tfoot');
+        const resumenDiv = document.getElementById('precios-resumen-cliente');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        this.renderPlanilla();
+        
+        // GUARDAR VALORES ACTUALES DE LOS INPUTS ANTES DE RENDERIZAR
+        // Precio real: lo que esté escrito en el campo (vacío = volver al de la recepción).
+        const realesInputs = {};
+        document.querySelectorAll('.precio-real').forEach(input => {
+            const id = input.getAttribute('data-id');
+            if (!id) return;
+            const valor = Utils.parsePrice((input.value || '').trim()) || 0;
+            // Si sigue el costo que se rellenó solo (data-auto), no es un cambio a mano: así, si la
+            // recepción se corrigió después, la línea toma el costo nuevo en vez de congelar el viejo.
+            realesInputs[id] = valor === (Number(input.dataset.auto) || 0) ? 0 : valor;
+        });
+        const preciosInputs = {};
+        document.querySelectorAll('.precio-cliente').forEach(input => {
+            const id = input.getAttribute('data-id');
+            const raw = (input.value || '').trim();
+            if (!id || !raw) return;
+            const value = Utils.parsePrice(raw) || 0;
+            if (!isNaN(value) && value > 0) {
+                preciosInputs[id] = value;
+            }
+        });
+        
+        // Filtrar precios por cliente si hay filtro activo
+        let preciosFiltrados = this._ordenados(AppState.precios || []);
+        if (this.selectedClienteId) {
+            preciosFiltrados = preciosFiltrados.filter(p => p.cliente_id === this.selectedClienteId);
+        }
+        
+        if (preciosFiltrados.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 30px; color: #666;">' +
+                '<div style="margin-bottom: 10px;">📋 No hay precios para el día de hoy' + 
+                (this.selectedClienteId ? ' para este cliente' : '') + '</div>' +
+                '<div style="font-size: 12px; color: #999;">Haz clic en "Generar lista" después de confirmar la recepción de productos</div>' +
+                '</td></tr>';
+            
+            // Ocultar resumen y footer si no hay datos
+            if (tfoot) tfoot.hidden = true;
+            if (resumenDiv) resumenDiv.style.display = 'none';
+            this.renderComisionesProducto();
+            return;
+        }
+        
+        // Calcular totales
+        let totalProductos = 0;
+        let totalCantidad = 0;
+        let totalGanancia = 0;
+        let totalComision = 0;
+        let clienteNombre = '';
+        
+        let rowsHtml = '';
+        
+        preciosFiltrados.forEach(precio => {
+            const cantidad = parseFloat(precio.cantidad || 0);
+            
+            // Precio al cliente: solo lo que escribió el usuario, nunca el precio real.
+            const precioUnitario = preciosInputs[precio.id] !== undefined 
+                ? preciosInputs[precio.id] 
+                : Utils.parsePrice(precio.precio_cliente || 0);
+            
+            // Obtener precio_real de la recepción
+            const costoLinea = this._costoDeLinea(precio);
+            const precioRealRecepcion = costoLinea.costo;
+            // Se completa solo con el costo de la recepción; si lo cambian a mano, vale el de la línea.
+            const precioRealLinea = realesInputs[precio.id] !== undefined
+                ? realesInputs[precio.id]
+                : Utils.parsePrice(precio.precio_real || 0);
+            const precioRealEditado = precioRealLinea > 0 && precioRealLinea !== precioRealRecepcion;
+            precio.precio_real = precioRealEditado ? precioRealLinea : 0;
+            const precioReal = precioRealEditado ? precioRealLinea : precioRealRecepcion;
+            
+            // El precio al cliente es siempre el que escribió el usuario (aunque coincida con
+            // precio real + comisión: antes ese caso se borraba solo).
+            const precioManual = precioUnitario;
+
+            const gananciaPorUnidad = precioManual > 0 ? precioManual - precioReal : 0;
+            const gananciaTotal = gananciaPorUnidad * cantidad;
+            const total = cantidad * precioManual;
+            const com = this._comisionLinea(precio, precioManual);
+            precio.comision_unitaria = com.comision_unitaria;
+            precio.comision_pct = com.comision_pct;
+            
+            totalProductos += total;
+            totalCantidad += cantidad;
+            totalGanancia += gananciaTotal;
+            totalComision += Math.round(cantidad * com.comision_unitaria);
+            
+            if (!clienteNombre && precio.cliente_nombre) {
+                clienteNombre = precio.cliente_nombre;
+            }
+            
+            rowsHtml += `
+                <tr>
+                    <td>${Utils.nombreCatalogo(precio, 'cliente')}</td>
+                    <td>${Utils.nombreCatalogo(precio, 'producto')}</td>
+                    <td>${cantidad}</td>
+                    <td><input type="text" class="precio-real${precioRealEditado ? ' precio-real-editado' : ''}" data-id="${precio.id}" data-auto="${precioRealRecepcion}" data-price-input="true" value="${precioReal > 0 ? Utils.formatPrice(precioReal) : ''}" style="width: 100px;" placeholder="${precioRealRecepcion > 0 ? Utils.formatPrice(precioRealRecepcion) : 'Costo c/u'}" title="${precioRealEditado ? `Cambiado a mano (el de la recepción es ${Utils.formatCurrency(precioRealRecepcion)}). Borralo para volver al de la recepción.` : (costoLinea.detalle.length > 1 ? this._textoMezcla(costoLinea) : 'Sale de la recepción. Podés cambiarlo: solo cambia la ganancia de esta línea, no lo que le debés al proveedor.')}"></td>
+                    <td><input type="text" class="precio-cliente" data-id="${precio.id}" data-price-input="true" value="${precioManual > 0 ? Utils.formatPrice(precioManual) : ''}" onchange="Precios.onPrecioChange()" style="width: 100px;" placeholder="Precio al cliente" title="Lo que le cobrás al cliente por unidad. La comisión se suma aparte."></td>
+                    <td class="precio-comision-celda">${this._htmlComision(com)}</td>
+                    <td style="color: ${gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${precioManual > 0 ? `${gananciaTotal > 0 ? '+' : ''}${Utils.formatCurrency(gananciaTotal)}` : '—'}</td>
+                    <td>${precioManual > 0 ? Utils.formatCurrency(total) : '—'}</td>
+                </tr>
+            `;
+        });
+        
+        tbody.innerHTML = rowsHtml;
+        Utils.enablePriceInputs(tbody);
+        
+        // Calcular comisión y saldo total
+        const comision = totalComision;
+        const saldoTotal = totalProductos + comision;
+        
+        if (resumenDiv) {
+            const nombreResumen = this.selectedClienteId ? (clienteNombre || '-') : 'Todos los clientes';
+            const nombreEl = document.getElementById('resumen-cliente-nombre');
+            if (nombreEl) nombreEl.textContent = nombreResumen;
+            document.getElementById('resumen-total-productos').textContent = Utils.formatCurrency(totalProductos);
+            const gananciaEl = document.getElementById('resumen-ganancia');
+            if (gananciaEl) {
+                gananciaEl.textContent = `${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}`;
+                gananciaEl.classList.toggle('resumen-ganancia-positiva', totalGanancia > 0);
+                gananciaEl.classList.toggle('resumen-ganancia-negativa', totalGanancia < 0);
+            }
+            document.getElementById('resumen-comision').textContent = Utils.formatCurrency(comision);
+            document.getElementById('resumen-saldo-total').textContent = Utils.formatCurrency(saldoTotal);
+            resumenDiv.style.display = 'block';
+        }
+        
+        // Totales siempre visibles: productos, comisión de reparto y saldo a cobrar
+        if (tfoot) {
+            tfoot.innerHTML = this._htmlTotales(totalProductos, totalGanancia, comision, saldoTotal);
+            tfoot.hidden = false;
+        }
+        this.renderComisionesProducto();
+    },
+
+    // Panel "Comisión por producto": la regla de cada producto del día. Se guarda en el producto
+    // (queda para los próximos días) y se aplica en el momento a las líneas de este día.
+    renderComisionesProducto() {
+        const caja = document.getElementById('precios-comisiones');
+        if (!caja) return;
+        const fecha = AppState.currentDate;
+        const productos = new Map();
+        (AppState.precios || []).forEach(p => {
+            if (p.fecha && Utils.fechaIso(p.fecha) !== fecha) return;
+            const pid = String(p.producto_id);
+            if (!productos.has(pid)) productos.set(pid, Utils.nombreCatalogo(p, 'producto') || 'Producto');
+        });
+        if (!productos.size) {
+            caja.hidden = true;
+            caja.innerHTML = '';
+            return;
+        }
+        const cerrado = DiaOperativo.diaCerrado(fecha);
+        const lista = [...productos.entries()].sort((a, b) => a[1].localeCompare(b[1], 'es'));
+        const propias = lista.filter(([pid]) => !Comisiones.reglaDe(pid).automatica).length;
+        const abierto = caja.querySelector('details')?.open || false;
+        const filas = lista.map(([pid, nombre]) => {
+            const regla = Comisiones.reglaDe(pid);
+            const conValor = regla.tipo === 'monto' || regla.tipo === 'porcentaje';
+            return `
+                <tr data-producto="${Utils.esc(pid)}">
+                    <td>${Utils.esc(nombre)}</td>
+                    <td>
+                        <select class="form-control comision-tipo" ${cerrado ? 'disabled' : ''} aria-label="Comisión de ${Utils.esc(nombre)}">
+                            ${Comisiones.TIPOS.map(t => `<option value="${t.valor}" ${t.valor === regla.guardado ? 'selected' : ''}>${t.texto}</option>`).join('')}
+                        </select>
+                    </td>
+                    <td>
+                        <input type="text" class="form-control comision-valor" inputmode="decimal" ${conValor ? '' : 'hidden'} ${cerrado ? 'disabled' : ''}
+                            value="${conValor ? String(regla.valor).replace('.', ',') : ''}" placeholder="${regla.tipo === 'porcentaje' ? '%' : '$'}" aria-label="Valor de la comisión de ${Utils.esc(nombre)}">
+                    </td>
+                    <td class="comision-texto">${Comisiones.texto(regla, this.comisionPorUnidad)}</td>
+                </tr>`;
+        }).join('');
+        caja.hidden = false;
+        caja.innerHTML = `
+            <details ${abierto ? 'open' : ''}>
+                <summary>Comisión por producto <span class="th-hint">${propias ? `${propias} producto(s) con comisión propia` : 'el resto sigue la regla automática del tipo'}</span></summary>
+                <p class="dia-operativo-hint">Por defecto (automática) las verduras y frutas llevan la comisión general fija, las bebidas y la mercadería no llevan, y zapallo criollo y sandía se definen aparte. Cada producto puede además usar la comisión general, no llevar comisión, llevar un monto fijo por unidad o un porcentaje de la cantidad (la sandía por kilo: 500 kg al 10 % paga la comisión general de 50 bultos). Queda guardado en el producto para los próximos días.</p>
+                <div class="table-container">
+                    <table class="data-table precios-comisiones-tabla">
+                        <thead><tr><th>Producto</th><th>Comisión</th><th>Valor</th><th>Se cobra</th></tr></thead>
+                        <tbody>${filas}</tbody>
+                    </table>
+                </div>
+            </details>`;
+        if (cerrado) return;
+        caja.querySelectorAll('tr[data-producto]').forEach(tr => {
+            const pid = tr.dataset.producto;
+            const select = tr.querySelector('.comision-tipo');
+            const input = tr.querySelector('.comision-valor');
+            select.addEventListener('change', () => {
+                const conValor = select.value === 'monto' || select.value === 'porcentaje';
+                input.hidden = !conValor;
+                input.placeholder = select.value === 'porcentaje' ? '%' : '$';
+                if (conValor) {
+                    input.value = '';
+                    input.focus();
+                    return;
+                }
+                this.cambiarReglaProducto(pid, select.value, '');
+            });
+            const guardarValor = () => {
+                if (select.value !== 'monto' && select.value !== 'porcentaje') return;
+                const valor = select.value === 'porcentaje' ? Comisiones.porcentaje(input.value) : (Utils.parsePrice(input.value) || 0);
+                if (!(valor > 0)) return;
+                const regla = Comisiones.reglaDe(pid);
+                if (regla.guardado === select.value && regla.valor === valor) return;
+                this.cambiarReglaProducto(pid, select.value, valor);
+            };
+            input.addEventListener('change', guardarValor);
+            input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
+        });
+    },
+
+    async cambiarReglaProducto(productoId, tipo, valor) {
+        const producto = (AppState.productos || []).find(p => String(p.id) === String(productoId));
+        if (!producto) {
+            Utils.showError('No se encontró el producto. Recargá la página.');
+            return;
+        }
+        const antes = { comision_tipo: producto.comision_tipo, comision_valor: producto.comision_valor };
+        producto.comision_tipo = tipo;
+        producto.comision_valor = valor;
+        CacheManager.set('productos', AppState.productos);
+        this.aplicarReglaProducto(productoId);
+        try {
+            await API.updateProducto(productoId, { comision_tipo: tipo, comision_valor: valor });
+            CacheManager.set('productos', AppState.productos);
+        } catch (error) {
+            Object.assign(producto, antes);
+            CacheManager.set('productos', AppState.productos);
+            this.aplicarReglaProducto(productoId);
+            Utils.showError(`No se pudo guardar la comisión de ${producto.nombre}: ${error.message}`);
+        }
+    },
+
+    // Aplica la regla de comisión de un producto a sus líneas del día que se está trabajando (si
+    // está abierto). Solo cambia la comisión: los precios quedan como están.
+    async aplicarReglaProducto(productoId) {
+        const fecha = AppState.currentDate;
+        if (!fecha || DiaOperativo.diaCerrado(fecha)) return;
+        let lineas = (AppState.precios || []).filter(p => !p.fecha || Utils.fechaIso(p.fecha) === fecha);
+        const enPantalla = lineas.length > 0;
+        if (!enPantalla) {
+            try {
+                lineas = await API.getPreciosCliente(fecha) || [];
+            } catch (error) {
+                return; // se aplica en el próximo "Armar lista"
+            }
+            const general = this._lineaGeneral(lineas.filter(p => String(p.producto_id) !== String(productoId)));
+            if (general) this.comisionPorUnidad = Utils.parsePrice(general.comision_unitaria);
+        }
+        const delProducto = lineas.filter(p => String(p.producto_id) === String(productoId));
+        if (!delProducto.length) return;
+        const items = delProducto.map(p => {
+            const com = Comisiones.deLinea(productoId, p.precio_cliente, this.comisionPorUnidad);
+            p.comision_unitaria = com.comision_unitaria;
+            p.comision_pct = com.comision_pct;
+            return {
+                cliente_id: p.cliente_id,
+                producto_id: p.producto_id,
+                cantidad: p.cantidad || 0,
+                precio_cliente: Utils.parsePrice(p.precio_cliente) || 0,
+                ...com,
+                solo_comision: true
+            };
+        });
+        if (enPantalla) {
+            CacheManager.set(`precios:${fecha}`, AppState.precios);
+            this.sincronizarCobranza();
+            if (AppState.currentPage === 'precios') this.render();
+        }
+        Utils.enSegundoPlano(async () => {
+            await API.savePreciosCliente({ fecha, comision_por_unidad: this.comisionPorUnidad, items });
+            CacheManager.invalidate(`precios:${fecha}`);
+            if (enPantalla) CacheManager.set(`precios:${fecha}`, AppState.precios);
+            Utils.avisar('Comisión del producto aplicada a los precios del día');
+        }, (error) => {
+            // Si otra persona ya cerró el día, lo cobrado no se toca: no hay nada que avisar.
+            if (/ya está cerrado/.test(String(error && error.message))) return;
+            Utils.showError('No se pudo aplicar la comisión a los precios del día: ' + (error && error.message || 'revisá la conexión') + '. Tocá "Armar lista" para reintentar.');
+        });
+    },
+
+    _htmlComision(com) {
+        if (!(com.comision_unitaria > 0)) return '<span class="precio-comision-nada">—</span>';
+        const pct = com.comision_pct > 0 ? ` <span class="th-hint">${String(com.comision_pct).replace('.', ',')} % cant.</span>` : '';
+        return `${Utils.formatComision(com.comision_unitaria)}${pct}`;
+    },
+
+    _htmlTotales(totalProductos, totalGanancia, comision, saldoTotal) {
+        return `
+                <tr style="background-color: #f8f9fa; font-weight: bold;">
+                    <td colspan="3" style="text-align: right;">TOTAL PRODUCTOS:</td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td style="color: ${totalGanancia >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}</td>
+                    <td>${Utils.formatCurrency(totalProductos)}</td>
+                </tr>
+                <tr style="background-color: #fff3cd; font-weight: bold;">
+                    <td colspan="3" style="text-align: right;">COMISIÓN DE REPARTO:</td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td>${Utils.formatCurrency(comision)}</td>
+                </tr>
+                <tr style="background-color: #d4edda; font-weight: bold; font-size: 16px;">
+                    <td colspan="3" style="text-align: right;">SALDO TOTAL:</td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                    <td>${Utils.formatCurrency(saldoTotal)}</td>
+                </tr>
+            `;
+    },
+
+    // Se cobra lo que llegó (no lo pedido): si llega más o menos, se reparte entre los clientes en
+    // proporción a lo que pidió cada uno. Con un solo cliente, se le cobra todo lo que llegó.
+    repartirRecibido(lineas, llego) {
+        const total = lineas.reduce((sum, linea) => sum + linea.cantidadPedida, 0);
+        if (total <= 0) return lineas.map(linea => ({ ...linea, cantidad: 0 }));
+        if (llego === total) return lineas.map(linea => ({ ...linea, cantidad: linea.cantidadPedida }));
+
+        let usada = 0;
+        return lineas.map((linea, index) => {
+            if (index === lineas.length - 1) {
+                const cantidad = Math.max(0, Math.round((llego - usada) * 100) / 100);
+                return { ...linea, cantidad };
+            }
+            const cantidad = Math.round((linea.cantidadPedida / total) * llego * 100) / 100;
+            usada += cantidad;
+            return { ...linea, cantidad };
+        });
+    },
+
+    // "Mismo precio para todos los clientes": al cambiar el precio de un producto en una línea, los demás
+    // clientes de ese producto (del día) quedan con ese mismo precio. Se puede apagar para un precio especial.
+    get mismoPrecio() {
+        try { return localStorage.getItem('precios-mismo-precio') !== '0'; } catch (e) { return true; }
+    },
+
+    set mismoPrecio(valor) {
+        try { localStorage.setItem('precios-mismo-precio', valor ? '1' : '0'); } catch (e) { /* sin almacenamiento */ }
+    },
+
+    propagarPrecio(input) {
+        if (!this.mismoPrecio || DiaOperativo.diaCerrado(AppState.currentDate)) return;
+        const id = input.getAttribute('data-id');
+        const linea = (AppState.precios || []).find(p => String(p.id) === String(id));
+        const valor = Utils.parsePrice(input.value) || 0;
+        if (!linea || !(valor > 0)) return;
+        let cambiados = 0;
+        (AppState.precios || []).forEach(p => {
+            if (String(p.id) === String(id) || String(p.producto_id) !== String(linea.producto_id)) return;
+            if (p.fecha && Utils.fechaIso(p.fecha) !== AppState.currentDate) return;
+            if ((Utils.parsePrice(p.precio_cliente) || 0) === valor) return;
+            p.precio_cliente = valor;
+            this._tocadas.add(String(p.id));
+            cambiados += 1;
+            const otro = document.querySelector(`.precio-cliente[data-id="${p.id}"]`);
+            if (otro) otro.value = Utils.formatPrice(valor);
+        });
+        if (!cambiados) return;
+        this.refrescarCalculo();
+        Utils.avisar(`Mismo precio para ${cambiados} cliente${cambiados === 1 ? '' : 's'} más`);
+    },
+
+    // Al salir de un campo de precio NO se rearma la tabla: si se rearmaba, el campo siguiente que
+    // la persona acababa de tocar desaparecía y lo que escribía se perdía (pasaba con un precio sí y
+    // otro no). Solo se recalculan comisión, ganancia y totales.
+    onPrecioChange() {
+        document.querySelectorAll('.precio-cliente').forEach(input => {
+            const id = input.getAttribute('data-id');
+            const value = Utils.parsePrice(input.value) || 0;
+            if (id) {
+                const precio = AppState.precios.find(p => p.id === id);
+                if (precio) {
+                    precio.precio_cliente = value;
+                }
+            }
+        });
+        
+        this.refrescarCalculo();
+    },
+
+    // Actualiza ganancia y totales sin rearmar los inputs.
+    // En el celular el teclado no dispara "change", y rearmar el campo lo cierra.
+    refrescarCalculo() {
+        const tbody = document.getElementById('precios-tbody');
+        const tfoot = document.getElementById('precios-tfoot');
+        if (!tbody) return;
+
+        let totalProductos = 0;
+        let totalCantidad = 0;
+        let totalGanancia = 0;
+        let totalComision = 0;
+
+        tbody.querySelectorAll('tr').forEach(tr => {
+            const input = tr.querySelector('.precio-cliente');
+            if (!input) return;
+            const precio = (AppState.precios || []).find(p => p.id === input.getAttribute('data-id'));
+            if (!precio) return;
+
+            const cantidad = parseFloat(precio.cantidad || 0);
+            totalCantidad += cantidad;
+            const costoLinea = this._costoDeLinea(precio);
+            const precioRealRecepcion = costoLinea.costo;
+            const inputReal = tr.querySelector('.precio-real');
+            const valorReal = inputReal ? (Utils.parsePrice(inputReal.value) || 0) : 0;
+            // El costo rellenado solo no cuenta como cambio a mano (ver render).
+            const precioRealLinea = inputReal && valorReal === (Number(inputReal.dataset.auto) || 0) ? 0 : valorReal;
+            const precioRealEditado = precioRealLinea > 0 && precioRealLinea !== precioRealRecepcion;
+            precio.precio_real = precioRealEditado ? precioRealLinea : 0;
+            if (inputReal) inputReal.classList.toggle('precio-real-editado', precioRealEditado);
+            const precioReal = precioRealEditado ? precioRealLinea : precioRealRecepcion;
+            const precioManual = Utils.parsePrice(input.value) || 0;
+            const gananciaTotal = precioManual > 0 ? (precioManual - precioReal) * cantidad : 0;
+            const total = cantidad * precioManual;
+
+            totalProductos += total;
+            totalGanancia += gananciaTotal;
+            precio.precio_cliente = precioManual;
+            const com = this._comisionLinea(precio, precioManual);
+            precio.comision_unitaria = com.comision_unitaria;
+            precio.comision_pct = com.comision_pct;
+            totalComision += Math.round(cantidad * com.comision_unitaria);
+
+            const celdas = tr.querySelectorAll('td');
+            if (celdas[5]) celdas[5].innerHTML = this._htmlComision(com);
+            const gananciaTd = celdas[6];
+            const totalTd = celdas[7];
+            if (gananciaTd) {
+                gananciaTd.style.color = gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)';
+                gananciaTd.style.fontWeight = '600';
+                gananciaTd.textContent = precioManual > 0 ? `${gananciaTotal > 0 ? '+' : ''}${Utils.formatCurrency(gananciaTotal)}` : '—';
+            }
+            if (totalTd) {
+                totalTd.textContent = precioManual > 0 ? Utils.formatCurrency(total) : '—';
+            }
+        });
+
+        const comision = totalComision;
+        const saldoTotal = totalProductos + comision;
+        const resumenDiv = document.getElementById('precios-resumen-cliente');
+        if (resumenDiv && resumenDiv.style.display !== 'none') {
+            const productosEl = document.getElementById('resumen-total-productos');
+            const gananciaEl = document.getElementById('resumen-ganancia');
+            const comisionEl = document.getElementById('resumen-comision');
+            const saldoEl = document.getElementById('resumen-saldo-total');
+            if (productosEl) productosEl.textContent = Utils.formatCurrency(totalProductos);
+            if (gananciaEl) {
+                gananciaEl.textContent = `${totalGanancia > 0 ? '+' : ''}${Utils.formatCurrency(totalGanancia)}`;
+                gananciaEl.classList.toggle('resumen-ganancia-positiva', totalGanancia > 0);
+                gananciaEl.classList.toggle('resumen-ganancia-negativa', totalGanancia < 0);
+            }
+            if (comisionEl) comisionEl.textContent = Utils.formatCurrency(comision);
+            if (saldoEl) saldoEl.textContent = Utils.formatCurrency(saldoTotal);
+        }
+
+        if (tfoot && !tfoot.hidden) {
+            tfoot.innerHTML = this._htmlTotales(totalProductos, totalGanancia, comision, saldoTotal);
+        }
+    },
+    
+    // Los precios de días anteriores: cada cliente arranca con el último precio que se le puso a ese producto
+    // (si nunca lo compró, con el último que se le puso a cualquier cliente). Solo cambian si alguien los cambia.
+    _historial: null,
+    async _preciosAnteriores() {
+        const fecha = AppState.currentDate;
+        if (this._historial && this._historial.fecha === fecha && Date.now() - this._historial.ts < 300000) return this._historial.mapa;
+        const mapa = { porCliente: new Map(), porProducto: new Map() };
+        try {
+            const todos = await API.request('precios-cliente', 'GET');
+            (todos || []).forEach(p => {
+                const dia = Utils.fechaIso(p.fecha);
+                const precio = Utils.parsePrice(p.precio_cliente) || 0;
+                if (!dia || dia >= fecha || precio <= 0) return;
+                const claveCliente = `${p.cliente_id}|${p.producto_id}`;
+                const delCliente = mapa.porCliente.get(claveCliente);
+                if (!delCliente || dia > delCliente.dia) mapa.porCliente.set(claveCliente, { dia, precio });
+                const claveProducto = String(p.producto_id);
+                const delProducto = mapa.porProducto.get(claveProducto);
+                if (!delProducto || dia > delProducto.dia) mapa.porProducto.set(claveProducto, { dia, precio });
+            });
+        } catch (error) {
+            // Sin historial las líneas nuevas quedan sin precio, como antes.
+        }
+        this._historial = { fecha, ts: Date.now(), mapa };
+        return mapa;
+    },
+
+    _precioAnterior(historial, clienteId, productoId) {
+        const propio = historial.porCliente.get(`${clienteId}|${productoId}`);
+        if (propio) return propio.precio;
+        const general = historial.porProducto.get(String(productoId));
+        return general ? general.precio : 0;
+    },
+
+    async armarLista(opciones = {}) {
+        const silencioso = !!opciones.silencioso;
+        this._sincronizarComision();
+        const historial = await this._preciosAnteriores();
+
+        const [recepciones, pedidos] = await Promise.all([
+            API.getRecepcion(AppState.currentDate),
+            API.getPedidos(AppState.currentDate)
+        ]);
+        if (!pedidos || pedidos.length === 0) {
+            throw new Error('No hay pedidos para armar la lista de precios.');
+        }
+
+        const confirmada = (recepcion) => recepcion.confirmado === true || recepcion.confirmado === 'true';
+        const recepcionesConfirmadas = (recepciones || []).filter(confirmada);
+        if (recepcionesConfirmadas.length === 0) {
+            throw new Error('No hay recepciones confirmadas para armar la lista de precios.');
+        }
+
+        const porProducto = {};
+        pedidos.forEach(pedido => {
+            if (!porProducto[pedido.producto_id]) porProducto[pedido.producto_id] = [];
+            porProducto[pedido.producto_id].push(pedido);
+        });
+
+        const preciosItems = [];
+        const avisosFaltante = [];
+        const avisosReparto = [];
+        // Productos con algún proveedor ya confirmado, y clientes que solo esperan a uno sin confirmar.
+        const confirmadosIds = new Set();
+        const esperandoKeys = new Set();
+
+        Object.keys(porProducto).forEach(productoId => {
+            const producto = (AppState.productos || []).find(x => String(x.id) === String(productoId));
+
+            // Un producto puede venir de más de un proveedor: lo que llegó de cada uno se reparte entre
+            // los clientes que le pidieron a ese proveedor, y la línea de cada cliente suma todo.
+            let porProveedor = {};
+            porProducto[productoId].forEach(pedido => {
+                const prov = Recepcion._proveedorDePedido(pedido, producto);
+                if (!porProveedor[prov]) porProveedor[prov] = [];
+                porProveedor[prov].push(pedido);
+            });
+            let proveedoresDelProducto = Object.keys(porProveedor);
+            const filasProducto = Recepcion._extrasComoPropias((recepciones || []).filter(r => String(r.producto_id) === String(productoId)), proveedoresDelProducto);
+            const esExtra = r => r.extra === true || r.extra === 'true';
+            let asignadas;
+            const acumulado = {};
+            const filasCompletas = proveedoresDelProducto.every(prov => Recepcion._asignarFilas(filasProducto.filter(r => !esExtra(r)), proveedoresDelProducto)[prov]);
+            if (filasProducto.some(esExtra) && filasCompletas && Recepcion._todasConRepartoManual(filasProducto)) {
+                // Vino de varios proveedores y en Recepción se cargó a mano lo que le toca a cada cliente de cada uno:
+                // la línea de cada cliente suma lo de todas las filas.
+                confirmadosIds.add(String(productoId));
+                const lineasCli = {};
+                porProducto[productoId].forEach(pedido => {
+                    const key = String(pedido.cliente_id);
+                    if (!lineasCli[key]) lineasCli[key] = { cliente_id: pedido.cliente_id, producto_id: productoId, producto_nombre: pedido.producto_nombre || '', cantidadPedida: 0, cantidad: 0 };
+                    lineasCli[key].cantidadPedida += parseFloat(pedido.cantidad) || 0;
+                });
+                filasProducto.forEach(fila => {
+                    Object.keys(fila.reparto || {}).forEach(id => {
+                        if (lineasCli[id]) lineasCli[id].cantidad = Math.round((lineasCli[id].cantidad + (Number(fila.reparto[id]) || 0)) * 100) / 100;
+                    });
+                });
+                Object.assign(acumulado, lineasCli);
+                const pedidoTotal = Object.values(lineasCli).reduce((t, l) => t + l.cantidadPedida, 0);
+                const llegoTotal = Object.values(lineasCli).reduce((t, l) => t + l.cantidad, 0);
+                if (Math.abs(llegoTotal - pedidoTotal) > 0.005) {
+                    avisosFaltante.push(`${Object.values(lineasCli)[0].producto_nombre || 'Producto'}: pedido ${pedidoTotal}, llegó ${Math.round(llegoTotal * 100) / 100}`);
+                }
+                proveedoresDelProducto = [];
+                asignadas = {};
+            } else if (filasProducto.some(esExtra)) {
+                // Vino de varios proveedores cargados a mano: lo que llegó en total se reparte entre todos los clientes.
+                const propias = Recepcion._asignarFilas(filasProducto.filter(r => !esExtra(r)), proveedoresDelProducto);
+                const completo = proveedoresDelProducto.every(prov => propias[prov]);
+                const agregada = Recepcion.agregadoDe(filasProducto, productoId);
+                const juntos = [].concat(...proveedoresDelProducto.map(prov => porProveedor[prov]));
+                porProveedor = { todos: juntos };
+                proveedoresDelProducto = ['todos'];
+                asignadas = { todos: completo && agregada ? { ...agregada, proveedor_nombre: '', reparto: null } : null };
+            } else {
+                asignadas = Recepcion._asignarFilas(filasProducto, proveedoresDelProducto);
+            }
+
+            proveedoresDelProducto.forEach(prov => {
+                const recepcion = asignadas[prov];
+                if (!recepcion || !confirmada(recepcion)) {
+                    porProveedor[prov].forEach(pedido => esperandoKeys.add(`${pedido.cliente_id}|${productoId}`));
+                    return;
+                }
+                confirmadosIds.add(String(productoId));
+
+                const porCliente = {};
+                porProveedor[prov].forEach(pedido => {
+                    const key = String(pedido.cliente_id);
+                    if (!porCliente[key]) {
+                        porCliente[key] = {
+                            cliente_id: pedido.cliente_id,
+                            producto_id: productoId,
+                            producto_nombre: pedido.producto_nombre || '',
+                            cantidadPedida: 0
+                        };
+                    }
+                    porCliente[key].cantidadPedida += parseFloat(pedido.cantidad) || 0;
+                });
+
+                const lineas = Object.values(porCliente);
+                const pedidoTotal = lineas.reduce((sum, linea) => sum + linea.cantidadPedida, 0);
+                const llego = parseFloat(recepcion.llego) || 0;
+                if (llego !== pedidoTotal) {
+                    const nombre = lineas[0].producto_nombre || 'Producto';
+                    const proveedor = proveedoresDelProducto.length > 1 ? (recepcion.proveedor_nombre || '') : '';
+                    avisosFaltante.push(`${nombre}${proveedor ? ' (' + proveedor + ')' : ''}: pedido ${pedidoTotal}, llegó ${llego}`);
+                }
+
+                // Si se repartió a mano (a quién le toca de más o de menos), se respeta; si no, es proporcional.
+                // Puede incluir clientes que le pidieron el producto a otro proveedor (le tocó de este).
+                const repartoManual = recepcion.reparto && typeof recepcion.reparto === 'object' ? recepcion.reparto : null;
+                const clientesDelProducto = new Set(porProducto[productoId].map(pedido => String(pedido.cliente_id)));
+                // Un cliente que pidió DESPUÉS de repartir a mano no tiene parte: se mantiene el reparto de los demás
+                // (a él se le avisa que falta cargarle la suya). Antes, con un solo cliente nuevo se descartaba todo el reparto.
+                // Si el reparto ya no cuadra de verdad (alguien dejó de pedir, o cambió lo que llegó), se reparte en
+                // proporción como siempre, pero ahora se avisa en vez de hacerlo en silencio.
+                const nombreCliente = id => (AppState.clientes || []).find(c => String(c.id) === String(id))?.nombre || 'un cliente';
+                const nombreProducto = lineas[0].producto_nombre || 'Producto';
+                let manualValido = false;
+                if (repartoManual) {
+                    const sumaManual = Object.values(repartoManual).reduce((t, n) => t + (Number(n) || 0), 0);
+                    const yaNoPidieron = Object.keys(repartoManual).filter(id => !clientesDelProducto.has(id));
+                    manualValido = yaNoPidieron.length === 0 && Math.abs(sumaManual - llego) <= 0.05;
+                    if (!manualValido) {
+                        const motivo = yaNoPidieron.length
+                            ? `${yaNoPidieron.map(nombreCliente).join(', ')} ya no pidió`
+                            : `lo repartido (${Math.round(sumaManual * 100) / 100}) no coincide con lo que llegó (${llego})`;
+                        avisosReparto.push(`${nombreProducto}: el reparto cargado a mano ya no cuadra (${motivo}), se repartió en proporción a lo pedido. Revisalo con Repartir.`);
+                    } else {
+                        const sinParte = lineas.filter(l => repartoManual[String(l.cliente_id)] === undefined && l.cantidadPedida > 0);
+                        if (sinParte.length) {
+                            avisosReparto.push(`${nombreProducto}: se mantuvo el reparto cargado a mano; sin parte (pidieron después): ${sinParte.map(l => nombreCliente(l.cliente_id)).join(', ')}. Cargales su parte con Repartir.`);
+                        }
+                    }
+                }
+                let repartidas;
+                if (manualValido) {
+                    const extrasCli = Object.keys(repartoManual).filter(id => !lineas.some(l => String(l.cliente_id) === id));
+                    repartidas = lineas.concat(extrasCli.map(id => ({
+                        cliente_id: id, producto_id: productoId, producto_nombre: lineas[0].producto_nombre || '', cantidadPedida: 0
+                    }))).map(l => ({
+                        ...l,
+                        cantidad: Math.round((Number(repartoManual[String(l.cliente_id)]) || 0) * 100) / 100,
+                        // Pidió después de repartir: tiene su línea de precio igual, para poder cargarle su parte.
+                        sinParte: repartoManual[String(l.cliente_id)] === undefined && l.cantidadPedida > 0
+                    }));
+                } else {
+                    repartidas = this.repartirRecibido(lineas, llego);
+                }
+                repartidas.forEach(linea => {
+                    const key = String(linea.cliente_id);
+                    if (!acumulado[key]) acumulado[key] = { ...linea, cantidad: 0 };
+                    acumulado[key].cantidad = Math.round((acumulado[key].cantidad + (Number(linea.cantidad) || 0)) * 100) / 100;
+                });
+            });
+
+            Object.values(acumulado).forEach(linea => {
+                const existentes = (AppState.precios || []).filter(p =>
+                    String(p.cliente_id) === String(linea.cliente_id) &&
+                    String(p.producto_id) === String(linea.producto_id)
+                );
+                const existente = existentes.find(p => Utils.parsePrice(p.precio_cliente) > 0) || existentes[0];
+                if (linea.cantidad <= 0 && !existente && !linea.sinParte) return;
+                const precioCliente = Utils.parsePrice(existente?.precio_cliente) || this._precioAnterior(historial, linea.cliente_id, linea.producto_id);
+                preciosItems.push({
+                    cliente_id: linea.cliente_id,
+                    producto_id: linea.producto_id,
+                    cantidad: linea.cantidad,
+                    precio_cliente: precioCliente,
+                    conservar_precio: true,
+                    ...Comisiones.deLinea(linea.producto_id, precioCliente, this.comisionPorUnidad)
+                });
+            });
+        });
+
+        if (opciones.ajustarNoConfirmados) {
+            const ya = new Set(preciosItems.map(item => `${item.cliente_id}|${item.producto_id}`));
+            (AppState.precios || []).forEach(precio => {
+                const key = `${precio.cliente_id}|${precio.producto_id}`;
+                if (ya.has(key) || (confirmadosIds.has(String(precio.producto_id)) && !esperandoKeys.has(key))) return;
+                preciosItems.push({
+                    cliente_id: precio.cliente_id,
+                    producto_id: precio.producto_id,
+                    cantidad: 0,
+                    precio_cliente: Utils.parsePrice(precio.precio_cliente) || 0,
+                    conservar_precio: true,
+                    ...Comisiones.deLinea(precio.producto_id, precio.precio_cliente, this.comisionPorUnidad)
+                });
+            });
+        }
+
+        if (preciosItems.length === 0) {
+            throw new Error('No se encontraron productos con recepción confirmada que coincidan con los pedidos.');
+        }
+
+        await API.savePreciosCliente({
+            fecha: AppState.currentDate,
+            comision_por_unidad: this.comisionPorUnidad,
+            items: preciosItems,
+            limpiar_sin_pedido: true
+        });
+        // load() devuelve lo que ya tiene si cree que el día está cargado: hay que forzar la lectura.
+        AppState.fechaCargada = null;
+        await this.load();
+        this.sincronizarCobranza();
+
+        const aviso = [
+            avisosFaltante.length ? 'Se repartió lo recibido: ' + avisosFaltante.join(' · ') : '',
+            avisosReparto.join(' · ')
+        ].filter(Boolean).join(' ');
+        if (!silencioso) {
+            Utils.showSuccess(`Lista de precios generada con ${preciosItems.length} item(s).${aviso ? ' ' + aviso : ''}`);
+        } else if (avisosReparto.length) {
+            // Cuando la lista se arma sola (al confirmar), un reparto que no cuadra no puede pasar desapercibido.
+            Utils.showWarning(avisosReparto.join(' '));
+        }
+        return { aviso, items: preciosItems.length };
+    },
+
+    async generarLista() {
+        try {
+            await this.armarLista({ ajustarNoConfirmados: true });
+        } catch (error) {
+            console.error('Error generating precios:', error);
+            Utils.showError('Error al generar lista: ' + error.message);
+        }
+    },
+    
+    async save() {
+        const todas = [];
+        const items = [];
+        const precios = AppState.precios;
+        
+        const enPantalla = new Set();
+        document.querySelectorAll('.precio-cliente').forEach(input => {
+            const id = input.getAttribute('data-id');
+            const precio = Utils.parsePrice(input.value) || 0;
+            enPantalla.add(String(id));
+            
+            const precioData = precios.find(p => p.id === id);
+            if (precioData) {
+                precioData.precio_cliente = precio;
+                const item = {
+                    cliente_id: precioData.cliente_id,
+                    producto_id: precioData.producto_id,
+                    cantidad: precioData.cantidad || 0,
+                    precio_cliente: precio,
+                    ...this._comisionLinea(precioData, precio),
+                    // 0 = el de la recepción (se guarda vacío)
+                    precio_real: Utils.parsePrice(precioData.precio_real) || 0
+                };
+                todas.push(item);
+                if (this._tocadas.has(String(id))) {
+                    items.push(item);
+                } else if (this._comisionEditada) {
+                    // Solo cambia la comisión: el servidor no toca el precio de esta línea.
+                    items.push({ ...item, solo_comision: true });
+                }
+            }
+        });
+        
+        // Líneas de otros clientes que cambiaron por "mismo precio" y no se ven (hay un cliente filtrado).
+        this._tocadas.forEach(id => {
+            if (enPantalla.has(String(id))) return;
+            const precioData = precios.find(p => String(p.id) === String(id));
+            if (!precioData) return;
+            const item = {
+                cliente_id: precioData.cliente_id,
+                producto_id: precioData.producto_id,
+                cantidad: precioData.cantidad || 0,
+                precio_cliente: Utils.parsePrice(precioData.precio_cliente) || 0,
+                ...this._comisionLinea(precioData, precioData.precio_cliente),
+                precio_real: Utils.parsePrice(precioData.precio_real) || 0
+            };
+            todas.push(item);
+            items.push(item);
+        });
+        
+        if (todas.length === 0) {
+            Utils.showError('No hay precios para guardar');
+            return;
+        }
+        if (items.length === 0) {
+            Utils.avisar('No hay cambios para guardar');
+            return;
+        }
+
+        const sinPrecio = todas.filter(item => Number(item.cantidad) > 0 && !(item.precio_cliente > 0)).length;
+        if (sinPrecio > 0) {
+            const seguir = await Utils.showConfirm(`Hay ${sinPrecio} producto(s) sin precio al cliente. No vas a poder cerrar el día hasta cargarlos. ¿Guardar igual?`);
+            if (!seguir) return;
+        }
+
+        this.sincronizarCobranza();
+        CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
+        Utils.avisar('Precios guardados');
+        const tocadasAntes = new Set(this._tocadas);
+        const comisionAntes = this._comisionEditada;
+        this._tocadas.clear();
+        this._comisionEditada = false;
+
+        Utils.enSegundoPlano(async () => {
+            await API.savePreciosCliente({
+                fecha: AppState.currentDate,
+                comision_por_unidad: this.comisionPorUnidad,
+                // La cantidad no se edita acá: la fija el armado de la lista. Mandar la de esta pantalla
+                // pisaba la cantidad nueva con la que tenía una pantalla vieja.
+                items: items.map(({ cantidad, ...resto }) => resto)
+            });
+            CacheManager.set(`precios:${AppState.currentDate}`, AppState.precios);
+        }, async (error) => {
+            tocadasAntes.forEach(id => this._tocadas.add(id));
+            if (comisionAntes) this._comisionEditada = true;
+            Utils.showError(API._esCorteDeConexion(error) ? 'No se pudieron guardar los precios. Revisá la conexión.' : 'No se pudieron guardar los precios: ' + (error && error.message || ''));
+            await this.load();
+            this.sincronizarCobranza();
+        });
+    },
+    
+    sincronizarCobranza() {
+        const precios = AppState.precios || [];
+        const comisionDefault = Utils.parsePrice(this.comisionPorUnidad) || 0;
+        const porCliente = {};
+
+        precios.forEach(precio => {
+            const cid = String(precio.cliente_id || '');
+            if (!cid) return;
+            if (!porCliente[cid]) {
+                porCliente[cid] = {
+                    cliente_id: precio.cliente_id,
+                    cliente_nombre: precio.cliente_nombre || Utils.nombreCatalogo(precio, 'cliente'),
+                    total: 0
+                };
+            }
+            const cantidad = parseFloat(precio.cantidad) || 0;
+            const unit = Utils.parsePrice(precio.precio_cliente) || 0;
+            const comision = precio.comision_unitaria !== undefined && precio.comision_unitaria !== null && precio.comision_unitaria !== ''
+                ? Utils.parseComision(precio.comision_unitaria)
+                : comisionDefault;
+            porCliente[cid].total += Math.round(cantidad * unit) + Math.round(cantidad * comision);
+        });
+
+        const previos = {};
+        (CobranzasHoy._lastTotales || []).forEach(item => {
+            previos[String(item.cliente_id)] = item;
+        });
+
+        const fecha = Utils.fechaIso(AppState.currentDate);
+        const cobranzasGuardadas = []
+            .concat(CacheManager.get(`cobranzas:${fecha}:all`) || [])
+            .concat(CacheManager.get('cobranzas:all:all') || [])
+            .concat(AppState.cobranzas || []);
+
+        let pagadoConocido = true;
+        CobranzasHoy._revision = (CobranzasHoy._revision || 0) + 1;
+        CobranzasHoy._lastTotales = Object.values(porCliente).map(item => {
+            const cid = String(item.cliente_id);
+            const prev = previos[cid];
+            let pagado = null;
+            if (prev && CobranzasHoy._pagadoConocido !== false) {
+                pagado = parseFloat(prev.pagado) || 0;
+            } else {
+                const cob = cobranzasGuardadas.find(c =>
+                    String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha && c.origen !== 'manual'
+                );
+                if (cob) pagado = parseFloat(cob.pagado) || 0;
+                else if (prev) pagado = parseFloat(prev.pagado) || 0;
+            }
+            if (pagado === null) {
+                pagadoConocido = false;
+                pagado = 0;
+            }
+            const saldo = Math.max(0, item.total - pagado);
+            let estado = 'sin_cobrar';
+            if (pagado > 0 && saldo <= 0) estado = 'pagado';
+            else if (pagado > 0) estado = 'parcial';
+            const cob = cobranzasGuardadas.find(c =>
+                String(c.cliente_id) === cid && Utils.fechaIso(c.fecha) === fecha && c.origen !== 'manual'
+            );
+            let depositos = Array.isArray(prev?.depositos) ? prev.depositos : [];
+            if (!depositos.length && Array.isArray(cob?.depositos)) depositos = cob.depositos;
+            if (!depositos.length) depositos = Depositos.de(fecha, cid);
+            return {
+                ...item,
+                items: prev?.items || [],
+                pagado,
+                saldo,
+                estado,
+                cobranza_id: prev?.cobranza_id || cob?.id || null,
+                medios: (prev && CobranzasHoy._pagadoConocido !== false) ? (prev.medios || cob?.medios || null) : (cob?.medios || prev?.medios || null),
+                depositos
+            };
+        });
+        CobranzasHoy._fechaTotales = fecha;
+        CobranzasHoy._pagadoConocido = pagadoConocido;
+
+        if (AppState.currentPage === 'cobros-hoy' && pagadoConocido) {
+            CobranzasHoy.render(CobranzasHoy._lastTotales);
+        }
+        CobranzasHoy.load().catch(() => {});
+    },
+
+    limpiarFiltro() {
+        this.selectedClienteId = null;
+        localStorage.removeItem('precios-selected-cliente');
+        const select = document.getElementById('precios-filtro-cliente');
+        if (select) select.value = '';
+        this._mostrarClienteElegido();
+        this._ocultarSugerencias();
+        this.render();
+    },
+    
+    /** Lee precios actuales de la tabla (inputs + filtro cliente) para exportar */
+    // Las líneas en el orden de la planilla de pedidos (la pantalla y el PDF al cliente salen iguales).
+    _ordenados(precios) {
+        return precios.slice().sort((a, b) =>
+            Utils.compararProductos({ id: a.producto_id, nombre: a.producto_nombre }, { id: b.producto_id, nombre: b.producto_nombre }));
+    },
+
+    _obtenerDatosClienteParaExportar() {
+        if (!this.selectedClienteId) return null;
+
+        const preciosFiltrados = this._ordenados(AppState.precios || []).filter(
+            p => p.cliente_id === this.selectedClienteId
+        );
+        if (preciosFiltrados.length === 0) return null;
+
+        const preciosInputs = {};
+        document.querySelectorAll('.precio-cliente').forEach(input => {
+            const id = input.getAttribute('data-id');
+            if (id) preciosInputs[id] = Utils.parsePrice(input.value) || 0;
+        });
+
+        const filas = [];
+        let totalProductos = 0;
+        let totalCantidad = 0;
+        let totalComision = 0;
+        let clienteNombre = '';
+
+        preciosFiltrados.forEach(precio => {
+            const cantidad = parseFloat(precio.cantidad || 0);
+            const precioUnitario = preciosInputs[precio.id] !== undefined
+                ? preciosInputs[precio.id]
+                : Utils.parsePrice(precio.precio_cliente || 0);
+            const total = cantidad * precioUnitario;
+            const comisionUnidad = this._comisionLinea(precio, precioUnitario).comision_unitaria;
+
+            totalProductos += total;
+            totalCantidad += cantidad;
+            totalComision += Math.round(cantidad * comisionUnidad);
+            if (!clienteNombre && precio.cliente_nombre) {
+                clienteNombre = precio.cliente_nombre;
+            }
+
+            filas.push({
+                producto: precio.producto_nombre || '',
+                cantidad,
+                precioUnitario,
+                comision: comisionUnidad,
+                comisionPct: this._comisionLinea(precio, precioUnitario).comision_pct,
+                total
+            });
+        });
+
+        const comision = totalComision;
+        const saldoTotal = totalProductos + comision;
+        const comisiones = Comisiones.resumen(filas.map(f => ({ cantidad: f.cantidad, comision_unitaria: f.comision, comision_pct: f.comisionPct })));
+
+        return {
+            clienteNombre,
+            clienteId: this.selectedClienteId,
+            filas,
+            totalProductos,
+            totalCantidad,
+            comision,
+            comisiones,
+            saldoTotal
+        };
+    },
+
+    handleWhatsAppError(error) {
+        if (error instanceof PrecioClienteError) {
+            if (error.code === 'SIN_PRECIO') {
+                Utils.showWarning(error.message);
+            } else {
+                Utils.showError(error.message);
+            }
+            return;
+        }
+
+        if (error instanceof WhatsAppError) {
+            Utils.showError(error.message);
+            return;
+        }
+
+        Utils.showError('Error al enviar WhatsApp: ' + error.message);
+    },
+
+    async ensureDatosWhatsApp() {
+        const promises = [];
+
+        if (!AppState.clientes?.length) {
+            promises.push(API.getClientes().then(data => { AppState.clientes = data; }));
+        }
+        if (AppState.whatsappAutoEnvio === undefined) {
+            promises.push(
+                API.getWhatsAppStatus()
+                    .catch(() => ({ autoEnvioActivo: false }))
+                    .then(status => {
+                        AppState.whatsappAutoEnvio = !!status.autoEnvioActivo;
+                        AppState.whatsappModo = status.modo || 'manual';
+                    })
+            );
+        }
+
+        if (promises.length > 0) {
+            await Promise.all(promises);
+        }
+    },
+
+    async enviarWhatsApp() {
+        if (!this.selectedClienteId) {
+            Utils.showError('Seleccioná un cliente en el filtro para enviar el mensaje');
+            return;
+        }
+
+        const datos = this._obtenerDatosClienteParaExportar();
+        if (!datos) {
+            Utils.showError('No hay datos para enviar');
+            return;
+        }
+
+        try {
+            await this.ensureDatosWhatsApp();
+
+            const cliente = (AppState.clientes || []).find(
+                c => String(c.id) === String(this.selectedClienteId)
+            );
+            PrecioClienteService.validarEnvio(cliente, datos);
+            this.abrirModalEnviarWhatsApp(datos);
+        } catch (error) {
+            console.error('Error preparando WhatsApp:', error);
+            this.handleWhatsAppError(error);
+        }
+    },
+
+    abrirModalEnviarWhatsApp(datos) {
+        const cliente = (AppState.clientes || []).find(
+            c => String(c.id) === String(this.selectedClienteId)
+        );
+        const sinTelefono = !cliente?.telefono || !String(cliente.telefono).trim();
+
+        const filasPreview = datos.filas.map(f => `
+            <tr>
+                <td>${f.producto}</td>
+                <td>${f.cantidad}</td>
+                <td>${Utils.formatCurrency(f.precioUnitario)}</td>
+                <td>${Utils.formatCurrency(f.total)}</td>
+            </tr>
+        `).join('');
+
+        const saveLabel = 'Enviar PDF';
+
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <p class="modal-static-value">${datos.clienteNombre || '-'}</p>
+                <small id="modal-precio-cliente-hint" class="modal-hint">${sinTelefono
+                    ? 'Este cliente no tiene teléfono. Configuralo en Clientes.'
+                    : (cliente.telefono || '')}</small>
+            </div>
+            <div class="form-group">
+                <label>PDF que se envía</label>
+                <div class="modal-pedido-preview-box">
+                    <table class="modal-pedido-detalle-table">
+                        <thead>
+                            <tr>
+                                <th>Producto</th>
+                                <th>Cant.</th>
+                                <th>Precio</th>
+                                <th>Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>${filasPreview}${(datos.comisiones || []).map(c => `
+                            <tr>
+                                <td>Comisión de reparto</td>
+                                <td>${Comisiones.bultosTexto(c.bultos)}</td>
+                                <td>${Utils.formatComision(c.tarifa)}</td>
+                                <td>${Utils.formatCurrency(c.total)}</td>
+                            </tr>`).join('')}</tbody>
+                        <tfoot>
+                            <tr>
+                                <td colspan="3" style="text-align:right;font-weight:600;">Total a pagar</td>
+                                <td style="font-weight:700;">${Utils.formatCurrency(datos.saldoTotal)}</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+            <p class="modal-hint">Se arma un PDF con esta lista y se abre WhatsApp para enviarlo. En el celular podés compartirlo directo. En la computadora se descarga el archivo para que lo adjuntes en el chat.</p>
+        `;
+
+        Utils.showModal('Enviar PDF al cliente', content, async () => {
+            await this.ejecutarEnvioPdfWhatsApp(cliente, datos);
+        }, saveLabel);
+
+        const saveBtn = document.getElementById('modal-save');
+        if (saveBtn) saveBtn.disabled = sinTelefono;
+    },
+
+    async _cargarJsPdf() {
+        if (window.jspdf && window.jspdf.jsPDF) return window.jspdf.jsPDF;
+        await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js';
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('No se pudo cargar el generador de PDF'));
+            document.head.appendChild(script);
+        });
+        if (!window.jspdf || !window.jspdf.jsPDF) {
+            throw new Error('No se pudo cargar el generador de PDF');
+        }
+        return window.jspdf.jsPDF;
+    },
+
+    async _construirPdfPrecios(datos) {
+        const JsPDF = await this._cargarJsPdf();
+        const doc = new JsPDF({ unit: 'mm', format: 'a4' });
+        const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        doc.setFontSize(16);
+        doc.text('Luciano Cargas', 14, 18);
+        doc.setFontSize(12);
+        doc.text('Lista de precios', 14, 26);
+        doc.setFontSize(11);
+        doc.text(String(datos.clienteNombre || ''), 14, 34);
+        doc.setFontSize(10);
+        doc.text(String(fecha || ''), 14, 40);
+        let y = 50;
+        doc.text('Cant.', 14, y);
+        doc.text('Producto', 32, y);
+        doc.text('Precio', 130, y);
+        doc.text('Total', 165, y);
+        y += 6;
+        (datos.filas || []).forEach(fila => {
+            if (y > 275) {
+                doc.addPage();
+                y = 20;
+            }
+            const unitario = parseFloat(fila.precioUnitario) || 0;
+            const subtotal = unitario * (parseFloat(fila.cantidad) || 0);
+            doc.text(String(fila.cantidad ?? ''), 14, y);
+            doc.text(String(fila.producto || '').slice(0, 42), 32, y);
+            doc.text(Utils.formatCurrency(unitario), 130, y);
+            doc.text(Utils.formatCurrency(subtotal), 165, y);
+            y += 7;
+        });
+        // La comisión va aparte, al final: "1200 bultos × $500".
+        const comisiones = datos.comisiones || (extra > 0 && datos.totalCantidad > 0 ? [{ bultos: datos.totalCantidad, tarifa: extra, total: Math.round(datos.totalCantidad * extra) }] : []);
+        comisiones.forEach(c => {
+            if (y > 275) {
+                doc.addPage();
+                y = 20;
+            }
+            doc.text(Comisiones.bultosTexto(c.bultos), 14, y);
+            doc.text('Comisión de reparto', 32, y);
+            doc.text(Utils.formatComision(c.tarifa), 130, y);
+            doc.text(Utils.formatCurrency(c.total), 165, y);
+            y += 7;
+        });
+        doc.setFontSize(12);
+        doc.text('Total a pagar: ' + Utils.formatCurrency(datos.saldoTotal), 14, Math.min(y + 8, 285));
+        return doc;
+    },
+
+    async _pdfDesdeHtml(html) {
+        const JsPDF = await this._cargarJsPdf();
+        const html2canvas = await Camiones._cargarHtml2Canvas();
+        const marco = document.createElement('iframe');
+        marco.setAttribute('aria-hidden', 'true');
+        marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+        document.body.appendChild(marco);
+        const docMarco = marco.contentDocument;
+        docMarco.open();
+        docMarco.write(html);
+        docMarco.close();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const alto = Math.max(docMarco.body.scrollHeight, 400);
+        marco.style.height = alto + 'px';
+        try {
+            const canvas = await html2canvas(docMarco.body, {
+                scale: 2,
+                backgroundColor: '#ffffff',
+                windowWidth: 794,
+                width: 794,
+                height: alto
+            });
+            const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            doc.__lienzos = [canvas];
+            const pageW = doc.internal.pageSize.getWidth();
+            const pageH = doc.internal.pageSize.getHeight();
+            const img = canvas.toDataURL('image/jpeg', 0.92);
+            const imgH = canvas.height * pageW / canvas.width;
+            let altoRestante = imgH;
+            let posicion = 0;
+            doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+            altoRestante -= pageH;
+            while (altoRestante > 8) {
+                posicion -= pageH;
+                doc.addPage();
+                doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                altoRestante -= pageH;
+            }
+            return doc;
+        } finally {
+            marco.remove();
+        }
+    },
+
+    async ejecutarEnvioPdfWhatsApp(cliente, datos) {
+        try {
+            PrecioClienteService.validarEnvio(cliente, datos);
+            const doc = await this._construirPdfPrecios(datos);
+            const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.pdf`;
+            await EnvioPdf.enviar({
+                telefono: cliente.telefono,
+                texto: `Hola ${cliente.nombre}, te envío la lista de precios.`,
+                doc,
+                nombre,
+                destinatario: cliente.nombre
+            });
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            this.handleWhatsAppError(error);
+            throw error;
+        }
+    },
+
+    // Lista de precios del cliente como Excel (es lo que reciben los clientes por WhatsApp desde el paso 4).
+    // Mismo diseño que el Excel de la hoja de carga: banda azul con el título, fecha, tabla y total en azul.
+    async _construirExcelPrecios(datos) {
+        const ExcelJS = await Camiones._cargarExcelJS();
+        const libro = new ExcelJS.Workbook();
+        libro.creator = 'Luciano Cargas';
+        const AZUL = 'FF1A73E8', AZUL_CLARO = 'FFE8F1FD', GRIS = 'FFF1F5F9', BORDE = 'FFCBD5E1', BLANCO = 'FFFFFFFF';
+        const relleno = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+        const borde = { bottom: { style: 'thin', color: { argb: BORDE } } };
+        const moneda = '"$" #,##0';
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        const nombreHoja = 'Lista de precios';
+
+        const hoja = libro.addWorksheet(nombreHoja, {
+            views: [{ state: 'frozen', ySplit: 4, showGridLines: false }],
+            pageSetup: { paperSize: 9, orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 } }
+        });
+        const ultima = 4;
+        hoja.getColumn(1).width = 14;
+        hoja.getColumn(2).width = 44;
+        hoja.getColumn(3).width = 18;
+        hoja.getColumn(4).width = 20;
+
+        // Título
+        hoja.mergeCells(1, 1, 1, ultima);
+        const titulo = hoja.getCell(1, 1);
+        titulo.value = `Luciano Cargas · Lista de precios · ${datos.clienteNombre || ''}`;
+        titulo.font = { name: 'Calibri', size: 18, bold: true, color: { argb: BLANCO } };
+        titulo.fill = relleno(AZUL);
+        titulo.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+        hoja.getRow(1).height = 32;
+
+        hoja.mergeCells(2, 1, 2, ultima);
+        const fechaCelda = hoja.getCell(2, 1);
+        fechaCelda.value = `Fecha: ${fecha || ''}`;
+        fechaCelda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FF475569' } };
+        fechaCelda.alignment = { vertical: 'middle', horizontal: 'left', indent: 1 };
+        hoja.getRow(2).height = 22;
+        hoja.getRow(3).height = 6;
+
+        // Encabezado de la tabla
+        const cabecera = hoja.getRow(4);
+        cabecera.values = ['Cant.', 'Producto', 'Precio', 'Total'];
+        cabecera.height = 34;
+        cabecera.eachCell((celda, col) => {
+            celda.font = { name: 'Calibri', size: 12, bold: true, color: { argb: BLANCO } };
+            celda.fill = relleno(AZUL);
+            celda.alignment = { vertical: 'middle', horizontal: col === 2 ? 'left' : (col === 1 ? 'center' : 'right'), indent: col === 2 ? 1 : (col >= 3 ? 1 : 0) };
+        });
+
+        // Filas: productos y, al final, la comisión de reparto
+        const lineas = (datos.filas || []).map(f => {
+            const unitario = parseFloat(f.precioUnitario) || 0;
+            const cantidad = parseFloat(f.cantidad) || 0;
+            return { cantidad, texto: false, producto: String(f.producto || ''), precio: unitario, total: Math.round(unitario * cantidad * 100) / 100 };
+        }).concat((datos.comisiones || []).map(c => ({
+            cantidad: Comisiones.bultosTexto(c.bultos), texto: true, producto: 'Comisión de reparto', precio: Number(c.tarifa) || 0, total: Number(c.total) || 0
+        })));
+        lineas.forEach((linea, k) => {
+            const fila = hoja.getRow(5 + k);
+            fila.values = [linea.cantidad, linea.producto, linea.precio, linea.total];
+            fila.height = 24;
+            fila.eachCell({ includeEmpty: true }, (celda, col) => {
+                if (col > ultima) return;
+                celda.fill = relleno(k % 2 ? GRIS : BLANCO);
+                celda.border = borde;
+                celda.font = { name: 'Calibri', size: 13, bold: col === 1 || col === 2, color: { argb: 'FF0F172A' } };
+                celda.alignment = { vertical: 'middle', horizontal: col === 2 ? 'left' : (col === 1 ? 'center' : 'right'), indent: col === 2 ? 1 : (col >= 3 ? 1 : 0) };
+                if (col === 1 && !linea.texto) celda.numFmt = '0.##';
+                if (col >= 3) celda.numFmt = moneda;
+                if (col === 4) { celda.fill = relleno(AZUL_CLARO); celda.font = { name: 'Calibri', size: 13, bold: true, color: { argb: AZUL } }; }
+            });
+        });
+
+        // Total a pagar
+        const filaTotal = hoja.getRow(5 + Math.max(lineas.length, 1) + 1);
+        filaTotal.height = 28;
+        hoja.mergeCells(filaTotal.number, 1, filaTotal.number, 3);
+        const etiqueta = hoja.getCell(filaTotal.number, 1);
+        etiqueta.value = 'Total a pagar';
+        etiqueta.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+        etiqueta.fill = relleno(AZUL);
+        etiqueta.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+        const valor = hoja.getCell(filaTotal.number, 4);
+        valor.value = Number(datos.saldoTotal) || 0;
+        valor.numFmt = moneda;
+        valor.font = { name: 'Calibri', size: 14, bold: true, color: { argb: BLANCO } };
+        valor.fill = relleno(AZUL);
+        valor.alignment = { vertical: 'middle', horizontal: 'right', indent: 1 };
+
+        // Al imprimir, el encabezado se repite en cada hoja.
+        hoja.pageSetup.printTitlesRow = '4:4';
+        hoja.headerFooter.oddFooter = '&CLuciano Cargas · &P de &N';
+
+        const buffer = await libro.xlsx.writeBuffer();
+        return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    },
+
+    // "WhatsApp Excel": arma el Excel con la lista del cliente elegido y lo manda por la aplicación de WhatsApp.
+    async enviarExcel() {
+        if (!this.selectedClienteId) {
+            Utils.showError('Por favor, seleccioná un cliente para enviarle la lista');
+            return;
+        }
+        const datos = this._obtenerDatosClienteParaExportar();
+        if (!datos) {
+            Utils.showError('No hay datos para enviar');
+            return;
+        }
+        try {
+            await this.ensureDatosWhatsApp();
+            const cliente = (AppState.clientes || []).find(c => String(c.id) === String(this.selectedClienteId));
+            PrecioClienteService.validarEnvio(cliente, datos);
+            const blob = await this._construirExcelPrecios(datos);
+            const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.xlsx`;
+            await EnvioPdf.enviarExcel({
+                telefono: cliente.telefono,
+                texto: `Hola ${cliente.nombre}, te envío la lista de precios.`,
+                blob,
+                nombre,
+                destinatario: cliente.nombre
+            });
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            console.error('Error enviando la lista en Excel:', error);
+            this.handleWhatsAppError(error);
+        }
+    },
+
+    async exportarPDF() {
+        if (!this.selectedClienteId) {
+            Utils.showError('Por favor, selecciona un cliente para exportar');
+            return;
+        }
+
+        const datos = this._obtenerDatosClienteParaExportar();
+        if (!datos) {
+            Utils.showError('No hay datos para exportar');
+            return;
+        }
+
+        try {
+            const fechaFormateada = AppState.currentDate
+                ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR', {
+                    weekday: 'long',
+                    day: '2-digit',
+                    month: 'long',
+                    year: 'numeric'
+                })
+                : new Date().toLocaleDateString('es-AR');
+
+            const fechaCorta = AppState.currentDate
+                ? new Date(AppState.currentDate + 'T12:00:00').toLocaleDateString('es-AR')
+                : '';
+
+            const extra = Utils.parsePrice(this.comisionPorUnidad) || 0;
+            // Cada producto a su precio; la comisión va aparte, al final: "1200 bultos × $500".
+            const filasProductos = datos.filas.map((f, i) => {
+                const unitario = parseFloat(f.precioUnitario) || 0;
+                const subtotal = unitario * (parseFloat(f.cantidad) || 0);
+                return `
+                <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                    <td class="col-cant">${f.cantidad}</td>
+                    <td class="col-prod">${Utils.esc(f.producto)}</td>
+                    <td class="col-money">${Utils.formatCurrency(unitario)}</td>
+                    <td class="col-money col-total">${Utils.formatCurrency(subtotal)}</td>
+                </tr>`;
+            }).join('');
+            const comisiones = datos.comisiones || (extra > 0 && datos.totalCantidad > 0 ? [{ bultos: datos.totalCantidad, tarifa: extra, total: Math.round(datos.totalCantidad * extra) }] : []);
+            const filasComision = comisiones.map(c => `
+                <tr class="row-comision">
+                    <td class="col-cant">${Comisiones.bultosTexto(c.bultos)}</td>
+                    <td class="col-prod">Comisión de reparto</td>
+                    <td class="col-money">${Utils.formatComision(c.tarifa)}</td>
+                    <td class="col-money col-total">${Utils.formatCurrency(c.total)}</td>
+                </tr>`).join('');
+            const filasHtml = filasProductos + filasComision;
+
+            const html = `
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Lista de precios - ${datos.clienteNombre}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+    color: #1e293b;
+    padding: 32px 40px;
+    background: #fff;
+  }
+  .doc-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 3px solid #1a73e8;
+  }
+  .brand h1 {
+    font-size: 26px;
+    font-weight: 700;
+    color: #1a73e8;
+    letter-spacing: -0.5px;
+  }
+  .brand p {
+    font-size: 12px;
+    color: #64748b;
+    margin-top: 4px;
+  }
+  .doc-meta {
+    text-align: right;
+    font-size: 12px;
+    color: #475569;
+    line-height: 1.6;
+  }
+  .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+  .cliente-box {
+    background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+    border-left: 4px solid #1a73e8;
+    padding: 16px 20px;
+    border-radius: 8px;
+    margin-bottom: 24px;
+  }
+  .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+  .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 8px;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  thead th {
+    background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%);
+    color: #fff;
+    padding: 12px 14px;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  thead th.col-money { text-align: right; }
+  tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid #e2e8f0;
+  }
+  .row-even { background: #fff; }
+  .row-odd { background: #f8fafc; }
+  .col-cant { text-align: center; font-weight: 600; width: 70px; }
+  .col-prod { font-weight: 500; }
+  .col-money { text-align: right; white-space: nowrap; }
+  .col-total { font-weight: 600; color: #1a73e8; }
+  .totals-wrap {
+    margin-top: 20px;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .totals-table {
+    width: 340px;
+    border-collapse: collapse;
+    box-shadow: none;
+  }
+  .totals-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid #e2e8f0;
+    font-size: 13px;
+  }
+  .totals-table td:first-child { color: #64748b; font-weight: 500; }
+  .totals-table td:last-child { text-align: right; font-weight: 600; }
+  .totals-table tr.saldo td {
+    background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%);
+    color: #fff;
+    font-size: 16px;
+    font-weight: 700;
+    border: none;
+  }
+  .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); }
+  tr.row-comision td { background: #fff7e0; font-weight: 600; border-top: 2px solid #f0d58a; }
+  .footer {
+    margin-top: 36px;
+    padding-top: 16px;
+    border-top: 1px solid #e2e8f0;
+    text-align: center;
+    font-size: 11px;
+    color: #94a3b8;
+  }
+  @media print {
+    body { padding: 20px; }
+    @page { margin: 15mm; }
+  }
+</style>
+</head>
+<body>
+  <div class="doc-header">
+    <div class="brand">
+      <h1>Luciano Cargas</h1>
+      <p>Resumen del pedido</p>
+    </div>
+    <div class="doc-meta">
+      <strong>Fecha de carga</strong>
+      ${fechaFormateada}<br>
+      <span style="font-size:11px;">Generado: ${new Date().toLocaleString('es-AR')}</span>
+    </div>
+  </div>
+
+  <div class="cliente-box">
+    <div class="label">Cliente</div>
+    <div class="name">${datos.clienteNombre}</div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th class="col-cant">Cant.</th>
+        <th>Producto</th>
+        <th class="col-money">Precio unit.</th>
+        <th class="col-money">Subtotal</th>
+      </tr>
+    </thead>
+    <tbody>${filasHtml}</tbody>
+  </table>
+
+  <div class="totals-wrap">
+    <table class="totals-table">
+      <tr class="saldo">
+        <td>Total a pagar</td>
+        <td>${Utils.formatCurrency(datos.saldoTotal)}</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="footer">
+    Documento generado por el Sistema de Gestión Luciano Cargas · ${fechaCorta}
+  </div>
+</body>
+</html>`;
+
+            await this.ensureDatosWhatsApp();
+            const cliente = (AppState.clientes || []).find(
+                c => String(c.id) === String(this.selectedClienteId)
+            );
+            PrecioClienteService.validarEnvio(cliente, datos);
+            const doc = await this._pdfDesdeHtml(html);
+            const nombre = `precios-${String(datos.clienteNombre || 'cliente').replace(/[^\w\-]+/g, '-')}.pdf`;
+            await EnvioPdf.enviar({
+                telefono: cliente.telefono,
+                texto: `Hola ${cliente.nombre}, te envío la lista de precios.`,
+                doc,
+                nombre,
+                destinatario: cliente.nombre
+            });
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            console.error('Error exporting PDF:', error);
+            this.handleWhatsAppError(error);
+        }
+    }
+};
+
+// Cuenta corriente de un cliente o un proveedor: cada carga y cada pago, con el saldo que va
+// quedando. La pueden ver todos los usuarios (los totales del inicio, solo algunos).
+//  - Proveedor: lo que llegó y se confirmó en la recepción (cantidad × precio real) y sus pagos.
+//  - Cliente: lo que se le cobró cada día (productos y comisión) y lo que fue pagando.
+//    Solo figuran los días que ya tienen cobranza (cerrados o con algún cobro), igual que en Cobranzas.
+const CuentaCorriente = {
+    _ultima: null,
+
+    _medio(texto) {
+        const partes = String(texto || '').split('·');
+        return partes.length > 1 ? partes[partes.length - 1].trim() : '';
+    },
+
+    _movimientosProveedor(id, recepcion, pagos, deudas) {
+        const movs = [];
+        (deudas || []).forEach(d => {
+            if (String(d.proveedor_id) !== id) return;
+            const monto = Utils.parsePrice(d.monto) || 0;
+            if (!monto) return;
+            movs.push({ fecha: Utils.fechaIso(d.fecha), orden: 0, producto: d.nota ? `Deuda anterior · ${d.nota}` : 'Deuda anterior', cantidad: '', precio: '', total: monto, pago: 0, medio: '' });
+        });
+        (recepcion || []).forEach(r => {
+            const confirmado = r.confirmado === true || r.confirmado === 'true';
+            const cantidad = parseFloat(r.llego) || 0;
+            if (!confirmado || cantidad <= 0 || String(r.proveedor_id) !== id) return;
+            const precio = Utils.parsePrice(r.precio_real) || 0;
+            movs.push({ fecha: Utils.fechaIso(r.fecha), orden: 0, producto: r.producto_nombre || 'Producto', cantidad, precio, total: Math.round(cantidad * precio), pago: 0, medio: '' });
+        });
+        (pagos || []).forEach(p => {
+            if (String(p.proveedor_id) !== id) return;
+            const monto = Utils.parsePrice(p.monto) || 0;
+            if (!monto) return;
+            const metodo = String(p.metodo || 'efectivo');
+            movs.push({ fecha: Utils.fechaIso(p.fecha), orden: 1, producto: p.nota ? String(p.nota) : 'Pago', cantidad: '', precio: '', total: 0, pago: monto, medio: metodo.charAt(0).toUpperCase() + metodo.slice(1) });
+        });
+        return movs;
+    },
+
+    _movimientosCliente(id, cobranzas, precios, caja) {
+        const movs = [];
+        (cobranzas || []).filter(c => String(c.cliente_id) === id).forEach(c => {
+            const fecha = Utils.fechaIso(c.fecha);
+            const manual = c.origen === 'manual';
+            const lineas = manual ? [] : (precios || []).filter(p => String(p.cliente_id) === id && Utils.fechaIso(p.fecha) === fecha && (parseFloat(p.cantidad) || 0) > 0);
+            let suma = 0;
+            let comision = 0;
+            lineas.forEach(p => {
+                const cantidad = parseFloat(p.cantidad) || 0;
+                const precio = Utils.parsePrice(p.precio_cliente) || 0;
+                const total = Math.round(cantidad * precio);
+                comision += Math.round(cantidad * (Utils.parseComision(p.comision_unitaria) || 0));
+                suma += total;
+                movs.push({ fecha, orden: 0, producto: p.producto_nombre || 'Producto', cantidad, precio, total, pago: 0, medio: '' });
+            });
+            if (comision) {
+                suma += comision;
+                Comisiones.resumen(lineas).forEach(r => {
+                    movs.push({ fecha, orden: 0, producto: 'Comisión de reparto', cantidad: r.bultos, precio: r.tarifa, total: r.total, pago: 0, medio: '' });
+                });
+            }
+            const totalCobranza = Utils.parsePrice(c.total) || 0;
+            if (totalCobranza !== suma) {
+                const rotulo = manual ? (c.nota ? `Deuda anterior · ${c.nota}` : 'Deuda anterior') : (lineas.length ? 'Ajuste del día' : 'Carga del día');
+                movs.push({ fecha, orden: 0, producto: rotulo, cantidad: '', precio: '', total: totalCobranza - suma, pago: 0, medio: '' });
+            }
+            // Pagos: los movimientos de caja de esta cobranza (con su fecha y medio).
+            let pagadoCaja = 0;
+            // Un cobro que se corrigió no deja rastro: de cada medio con correcciones queda un solo pago, por lo neto.
+            const pagos = [];
+            (caja || []).filter(m => String(m.referencia) === String(c.id)).forEach(m => {
+                const monto = (Utils.parsePrice(m.monto) || 0) * (String(m.tipo) === 'egreso' ? -1 : 1);
+                if (!monto) return;
+                pagadoCaja += monto;
+                pagos.push({ fecha: Utils.fechaIso(m.fecha) || fecha, monto, medio: this._medio(m.nota) });
+            });
+            const corregidos = new Set(pagos.filter(x => x.monto < 0).map(x => x.medio));
+            pagos.filter(x => !corregidos.has(x.medio)).forEach(x => {
+                movs.push({ fecha: x.fecha, orden: 1, producto: 'Pago', cantidad: '', precio: '', total: 0, pago: x.monto, medio: x.medio });
+            });
+            corregidos.forEach(medio => {
+                const delMedio = pagos.filter(x => x.medio === medio);
+                const neto = delMedio.reduce((suma, x) => suma + x.monto, 0);
+                if (Math.abs(neto) < 0.01) return;
+                const ultima = delMedio.reduce((f, x) => (x.fecha > f ? x.fecha : f), '');
+                movs.push({ fecha: ultima || fecha, orden: 1, producto: neto < 0 ? 'Corrección de cobro' : 'Pago', cantidad: '', precio: '', total: 0, pago: neto, medio });
+            });
+            const pagado = Utils.parsePrice(c.pagado) || 0;
+            if (pagado !== pagadoCaja) {
+                movs.push({ fecha, orden: 1, producto: 'Pago', cantidad: '', precio: '', total: 0, pago: pagado - pagadoCaja, medio: '' });
+            }
+        });
+        return movs;
+    },
+
+    _conSaldo(movs) {
+        let saldo = 0;
+        return movs
+            .sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '') || a.orden - b.orden)
+            .map(m => {
+                saldo += (m.total || 0) - (m.pago || 0);
+                return { ...m, saldo };
+            });
+    },
+
+    async abrir(tipo, id) {
+        id = String(id);
+        const esCliente = tipo === 'cliente';
+        const lista = esCliente ? AppState.clientes : AppState.proveedores;
+        const nombre = (esCliente && Utils.cuentaDe(id).titular) || (lista || []).find(x => String(x.id) === id)?.nombre || (esCliente ? 'Cliente' : 'Proveedor');
+        Utils.showLoader();
+        try {
+            let movs;
+            if (esCliente) {
+                const [cobranzas, precios, caja] = await Promise.all([
+                    API.request('cobranzas', 'GET'),
+                    API.request('precios-cliente', 'GET'),
+                    API.request('caja', 'GET')
+                ]);
+                const ids = Utils.clientesDeCuenta(id);
+                movs = ids.flatMap(cid => this._movimientosCliente(cid, cobranzas, precios, caja));
+                this._resumenCliente = this._filasResumenCliente(ids, cobranzas);
+            } else {
+                const [recepcion, pagos, deudas] = await Promise.all([
+                    API.request('recepcion', 'GET'),
+                    API.request('pagos-proveedores', 'GET'),
+                    API.request('deudas-proveedores', 'GET').catch(() => [])
+                ]);
+                movs = this._movimientosProveedor(id, recepcion, pagos, deudas);
+            }
+            const filas = this._conSaldo(movs);
+            this._ultima = { tipo, id, nombre, filas };
+            if (esCliente) this._mostrarResumenCliente(nombre, this._resumenCliente);
+            else this._mostrar(esCliente, nombre, filas);
+        } catch (error) {
+            console.error('Error armando la cuenta corriente:', error);
+            Utils.showError('No se pudo armar la cuenta corriente: ' + error.message);
+        } finally {
+            Utils.hideLoader();
+        }
+    },
+
+    // Una fila por fecha: lo cargado, lo cobrado en efectivo y por transferencia (y a qué proveedor fue) y el saldo.
+    _filasResumenCliente(ids, cobranzas) {
+        const porFecha = {};
+        (cobranzas || []).filter(c => ids.includes(String(c.cliente_id))).forEach(c => {
+            const fecha = Utils.fechaIso(c.fecha);
+            const fila = porFecha[fecha] || (porFecha[fecha] = { fecha, total: 0, pagado: 0, efectivo: 0, transferencia: 0, depositos: [] });
+            const medios = MediosPago.parse(c.medios);
+            fila.total += Utils.parsePrice(c.total) || 0;
+            fila.pagado += Utils.parsePrice(c.pagado) || 0;
+            fila.efectivo += medios.efectivo;
+            fila.transferencia += medios.transferencia;
+            fila.depositos = fila.depositos.concat(Depositos.deCobranza(c) || []);
+        });
+        let saldo = 0;
+        return Object.values(porFecha).sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '')).map(f => {
+            saldo += f.total - f.pagado;
+            return { ...f, saldo };
+        });
+    },
+
+    _mostrarResumenCliente(nombre, filas) {
+        const saldo = filas.length ? filas[filas.length - 1].saldo : 0;
+        const plata = n => (n ? Utils.formatCurrency(n) : '');
+        const fecha = iso => (iso ? new Date(iso + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric' }) : '');
+        const cuerpo = filas.length
+            ? filas.map(f => `
+                <tr>
+                    <td data-label="Fecha">${Utils.esc(fecha(f.fecha))}</td>
+                    <td data-label="Total de carga" class="cc-num">${plata(f.total)}</td>
+                    <td data-label="Pago en efectivo" class="cc-num">${plata(f.efectivo)}</td>
+                    <td data-label="Pago en transferencia" class="cc-num">${plata(f.transferencia)}</td>
+                    <td data-label="A quién corresponde">${Utils.esc(f.depositos.map(d => `${Depositos._nombreProveedor(d.proveedor_id)} ${Utils.formatCurrency(d.monto)}`).join(' · '))}</td>
+                    <td data-label="Saldo" class="cc-num cc-saldo">${Utils.formatCurrency(f.saldo)}</td>
+                </tr>`).join('')
+            : `<tr><td colspan="6" style="text-align:center;padding:24px;color:#666;">Todavía no hay movimientos con ${Utils.esc(nombre)}.</td></tr>`;
+        const content = `
+            <div class="cuenta-corriente">
+                <div class="cc-resumen">
+                    <span>Saldo total</span>
+                    <strong class="${saldo > 0 ? 'cc-deuda' : ''}">${Utils.formatCurrency(saldo)}</strong>
+                    <button type="button" class="btn btn-whatsapp btn-sm" id="cc-whatsapp">Enviar WhatsApp</button>
+                </div>
+                <div class="table-container cc-scroll">
+                    <table class="data-table cc-tabla">
+                        <thead>
+                            <tr><th>Fecha</th><th>Total de carga</th><th>Pago en efectivo</th><th>Pago en transferencia</th><th>A quién corresponde</th><th>Saldo</th></tr>
+                        </thead>
+                        <tbody>${cuerpo}</tbody>
+                    </table>
+                </div>
+                <p class="modal-hint">Figuran los días ya cerrados o con algún cobro. Lo de hoy aparece cuando se cobra o se cierra el día.</p>
+            </div>
+        `;
+        Utils.showModal(`Cuenta corriente · ${nombre}`, content, null);
+        document.getElementById('cc-whatsapp')?.addEventListener('click', () => this.enviarWhatsApp());
+        const scroll = document.querySelector('.cc-scroll');
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    },
+
+    _mostrar(esCliente, nombre, filas) {
+        const saldo = filas.length ? filas[filas.length - 1].saldo : 0;
+        const plata = n => (n ? Utils.formatCurrency(n) : '');
+        const fecha = iso => (iso ? new Date(iso + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric' }) : '');
+        const cuerpo = filas.length
+            ? filas.map(f => `
+                <tr class="${f.pago ? 'cc-pago' : ''}">
+                    <td data-label="Fecha">${Utils.esc(fecha(f.fecha))}</td>
+                    <td data-label="Producto" class="cc-producto">${Utils.esc(f.producto)}</td>
+                    <td data-label="Cantidad" class="cc-num">${f.cantidad === '' ? '' : String(f.cantidad).replace('.', ',')}</td>
+                    <td data-label="Precio" class="cc-num">${plata(f.precio)}</td>
+                    <td data-label="Total" class="cc-num">${plata(f.total)}</td>
+                    <td data-label="Pago" class="cc-num">${plata(f.pago)}</td>
+                    <td data-label="Medio">${Utils.esc(f.medio || '')}</td>
+                    <td data-label="Saldo" class="cc-num cc-saldo">${Utils.formatCurrency(f.saldo)}</td>
+                </tr>`).join('')
+            : `<tr><td colspan="8" style="text-align:center;padding:24px;color:#666;">Todavía no hay movimientos con ${Utils.esc(nombre)}.</td></tr>`;
+        const content = `
+            <div class="cuenta-corriente">
+                <div class="cc-resumen">
+                    <span>${esCliente ? 'Te debe' : 'Le debés'}</span>
+                    <strong class="${saldo > 0 ? 'cc-deuda' : ''}">${Utils.formatCurrency(saldo)}</strong>
+                    <button type="button" class="btn btn-whatsapp btn-sm" id="cc-whatsapp">Enviar WhatsApp</button>
+                </div>
+                <div class="table-container cc-scroll">
+                    <table class="data-table cc-tabla">
+                        <thead>
+                            <tr><th>Fecha</th><th>Producto</th><th>Cantidad</th><th>Precio</th><th>Total</th><th>Pago</th><th>Medio</th><th>Saldo</th></tr>
+                        </thead>
+                        <tbody>${cuerpo}</tbody>
+                    </table>
+                </div>
+                ${esCliente ? '<p class="modal-hint">Figuran los días ya cerrados o con algún cobro. Lo de hoy aparece cuando se cobra o se cierra el día.</p>' : ''}
+            </div>
+        `;
+        Utils.showModal(`Cuenta corriente · ${nombre}`, content, null);
+        document.getElementById('cc-whatsapp')?.addEventListener('click', () => this.enviarWhatsApp());
+        const scroll = document.querySelector('.cc-scroll');
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    },
+
+    _fechaLarga(iso) {
+        const f = Utils.fechaIso(iso);
+        if (!f) return '';
+        return new Date(f + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    },
+
+    // Mismo diseño que los demás PDF de la app (encabezado azul, recuadro con el nombre, filas alternadas).
+    _htmlPdf(cuenta, tipo) {
+        const esCliente = tipo === 'cliente';
+        const generado = new Date().toLocaleString('es-AR');
+        const etiquetaSaldo = esCliente ? 'Saldo que debe' : 'Saldo a pagar';
+        const cant = n => (n === '' || n === null || n === undefined ? '' : String(n).replace('.', ','));
+        const plata = n => (n === '' || !n ? '' : Utils.formatCurrency(n));
+        let fechaAnterior = '';
+        const cuerpo = cuenta.movimientos.map((m, i) => {
+            const fecha = this._fechaLarga(m.fecha);
+            const mostrarFecha = fecha !== fechaAnterior;
+            fechaAnterior = fecha;
+            const esPago = !!m.pago;
+            return `
+            <tr class="${i % 2 === 0 ? 'row-even' : 'row-odd'}">
+                <td class="col-fecha">${mostrarFecha ? Utils.esc(fecha) : ''}</td>
+                <td class="${esPago ? 'pago' : ''}">${Utils.esc(m.producto || (esPago ? 'Pago' : ''))}</td>
+                <td class="col-num">${cant(m.cantidad)}</td>
+                <td class="col-num">${plata(m.precio)}</td>
+                <td class="col-money">${plata(m.total)}</td>
+                <td class="col-money pago">${plata(m.pago)}</td>
+                <td class="pago">${Utils.esc(m.medio)}</td>
+                <td class="col-money saldo">${Utils.formatCurrency(m.saldo)}</td>
+            </tr>`;
+        }).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Cuenta corriente</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; padding: 32px 36px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 14px 20px; border-radius: 8px; margin-bottom: 20px; }
+                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 10px 8px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+                thead th.col-money, thead th.col-num { text-align: right; }
+                tbody td { padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f8fafc; }
+                td.col-fecha { color: #475569; width: 150px; }
+                td.col-num { text-align: right; white-space: nowrap; }
+                td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                td.col-money.saldo { color: #1e293b; }
+                td.pago, td.col-money.pago { color: #15803d; }
+                .totals-wrap { margin-top: 18px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 300px; box-shadow: none; }
+                .totals-table td { padding: 8px 14px; font-size: 14px; font-weight: 700; border: none; }
+                .totals-table td:last-child { text-align: right; }
+                .totals-table tr.linea td { color: #475569; font-weight: 500; font-size: 13px; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; font-size: 16px; }
+                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
+                .footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Cuenta corriente</p></div>
+                <div class="doc-meta"><strong>${etiquetaSaldo}</strong>${Utils.formatCurrency(cuenta.saldo)}<br><span>Generado: ${Utils.esc(generado)}</span></div>
+            </div>
+            <div class="cliente-box"><div class="label">${esCliente ? 'Cliente' : 'Proveedor'}</div><div class="name">${Utils.esc(cuenta.nombre)}</div></div>
+            <table>
+                <thead><tr>
+                    <th>Fecha</th><th>Producto</th><th class="col-num">Cant.</th><th class="col-num">Precio</th>
+                    <th class="col-money">Total</th><th class="col-money">Pago</th><th>Medio</th><th class="col-money">Saldo</th>
+                </tr></thead>
+                <tbody>${cuerpo || '<tr><td colspan="8">Todavía no tiene cargas ni pagos.</td></tr>'}</tbody>
+            </table>
+            <div class="totals-wrap"><table class="totals-table">
+                <tr class="linea"><td>Total cargas</td><td>${Utils.formatCurrency(cuenta.cargas)}</td></tr>
+                <tr class="linea"><td>Total pagos</td><td>${Utils.formatCurrency(cuenta.pagos)}</td></tr>
+                <tr class="saldo"><td>${etiquetaSaldo}</td><td>${Utils.formatCurrency(cuenta.saldo)}</td></tr>
+            </table></div>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
+
+    // Como los demás envíos de PDF: en la computadora abre WhatsApp Web con la frase y deja el
+    // documento copiado para pegar; en el celular, el menú Compartir. Sin teléfono, se descarga.
+    async enviarWhatsApp() {
+        const cuenta = this._ultima;
+        if (!cuenta) return;
+        try {
+            const esCliente = cuenta.tipo === 'cliente';
+            const lista = esCliente ? AppState.clientes : AppState.proveedores;
+            const persona = (lista || []).find(x => String(x.id) === String(cuenta.id)) || {};
+            const movimientos = cuenta.filas;
+            const datos = {
+                nombre: cuenta.nombre,
+                movimientos,
+                cargas: movimientos.reduce((suma, f) => suma + (f.total || 0), 0),
+                pagos: movimientos.reduce((suma, f) => suma + (f.pago || 0), 0),
+                saldo: movimientos.length ? movimientos[movimientos.length - 1].saldo : 0
+            };
+            const doc = await Precios._pdfDesdeHtml(this._htmlPdf(datos, cuenta.tipo));
+            const nombreArchivo = `cuenta-${String(cuenta.nombre).replace(/[^\w\-]+/g, '-')}.pdf`;
+            if (!WhatsAppService.normalizePhone(persona.telefono)) {
+                doc.save(nombreArchivo);
+                Utils.avisar(`Se descargó el PDF. ${cuenta.nombre} no tiene un teléfono válido para WhatsApp: cargalo en ${esCliente ? 'Clientes' : 'Proveedores'}.`);
+                return;
+            }
+            await EnvioPdf.enviar({
+                telefono: persona.telefono,
+                texto: `Hola ${cuenta.nombre}, te paso la cuenta corriente con el saldo al día.`,
+                doc,
+                nombre: nombreArchivo,
+                destinatario: cuenta.nombre
+            });
+        } catch (error) {
+            console.error('Error enviando la cuenta corriente:', error);
+            Utils.showError('No se pudo enviar la cuenta corriente: ' + error.message);
+        }
+    }
+};
+
+// Envío de un PDF por WhatsApp Web. Ninguna página puede adjuntar un archivo en el chat de
+// WhatsApp Web, así que el documento se copia como imagen: se abre el chat con la frase y en el
+// chat se pega con Cmd+V (Ctrl+V), debajo de la frase. En el celular se usa el menú Compartir.
+const EnvioPdf = {
+    async _imagen(doc) {
+        const lienzos = (doc && doc.__lienzos) || [];
+        if (!lienzos.length) return null;
+        const ancho = Math.max(...lienzos.map(c => c.width));
+        const altoTotal = lienzos.reduce((suma, c) => suma + c.height, 0);
+        const escala = Math.min(1, 14000 / altoTotal);
+        const lienzo = document.createElement('canvas');
+        lienzo.width = Math.round(ancho * escala);
+        lienzo.height = Math.round(altoTotal * escala);
+        const ctx = lienzo.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, lienzo.width, lienzo.height);
+        let y = 0;
+        lienzos.forEach(c => {
+            ctx.drawImage(c, 0, y, Math.round(c.width * escala), Math.round(c.height * escala));
+            y += Math.round(c.height * escala);
+        });
+        return new Promise(resolve => lienzo.toBlob(resolve, 'image/png'));
+    },
+
+    _puedeCopiarImagen() {
+        return !!(navigator.clipboard && navigator.clipboard.write && window.ClipboardItem);
+    },
+
+    // Excel por la aplicación de WhatsApp. En el celular, el menú Compartir; en la computadora se descarga
+    // el archivo y se abre el chat en la aplicación de escritorio (WhatsApp no deja adjuntar desde una página).
+    async enviarExcel({ telefono, texto, blob, nombre, destinatario }) {
+        const archivo = new File([blob], nombre, { type: blob.type });
+        if (WhatsAppService.isMobile()) {
+            try {
+                if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                    await navigator.share({ files: [archivo], title: nombre, text: texto });
+                    return;
+                }
+            } catch (error) {
+                if (error && error.name === 'AbortError') return;
+            }
+        }
+        const url = URL.createObjectURL(blob);
+        const enlace = document.createElement('a');
+        enlace.href = url;
+        enlace.download = nombre;
+        document.body.appendChild(enlace);
+        enlace.click();
+        enlace.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        setTimeout(() => WhatsAppService.openChat(telefono, texto, { app: true }), 400);
+        Utils.avisar(`Se descargó el Excel y se abre WhatsApp. Arrastralo (o adjuntalo con el clip) al chat de ${destinatario}.`);
+    },
+
+    // { telefono, texto, doc, nombre, destinatario }
+    async enviar({ telefono, texto, doc, nombre, destinatario }) {
+        const archivo = new File([doc.output('blob')], nombre, { type: 'application/pdf' });
+        if (WhatsAppService.isMobile()) {
+            try {
+                if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+                    await navigator.share({ files: [archivo], title: nombre, text: texto });
+                    return;
+                }
+            } catch (error) {
+                if (error && error.name === 'AbortError') return;
+            }
+            doc.save(nombre);
+            WhatsAppService.openChat(telefono, texto);
+            Utils.avisar(`Se descargó el PDF. Adjuntalo en el chat de ${destinatario}.`);
+            return;
+        }
+
+        const imagen = this._puedeCopiarImagen() ? await this._imagen(doc) : null;
+        if (!imagen) {
+            doc.save(nombre);
+            WhatsAppService.openChat(telefono, texto);
+            Utils.avisar('Se abrió WhatsApp Web. El PDF se descargó: arrastralo al chat para enviarlo.');
+            return;
+        }
+
+        const vista = URL.createObjectURL(imagen);
+        const atajo = /Mac/i.test(navigator.platform || navigator.userAgent) ? 'Cmd+V' : 'Ctrl+V';
+        const content = `
+            <ol class="envio-pdf-pasos">
+                <li>Tocá <strong>Copiar y abrir WhatsApp</strong>: se abre WhatsApp Web con el chat de <strong>${Utils.esc(destinatario)}</strong> y esta frase.</li>
+                <li>En el chat apretá <strong>${atajo}</strong>: el documento aparece debajo de la frase, listo para enviar.</li>
+            </ol>
+            <p class="envio-pdf-frase">${Utils.esc(texto)}</p>
+            <img class="envio-pdf-vista" src="${vista}" alt="Vista previa del documento">
+            <p class="modal-hint">¿Lo necesitás como archivo PDF? <button type="button" class="btn btn-secondary btn-sm" id="envio-pdf-descargar">Descargar PDF</button></p>
+        `;
+        Utils.showModal(`Enviar a ${destinatario}`, content, async () => {
+            try {
+                await navigator.clipboard.write([new ClipboardItem({ 'image/png': imagen })]);
+                WhatsAppService.openChat(telefono, texto);
+                Utils.avisar(`Documento copiado. En el chat de WhatsApp Web apretá ${atajo} y después Enviar.`);
+            } catch (error) {
+                console.warn('No se pudo copiar el documento:', error);
+                doc.save(nombre);
+                WhatsAppService.openChat(telefono, texto);
+                Utils.avisar('No se pudo copiar el documento. Se descargó el PDF: arrastralo al chat de WhatsApp Web.');
+            } finally {
+                setTimeout(() => URL.revokeObjectURL(vista), 60000);
+            }
+        }, 'Copiar y abrir WhatsApp');
+        document.getElementById('envio-pdf-descargar')?.addEventListener('click', () => doc.save(nombre));
+    }
+};
+
+// Cierre
+const Cierre = {
+    _cerrando: false,
+
+    _cobranzasCache(fecha) {
+        // La lista del día no trae las deudas de días anteriores: se unen ambas, sin repetir.
+        const porId = new Map();
+        [CacheManager.get('cobranzas:all:all'), CacheManager.get(`cobranzas:${fecha}:all`)].forEach(lista => {
+            (Array.isArray(lista) ? lista : []).forEach((c, i) => {
+                porId.set(String(c.id || `${c.cliente_id}|${c.fecha}|${i}`), c);
+            });
+        });
+        return Array.from(porId.values());
+    },
+
+    _itemResumen(label, estadoHtml, hint) {
+        const hintHtml = hint
+            ? `<p class="cierre-resumen-hint">${hint}</p>`
+            : '';
+        return `<li>
+            <div class="cierre-resumen-main"><span>${label}</span>${estadoHtml}</div>
+            ${hintHtml}
+        </li>`;
+    },
+
+    _hintPrecios(info, precios) {
+        if (info && info.precios_completos) {
+            return 'Cada producto pedido ya tiene precio al cliente.';
+        }
+
+        const pedidos = AppState.pedidos || [];
+        const conPrecio = (precios || []).filter(p => Utils.parsePrice(p.precio_cliente) > 0);
+        const faltantes = pedidos.filter(pedido => {
+            const rec = Recepcion.agregadoDe(AppState.recepcion, pedido.producto_id);
+            const confirmado = rec && (rec.confirmado === true || rec.confirmado === 'true' || rec.confirmado === 1);
+            if (confirmado && (Number(rec.llego) || 0) <= 0) return false;
+            // Sin línea con cantidad y sin nada de lo que llegó para ese cliente: no hace falta su precio.
+            const tieneLineaConCantidad = (precios || []).some(pr =>
+                String(pr.cliente_id) === String(pedido.cliente_id) &&
+                String(pr.producto_id) === String(pedido.producto_id) &&
+                Number(pr.cantidad) > 0);
+            if (!tieneLineaConCantidad && Recepcion._clienteSinParte(pedido.cliente_id, pedido.producto_id)) return false;
+            return !conPrecio.some(pr =>
+                String(pr.cliente_id) === String(pedido.cliente_id) &&
+                String(pr.producto_id) === String(pedido.producto_id)
+            );
+        });
+
+        const partes = [];
+        if (info && !info.recepcion_confirmada) {
+            partes.push('Todavía falta confirmar la recepción: el precio se carga después de confirmar lo que llegó.');
+        }
+        if (faltantes.length > 0) {
+            const porCliente = [];
+            faltantes.forEach(pedido => {
+                const cliente = Utils.nombreCatalogo(pedido, 'cliente');
+                const producto = pedido.producto_nombre || Utils.nombreCatalogo(pedido, 'producto');
+                let grupo = porCliente.find(item => item.cliente === cliente);
+                if (!grupo) {
+                    grupo = { cliente, productos: [] };
+                    porCliente.push(grupo);
+                }
+                if (!grupo.productos.includes(producto)) grupo.productos.push(producto);
+            });
+            const detalles = porCliente.map(grupo => {
+                const productos = grupo.productos.length === 1
+                    ? grupo.productos[0]
+                    : this._unirLista(grupo.productos);
+                return `${grupo.cliente} (${productos})`;
+            });
+            partes.push(`Falta el precio al cliente de ${this._unirLista(detalles)}.`);
+        } else {
+            partes.push('Falta el precio al cliente en los productos del pedido.');
+        }
+        partes.push('Queda completo cuando cada producto pedido tiene precio.');
+        return partes.join(' ');
+    },
+
+    _unirLista(items) {
+        const lista = (items || []).map(item => this._textoPlano(item)).filter(Boolean);
+        if (lista.length <= 1) return lista[0] || '';
+        if (lista.length === 2) return `${lista[0]} y ${lista[1]}`;
+        return `${lista.slice(0, -1).join(', ')} y ${lista[lista.length - 1]}`;
+    },
+
+    _textoPlano(valor) {
+        return String(valor || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    },
+
+    pintarResumen({ info, precios = [], cobranzas = [], proveedores = [], stock = [] } = {}) {
+        const resumen = document.getElementById('cierre-resumen');
+        if (!resumen) return;
+
+        const recepcionConfirmada = !!(info && info.recepcion_confirmada);
+        const preciosCompletos = !!(info && info.precios_completos);
+        const confirmados = info?.recepcion_confirmados || 0;
+        const totalRecepcion = info?.recepcion_total || 0;
+
+        const estadoRecepcion = recepcionConfirmada
+            ? '<span class="cierre-ok">Confirmada</span>'
+            : '<span class="cierre-pendiente">Pendiente</span>';
+        const hintRecepcion = recepcionConfirmada
+            ? 'Todos los productos del pedido están confirmados.'
+            : (totalRecepcion > 0
+                ? `Confirmaste ${confirmados} de ${totalRecepcion} productos. Falta el resto en Confirmación de lo que llegó.`
+                : 'Falta confirmar lo que llegó en Confirmación de lo que llegó.');
+
+        const estadoPrecios = preciosCompletos
+            ? '<span class="cierre-ok">Completos</span>'
+            : '<span class="cierre-pendiente">Pendientes</span>';
+        const hintPrecios = this._hintPrecios(info, precios);
+
+        const clientesIds = [...new Set(
+            (precios || [])
+                .filter(p => Utils.parsePrice(p.precio_cliente) > 0)
+                .map(p => String(p.cliente_id))
+        )];
+        const totalClientesHoy = clientesIds.length;
+        const cobranzasDia = (cobranzas || []).filter(c => {
+            if (!AppState.currentDate) return true;
+            const fechaCob = Utils.fechaIso(c.fecha);
+            return !fechaCob || fechaCob === AppState.currentDate;
+        });
+        const cobradosHoy = clientesIds.filter(id => {
+            const cob = cobranzasDia.find(c => String(c.cliente_id) === id);
+            return cob && (String(cob.estado || '').toLowerCase() === 'pagado' || (parseFloat(cob.saldo) || 0) <= 0);
+        }).length;
+        const parcialHoy = clientesIds.filter(id => {
+            const cob = cobranzasDia.find(c => String(c.cliente_id) === id);
+            return cob && (parseFloat(cob.pagado) || 0) > 0 && (parseFloat(cob.saldo) || 0) > 0;
+        }).length;
+
+        let estadoCobranzasHoy;
+        if (totalClientesHoy === 0) {
+            estadoCobranzasHoy = '<span class="cierre-pendiente">Sin precios cargados</span>';
+        } else if (cobradosHoy === totalClientesHoy) {
+            estadoCobranzasHoy = `<span class="cierre-ok">Cobrado (${cobradosHoy}/${totalClientesHoy})</span>`;
+        } else {
+            estadoCobranzasHoy = `<span class="cierre-pendiente">${cobradosHoy} cobrados, ${parcialHoy} parciales, ${totalClientesHoy - cobradosHoy - parcialHoy} sin cobrar (de ${totalClientesHoy})</span>`;
+        }
+
+        const proveedoresPendientes = (proveedores || []).filter(p => (parseFloat(p.saldo) || 0) > 0);
+        const estadoProveedores = proveedoresPendientes.length > 0
+            ? `<span class="cierre-pendiente">Pendientes (${proveedoresPendientes.length})</span>`
+            : '<span class="cierre-ok">Sin pendientes</span>';
+
+        const stockBajo = Stock._filas(stock).filter(s => (parseFloat(s.stock_actual) || 0) <= (parseFloat(s.minimo) || 10));
+        const estadoStock = stockBajo.length > 0
+            ? `<span class="cierre-alerta">Stock bajo (${stockBajo.length} productos)</span>`
+            : '<span class="cierre-ok">Actualizado</span>';
+
+        resumen.innerHTML = [
+            this._itemResumen('Recepción', estadoRecepcion, hintRecepcion),
+            this._itemResumen('Precios al cliente', estadoPrecios, hintPrecios),
+            this._itemResumen('Cobranzas del día', estadoCobranzasHoy, totalClientesHoy === 0
+                ? 'Se habilita cuando hay precios al cliente cargados.'
+                : ''),
+            this._itemResumen('Proveedores', estadoProveedores, proveedoresPendientes.length
+                ? `Paso anterior: ${proveedoresPendientes.length} proveedor${proveedoresPendientes.length === 1 ? '' : 'es'} con saldo a pagar.`
+                : 'Paso anterior: ningún proveedor tiene saldo pendiente.'),
+            this._itemResumen('Stock', estadoStock, stockBajo.length
+                ? `${stockBajo.length} producto${stockBajo.length === 1 ? '' : 's'} debajo del mínimo.`
+                : 'Ningún producto está debajo del mínimo.')
+        ].join('');
+        resumen.dataset.loaded = 'true';
+
+        const btnCerrar = document.getElementById('btn-cerrar-dia');
+        if (btnCerrar) {
+            const diaCerrado = info && info.estado === 'cerrado';
+            btnCerrar.disabled = diaCerrado;
+            btnCerrar.textContent = diaCerrado ? 'Día cerrado' : 'Cerrar día';
+        }
+    },
+
+    async load() {
+        const resumen = document.getElementById('cierre-resumen');
+        if (!resumen) return;
+
+        const fecha = AppState.currentDate;
+        DiaOperativo.renderEstadoPanels();
+
+        this.pintarResumen({
+            info: DiaOperativo.getDiaInfo(fecha),
+            precios: AppState.precios || [],
+            cobranzas: this._cobranzasCache(fecha),
+            proveedores: AppState.proveedores || [],
+            stock: AppState.stock || []
+        });
+
+        try {
+            const flujo = await DataLoader.getFlujo(fecha).catch(() => null);
+            if (flujo?.precios) AppState.precios = flujo.precios;
+            if (flujo?.pedidos) AppState.pedidos = flujo.pedidos;
+
+            const [proveedores, stock, cobranzas] = await Promise.all([
+                AppState.proveedores?.length
+                    ? Promise.resolve(AppState.proveedores)
+                    : API.getProveedores().catch(() => []),
+                AppState.stock?.length
+                    ? Promise.resolve(AppState.stock)
+                    : API.getStock().catch(() => []),
+                this._cobranzasCache(fecha).length
+                    ? Promise.resolve(this._cobranzasCache(fecha))
+                    : API.getCobranzas(fecha).catch(() => [])
+            ]);
+
+            if (proveedores.length) AppState.proveedores = proveedores;
+            if (stock.length) AppState.stock = stock;
+
+            this.pintarResumen({
+                info: DiaOperativo.getDiaInfo(fecha),
+                precios: AppState.precios || [],
+                cobranzas,
+                proveedores,
+                stock
+            });
+        } catch (error) {
+            console.error('Error loading cierre resumen:', error);
+            if (resumen.dataset.loaded !== 'true') {
+                resumen.innerHTML = `
+                    <li>Recepción: <span class="cierre-error">Error al cargar</span></li>
+                    <li>Precios: <span class="cierre-error">Error al cargar</span></li>
+                    <li>Cobranzas del día: <span class="cierre-error">Error al cargar</span></li>
+                    <li>Proveedores: <span class="cierre-error">Error al cargar</span></li>
+                    <li>Stock: <span class="cierre-error">Error al cargar</span></li>
+                `;
+            }
+        } finally {
+            Utils.hideLoader(resumen);
+        }
+    },
+    
+    async _quedoCerrado(fecha) {
+        try {
+            const cierres = await API._executeRequest('cierre', 'GET', null, 0);
+            return (cierres || []).some(c => Utils.fechaIso(c.fecha) === fecha && String(c.estado) === 'cerrado');
+        } catch (error) {
+            return false;
+        }
+    },
+
+    async cerrar() {
+        if (this._cerrando) return;
+        const info = this && DiaOperativo.getDiaInfo(AppState.currentDate);
+        if (info && info.estado === 'cerrado') {
+            Utils.showInfo('Este día ya está cerrado.');
+            return;
+        }
+
+        const confirmar = await Utils.showConfirm('¿Está seguro de cerrar el día? Esta acción no se puede deshacer.');
+        if (!confirmar) return;
+
+        this._cerrando = true;
+        Utils.showLoader();
+        try {
+            // Validar que la fecha esté disponible
+            let fecha = AppState.currentDate;
+            
+            // Si no hay fecha en AppState, usar la fecha actual
+            if (!fecha) {
+                fecha = fechaHoyAR();
+                console.warn('⚠️ AppState.currentDate no está definida, usando fecha actual:', fecha);
+                // Actualizar AppState para futuras operaciones
+                AppState.currentDate = fecha;
+            }
+            
+            console.log('📅 Cierre.cerrar() - Fecha para cierre:', fecha);
+            console.log('📅 Cierre.cerrar() - AppState.currentDate:', AppState.currentDate);
+            console.log('📅 Cierre.cerrar() - Tipo de fecha:', typeof fecha);
+            
+            if (!fecha || fecha === 'undefined' || fecha === 'null') {
+                throw new Error('No se pudo determinar la fecha para cerrar el día');
+            }
+            
+            // Validar formato de fecha
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+                throw new Error(`Formato de fecha inválido: "${fecha}". Debe ser YYYY-MM-DD`);
+            }
+            
+            // Validar que todo esté completo
+            const resultadoCierre = await API.cerrarDia(fecha);
+            Utils.showSuccess('Día cerrado correctamente. Se está armando el reporte en PDF y guardando en Google Drive…');
+            Historial.generarReportePDF(fecha, { silencioso: true, drive: true });
+            const faltantesStock = (resultadoCierre && resultadoCierre.faltantes_stock) || [];
+            if (faltantesStock.length) {
+                await Utils.showWarning('Se vendió más de lo que había cargado en stock: '
+                    + faltantesStock.map(f => `${f.producto_nombre || 'Producto'} (faltaban ${f.faltante})`).join(', ')
+                    + '. El stock quedó en 0: revisalo en Stock.');
+            }
+            
+            CacheManager.invalidateAllExcept(['clientes', 'productos', 'proveedores']);
+            DataLoader.invalidate();
+            await DiaOperativo.resolveWorkDate();
+            Navigation.navigateTo('dashboard');
+        } catch (error) {
+            // Si se cortó la conexión no se sabe si el servidor llegó a cerrar: se le pregunta.
+            if (API._esCorteDeConexion(error) && await this._quedoCerrado(AppState.currentDate)) {
+                // Lo cerró esta misma acción: el reporte se arma igual.
+                Historial.generarReportePDF(AppState.currentDate, { silencioso: true, drive: true });
+                error = new Error('ya está cerrado');
+            }
+            if (String(error.message || '').includes('ya está cerrado')) {
+                Utils.showSuccess('Día cerrado correctamente');
+                CacheManager.invalidateAllExcept(['clientes', 'productos', 'proveedores']);
+                await DiaOperativo.resolveWorkDate();
+                Navigation.navigateTo('dashboard');
+                return;
+            }
+
+            console.error('❌ Error closing day:', error);
+            console.error('❌ Stack trace:', error.stack);
+            
+            // Mensaje de error más descriptivo
+            let errorMessage = 'Error al cerrar el día: ' + error.message;
+            
+            // Si el error menciona precios faltantes, dar más contexto
+            if (error.message.includes('precios cliente') || error.message.includes('precios faltantes')) {
+                errorMessage += '\n\nPor favor, asegúrate de haber guardado todos los precios al cliente antes de cerrar el día.';
+            }
+            
+            // Si el error menciona recepciones, dar más contexto
+            if (error.message.includes('recepciones')) {
+                errorMessage += '\n\nPor favor, asegúrate de haber confirmado todas las recepciones antes de cerrar el día.';
+            }
+
+            if (API._esCorteDeConexion(error)) {
+                errorMessage = 'No se pudo confirmar el cierre: Google no respondió. El día todavía no quedó cerrado. '
+                    + 'Volvé a tocar "Cerrar día": es seguro, no se duplica nada.';
+            }
+            
+            Utils.showError(errorMessage);
+        } finally {
+            this._cerrando = false;
+            Utils.hideLoader();
+        }
+    }
+};
+
+const Depositos = {
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    _proveedores() {
+        const cache = CacheManager.peek('proveedores');
+        const lista = (AppState.proveedores && AppState.proveedores.length)
+            ? AppState.proveedores
+            : (Array.isArray(cache) ? cache : []);
+        return lista.slice().sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+    },
+
+    _opciones(seleccionado) {
+        const id = String(seleccionado || '');
+        return '<option value="">Proveedor</option>' + this._proveedores().map(p =>
+            `<option value="${this._esc(p.id)}"${String(p.id) === id ? ' selected' : ''}>${this._esc(p.nombre)}</option>`
+        ).join('');
+    },
+
+    _hoy() {
+        const d = new Date();
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    },
+
+    // La fecha se guarda como AAAA-MM-DD; los depósitos viejos traen un nombre de cuenta y se muestran tal cual.
+    _fecha(valor) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(valor || ''));
+        return m ? `${m[3]}/${m[2]}/${m[1]}` : String(valor || '');
+    },
+
+    html() {
+        return `
+            <div id="deposito-box" class="deposito-box" hidden>
+                <p class="modal-hint">Identificá el depósito: la fecha en que se hace y a qué proveedor va. Si se reparte, sumá una línea por proveedor.</p>
+                <div class="form-group">
+                    <label for="deposito-cuenta">Fecha del depósito</label>
+                    <input type="date" id="deposito-cuenta" class="form-control" value="${this._hoy()}">
+                </div>
+                <div id="deposito-lineas"></div>
+                <button type="button" class="btn btn-secondary btn-sm" id="deposito-agregar">Otra línea</button>
+                <p class="pago-preview" id="deposito-aviso" hidden></p>
+            </div>
+        `;
+    },
+
+    _linea(monto, proveedorId) {
+        const fila = document.createElement('div');
+        fila.className = 'deposito-linea';
+        fila.innerHTML = `
+            <select class="form-control deposito-proveedor">${this._opciones(proveedorId)}</select>
+            <input type="text" class="form-control deposito-monto" data-price-input="true" placeholder="0" inputmode="numeric" value="${monto > 0 ? Utils.formatPrice(monto) : ''}">
+            <button type="button" class="btn btn-danger btn-sm deposito-quitar" aria-label="Quitar línea">×</button>
+        `;
+        return fila;
+    },
+
+    agregarLinea(monto, proveedorId) {
+        const caja = document.getElementById('deposito-lineas');
+        if (!caja) return;
+        const fila = this._linea(monto, proveedorId);
+        caja.appendChild(fila);
+        Utils.enablePriceInputs(fila);
+    },
+
+    enganchar() {
+        document.getElementById('deposito-agregar')?.addEventListener('click', () => {
+            this.agregarLinea(0);
+        });
+        // Si la persona cambia a mano el monto de la línea, deja de seguir a la transferencia.
+        document.getElementById('deposito-lineas')?.addEventListener('input', (event) => {
+            const fila = event.target.closest('.deposito-linea');
+            if (fila && event.target.classList.contains('deposito-monto') && event.isTrusted) fila.dataset.manual = '1';
+        });
+        document.getElementById('deposito-lineas')?.addEventListener('click', (event) => {
+            const boton = event.target.closest('.deposito-quitar');
+            if (!boton) return;
+            const lineas = document.querySelectorAll('.deposito-linea');
+            if (lineas.length <= 1) {
+                const input = boton.parentElement?.querySelector('.deposito-monto');
+                const select = boton.parentElement?.querySelector('.deposito-proveedor');
+                if (input) input.value = '';
+                if (select) select.value = '';
+                return;
+            }
+            boton.parentElement?.remove();
+        });
+    },
+
+    sync(monto) {
+        const box = document.getElementById('deposito-box');
+        if (!box) return;
+        const visible = (parseFloat(monto) || 0) > 0.009;
+        box.hidden = !visible;
+        if (!visible) return;
+        const lineas = document.querySelectorAll('.deposito-linea');
+        if (!lineas.length) {
+            this.agregarLinea(monto);
+        } else if (lineas.length === 1 && !lineas[0].dataset.manual) {
+            // Con una sola línea sin tocar, el monto sigue a lo que se escribe en Transferencia
+            // (si no, queda con el primer dígito: $1.000 se guardaba como $1).
+            const input = lineas[0].querySelector('.deposito-monto');
+            if (input) input.value = Utils.formatPrice(monto);
+        }
+    },
+
+    precargar(depositos) {
+        const lista = Array.isArray(depositos) ? depositos : [];
+        const cuenta = document.getElementById('deposito-cuenta');
+        const caja = document.getElementById('deposito-lineas');
+        if (!caja) return;
+        if (cuenta) cuenta.value = lista[0]?.cuenta || this._hoy();
+        caja.innerHTML = '';
+        lista.forEach(item => this.agregarLinea(item.monto, item.proveedor_id));
+    },
+
+    estado(montoTransferencia) {
+        if (!document.getElementById('deposito-box')) return { lineas: [], error: '' };
+        const monto = Math.round((parseFloat(montoTransferencia) || 0) * 100) / 100;
+        if (monto <= 0.009) return { lineas: [], error: '' };
+        const cuenta = document.getElementById('deposito-cuenta')?.value.trim() || '';
+        const lineas = [];
+        document.querySelectorAll('.deposito-linea').forEach(fila => {
+            const proveedorId = fila.querySelector('.deposito-proveedor')?.value || '';
+            const parte = Utils.parsePrice(fila.querySelector('.deposito-monto')?.value) || 0;
+            if (!proveedorId && parte <= 0) return;
+            lineas.push({ cuenta, proveedor_id: proveedorId, monto: parte });
+        });
+        if (!cuenta || !lineas.length || lineas.some(item => !item.proveedor_id || item.monto <= 0)) {
+            return { lineas: [], error: 'En la transferencia poné la fecha del depósito y a qué proveedor va.' };
+        }
+        const suma = Math.round(lineas.reduce((total, item) => total + item.monto, 0) * 100) / 100;
+        if (Math.abs(suma - monto) > 0.05) {
+            return {
+                lineas: [],
+                error: 'Los depósitos suman ' + Utils.formatCurrency(suma) + ' y la transferencia es ' + Utils.formatCurrency(monto) + '.'
+            };
+        }
+        return { lineas, error: '' };
+    },
+
+    _nombreProveedor(id) {
+        const proveedor = this._proveedores().find(item => String(item.id) === String(id));
+        return proveedor?.nombre || 'Proveedor';
+    },
+
+    _nombreCliente(id, respaldo) {
+        const cliente = (AppState.clientes || []).find(item => String(item.id) === String(id));
+        return cliente?.nombre || respaldo || 'Cliente';
+    },
+
+    texto(depositos) {
+        const lista = Array.isArray(depositos) ? depositos : [];
+        if (!lista.length) return '';
+        return lista.map(item =>
+            `${this._fecha(item.cuenta)} → ${this._nombreProveedor(item.proveedor_id)} ${Utils.formatCurrency(item.monto)}`
+        ).join(' · ');
+    },
+
+    htmlTexto(depositos) {
+        const texto = this.texto(depositos);
+        return texto ? `<div class="deposito-texto">${this._esc(texto)}</div>` : '';
+    },
+
+    _storageKey: 'sg_depositos_locales',
+
+    _leerMapa() {
+        try {
+            const raw = localStorage.getItem(this._storageKey);
+            const data = raw ? JSON.parse(raw) : {};
+            return data && typeof data === 'object' ? data : {};
+        } catch (e) {
+            return {};
+        }
+    },
+
+    de(fecha, clienteId) {
+        if (!clienteId) return [];
+        const lista = this._leerMapa()[Utils.fechaIso(fecha) + '|' + String(clienteId)];
+        return Array.isArray(lista) ? lista : [];
+    },
+
+    deCobranza(cobranza) {
+        const propios = Array.isArray(cobranza?.depositos) ? cobranza.depositos : [];
+        if (propios.length) return propios;
+        return this.de(cobranza?.fecha || AppState.currentDate, cobranza?.cliente_id);
+    },
+
+    guardar(fecha, clienteId, depositos) {
+        if (!clienteId) return;
+        const mapa = this._leerMapa();
+        const clave = Utils.fechaIso(fecha) + '|' + String(clienteId);
+        if (!depositos || !depositos.length) delete mapa[clave];
+        else mapa[clave] = depositos;
+        try {
+            localStorage.setItem(this._storageKey, JSON.stringify(mapa));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    todos() {
+        const vistos = new Set();
+        const lista = [];
+        const sumar = (cobranza) => {
+            const fecha = Utils.fechaIso(cobranza?.fecha || '');
+            const clienteId = String(cobranza?.cliente_id || '');
+            (cobranza?.depositos || []).forEach(item => {
+                const monto = Math.round((parseFloat(item.monto) || 0) * 100);
+                const base = [clienteId, item.proveedor_id, String(item.cuenta || '').trim().toLowerCase(), monto].join('|');
+                const clave = fecha ? base + '|' + fecha : base;
+                if (vistos.has(base) || vistos.has(clave)) return;
+                if (!fecha) {
+                    let yaConFecha = false;
+                    vistos.forEach(visto => {
+                        if (visto.startsWith(base + '|')) yaConFecha = true;
+                    });
+                    if (yaConFecha) return;
+                }
+                vistos.add(clave);
+                lista.push({
+                    cliente: this._nombreCliente(cobranza.cliente_id, cobranza.cliente_nombre),
+                    cuenta: item.cuenta,
+                    proveedor: this._nombreProveedor(item.proveedor_id),
+                    proveedor_id: item.proveedor_id,
+                    monto: item.monto
+                });
+            });
+        };
+        const cache = CacheManager.peek('cobranzas:all:all');
+        (Array.isArray(cache) ? cache : []).forEach(sumar);
+        (AppState.cobranzas || []).forEach(sumar);
+        (typeof CobranzasHoy !== 'undefined' ? (CobranzasHoy._lastTotales || []) : []).forEach(sumar);
+        const guardados = this._leerMapa();
+        Object.keys(guardados).forEach(clave => {
+            const corte = clave.indexOf('|');
+            if (corte < 0) return;
+            sumar({
+                fecha: clave.slice(0, corte),
+                cliente_id: clave.slice(corte + 1),
+                depositos: guardados[clave]
+            });
+        });
+        return lista;
+    },
+
+    pintarEnPagos() {
+        const caja = document.getElementById('pagos-depositos');
+        if (!caja) return;
+        const lista = this.todos();
+        if (!lista.length) {
+            caja.hidden = true;
+            caja.innerHTML = '';
+            return;
+        }
+        caja.hidden = false;
+        caja.innerHTML = `
+            <strong>Depósitos identificados</strong>
+            <ul>
+                ${lista.map(item => `<li>${this._esc(this._fecha(item.cuenta))} · ${this._esc(item.cliente)} → ${this._esc(item.proveedor)} · ${Utils.formatCurrency(item.monto)}</li>`).join('')}
+            </ul>
+        `;
+    },
+
+    deProveedor(proveedorId) {
+        return this.todos().filter(item => String(item.proveedor_id) === String(proveedorId));
+    }
+};
+
+const MediosPago = {
+    deCliente: [
+        ['efectivo', 'Efectivo'],
+        ['transferencia', 'Transferencia'],
+        ['cheque', 'Cheque'],
+        ['descuento', 'Descuento']
+    ],
+    // Cobros viejos con tarjeta: ya no se ofrece, pero se sigue mostrando.
+    historicos: [['tarjeta', 'Tarjeta de crédito'], ['adelanto', 'Pago por adelantado']],
+    deProveedor: [
+        ['efectivo', 'Efectivo'],
+        ['transferencia', 'Transferencia']
+    ],
+
+    vacio() {
+        return { efectivo: 0, transferencia: 0, cheque: 0, tarjeta: 0, descuento: 0, adelanto: 0 };
+    },
+
+    parse(valor) {
+        const medios = this.vacio();
+        let raw = valor;
+        if (typeof raw === 'string' && raw.trim()) {
+            try { raw = JSON.parse(raw); } catch (error) { raw = null; }
+        }
+        if (!raw || typeof raw !== 'object') return medios;
+        Object.keys(medios).forEach(id => {
+            medios[id] = Utils.parsePrice(raw[id]) || 0;
+        });
+        return medios;
+    },
+
+    total(medios) {
+        return Object.keys(this.vacio()).reduce((sum, id) => sum + (parseFloat(medios?.[id]) || 0), 0);
+    },
+
+    sumar(a, b) {
+        const base = this.parse(a);
+        const extra = this.parse(b);
+        Object.keys(base).forEach(id => {
+            base[id] = Math.round((base[id] + extra[id]) * 100) / 100;
+        });
+        return base;
+    },
+
+    texto(medios) {
+        const datos = this.parse(medios);
+        const partes = this.deCliente.concat(this.historicos)
+            .filter(([id]) => datos[id] > 0)
+            .map(([id, label]) => `${label} ${Utils.formatCurrency(datos[id])}`);
+        return partes.length ? partes.join(' · ') : '—';
+    },
+
+    html(tipos, valores) {
+        const datos = this.parse(valores);
+        const campos = tipos.map(([id, label]) => `
+            <div class="form-group medios-campo">
+                <label for="medio-${id}">${label}</label>
+                <input type="text" id="medio-${id}" class="form-control medio-monto" data-medio="${id}" data-price-input="true" value="${datos[id] > 0 ? Utils.formatPrice(datos[id]) : ''}" placeholder="0" inputmode="numeric">
+            </div>
+        `).join('');
+        return `
+            <div class="medios-pago">
+                <div class="medios-grid">${campos}</div>
+                <div class="pago-chips">
+                    <button type="button" class="pago-chip" id="medios-chip-efectivo">Todo en efectivo</button>
+                </div>
+                <div class="medios-resumen">
+                    <p>Ahora: <strong id="medios-suma">$ 0</strong></p>
+                    <p id="medios-resto-linea">Queda adeudado: <strong id="medios-resto">$ 0</strong></p>
+                </div>
+                <p class="pago-preview" id="medios-aviso" hidden></p>
+            </div>
+            ${tipos.some(([id]) => id === 'transferencia') && tipos.length > 2 ? Depositos.html() : ''}
+        `;
+    },
+
+    leer() {
+        const medios = this.vacio();
+        document.querySelectorAll('.medio-monto').forEach(input => {
+            const id = input.dataset.medio;
+            if (Object.prototype.hasOwnProperty.call(medios, id)) {
+                medios[id] = Utils.parsePrice(input.value) || 0;
+            }
+        });
+        const lista = Object.keys(medios)
+            .filter(id => medios[id] > 0)
+            .map(id => ({ metodo: id, monto: medios[id] }));
+        const depositos = Depositos.estado(medios.transferencia);
+        return { medios, lista, total: this.total(medios), depositos };
+    },
+
+    poner(valores) {
+        const datos = this.parse(valores);
+        document.querySelectorAll('.medio-monto').forEach(input => {
+            const id = input.dataset.medio;
+            const monto = datos[id] || 0;
+            input.value = monto > 0 ? Utils.formatPrice(monto) : '';
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+    },
+
+    enganchar(saldo, opciones = {}) {
+        const tope = opciones.tope !== false;
+        const linea = document.getElementById('medios-resto-linea');
+        if (linea && opciones.ocultarAdeudado) linea.hidden = true;
+        const actualizar = () => {
+            const { total } = this.leer();
+            const suma = document.getElementById('medios-suma');
+            const resto = document.getElementById('medios-resto');
+            const aviso = document.getElementById('medios-aviso');
+            if (suma) suma.textContent = Utils.formatCurrency(total);
+            const queda = Math.max(0, (parseFloat(saldo) || 0) - total);
+            if (resto) resto.textContent = Utils.formatCurrency(queda);
+            if (!aviso) return;
+            if (tope && total > saldo + 0.01) {
+                aviso.hidden = false;
+                aviso.textContent = 'La suma supera lo adeudado (' + Utils.formatCurrency(saldo) + ').';
+                return;
+            }
+            if (!tope && total > saldo + 0.01) {
+                aviso.hidden = false;
+                aviso.textContent = 'Paga de más: ' + Utils.formatCurrency(total - saldo) + ' le quedan a favor para la próxima carga.';
+                return;
+            }
+            if (total > 0 && !opciones.ocultarAdeudado && queda > 0.01) {
+                aviso.hidden = false;
+                aviso.textContent = 'Queda un saldo adeudado de ' + Utils.formatCurrency(queda) + '.';
+                return;
+            }
+            if (total > 0 && !opciones.ocultarAdeudado) {
+                aviso.hidden = false;
+                aviso.textContent = 'No queda saldo adeudado.';
+                return;
+            }
+            aviso.hidden = true;
+            aviso.textContent = '';
+        };
+        const actualizarDepositos = () => {
+            Depositos.sync(this.leer().medios.transferencia);
+        };
+        document.querySelectorAll('.medio-monto').forEach(input => {
+            input.addEventListener('input', () => {
+                actualizar();
+                actualizarDepositos();
+            });
+            input.addEventListener('change', () => {
+                actualizar();
+                actualizarDepositos();
+            });
+        });
+        Depositos.enganchar();
+        actualizarDepositos();
+        document.getElementById('medios-chip-efectivo')?.addEventListener('click', () => {
+            const lleno = this.vacio();
+            if (saldo > 0) lleno.efectivo = saldo;
+            this.poner(lleno);
+            actualizar();
+        });
+        actualizar();
+        return actualizar;
+    }
+};
+
+// Cobranzas
+const SaldoCliente = {
+    abrir(clienteId) {
+        const cliente = this._cliente(clienteId);
+        const cargas = this._cargas(clienteId);
+        if (!cargas.length) {
+            Utils.showError('Este cliente no tiene saldo pendiente.');
+            return;
+        }
+        const nombre = cliente.nombre || 'Cliente';
+        const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
+        const content = `
+            ${this._vista(cargas)}
+            <p class="modal-hint">${sinTelefono
+                ? 'Este cliente no tiene teléfono. El PDF se descarga igual.'
+                : 'Se arma un PDF y se abre WhatsApp. En la computadora tenés que adjuntar el archivo que se descarga.'}</p>
+        `;
+        Utils.showModal('Saldo de ' + nombre, content, async () => {
+            await this._enviar(cliente, cargas);
+        }, sinTelefono ? 'Descargar PDF' : 'Enviar PDF');
+    },
+
+    _cargas(clienteId) {
+        const id = String(clienteId);
+        const porFecha = new Map();
+        this._cobranzas().forEach(cobranza => {
+            if (String(cobranza.cliente_id) !== id) return;
+            const saldo = Utils.getCobranzaSaldo(cobranza);
+            if (saldo <= 0.01) return;
+            const fecha = Utils.fechaIso(cobranza.fecha);
+            if (!fecha) return;
+            const total = Utils.parsePrice(cobranza.total) || saldo;
+            const pagado = Utils.parsePrice(cobranza.pagado) || Math.max(0, total - saldo);
+            // Una deuda cargada a mano no reemplaza a la cobranza de ese mismo día (y viceversa).
+            porFecha.set(cobranza.origen === 'manual' ? `${fecha}|${cobranza.id}` : fecha, {
+                fecha,
+                total,
+                pagado,
+                saldo,
+                medios: cobranza.medios
+            });
+        });
+        const hoy = this._cargaDeHoy(id, porFecha);
+        if (hoy) porFecha.set(hoy.fecha, hoy);
+        return [...porFecha.values()].sort((a, b) => a.fecha.localeCompare(b.fecha));
+    },
+
+    _cobranzas() {
+        const cache = CacheManager.peek('cobranzas:all:all');
+        const lista = Array.isArray(cache) ? cache.slice() : [];
+        (AppState.cobranzas || []).forEach(cobranza => {
+            const index = lista.findIndex(item => String(item.id) === String(cobranza.id));
+            if (index >= 0) lista[index] = { ...lista[index], ...cobranza };
+            else lista.push(cobranza);
+        });
+        return lista;
+    },
+
+    _cargaDeHoy(clienteId, porFecha) {
+        const fecha = AppState.currentDate;
+        if (!fecha || porFecha.has(fecha)) return null;
+        if (typeof CobranzasHoy === 'undefined' || !CobranzasHoy._desdePrecios) return null;
+        const totales = CobranzasHoy._desdePrecios(fecha);
+        if (!Array.isArray(totales)) return null;
+        const fila = totales.find(item => String(item.cliente_id) === String(clienteId));
+        if (!fila) return null;
+        const saldo = Utils.parsePrice(fila.saldo) || 0;
+        if (saldo <= 0.01) return null;
+        const total = Utils.parsePrice(fila.total) || saldo;
+        return {
+            fecha,
+            total,
+            pagado: Utils.parsePrice(fila.pagado) || Math.max(0, total - saldo),
+            saldo,
+            medios: fila.medios
+        };
+    },
+
+    _pagos(carga) {
+        if (carga.pagado <= 0.01) return [];
+        const medios = MediosPago.parse(carga.medios);
+        const lineas = MediosPago.deCliente.concat(MediosPago.historicos)
+            .filter(([medio]) => medios[medio] > 0.01)
+            .map(([medio, etiqueta]) => ({ texto: etiqueta, monto: medios[medio] }));
+        const suma = lineas.reduce((sum, linea) => sum + linea.monto, 0);
+        if (!lineas.length || Math.abs(suma - carga.pagado) > 1) {
+            return [{ texto: 'Cobrado', monto: carga.pagado }];
+        }
+        return lineas;
+    },
+
+    _cliente(clienteId) {
+        const cobranza = this._cobranzas().find(item => String(item.cliente_id) === String(clienteId));
+        if (typeof Cobranzas !== 'undefined' && Cobranzas._clienteDe) {
+            return Cobranzas._clienteDe(cobranza || { cliente_id: clienteId });
+        }
+        const cliente = (AppState.clientes || []).find(item => String(item.id) === String(clienteId));
+        return cliente || { id: clienteId, nombre: 'Cliente', telefono: '' };
+    },
+
+    _vista(cargas) {
+        const total = cargas.reduce((sum, carga) => sum + carga.saldo, 0);
+        const una = cargas.length === 1;
+        const tarjetas = cargas.map(carga => {
+            const pagos = this._pagos(carga);
+            const detalles = [`<li><span>Carga</span><strong>${Utils.formatCurrency(carga.total)}</strong></li>`]
+                .concat(pagos.map(pago => `<li class="es-pago"><span>${this._esc(pago.texto)}</span><strong>${Utils.formatCurrency(pago.monto)}</strong></li>`));
+            const quedo = !una && carga.pagado > 0.01
+                ? `<p class="saldo-quedo">Quedó de este día <strong>${Utils.formatCurrency(carga.saldo)}</strong></p>`
+                : '';
+            return `
+                <article class="saldo-dia">
+                    <header>${this._esc(this._fechaLarga(carga.fecha))}</header>
+                    <ul>${detalles.join('')}</ul>
+                    ${quedo}
+                </article>`;
+        }).join('');
+        return `
+            <div class="saldo-doc">
+                <div class="saldo-hero">
+                    <span>Saldo a pagar</span>
+                    <strong>${Utils.formatCurrency(total)}</strong>
+                </div>
+                ${tarjetas}
+            </div>`;
+    },
+
+    _fechaLarga(iso) {
+        const fecha = Utils.fechaIso(iso);
+        if (!fecha) return '';
+        return new Date(fecha + 'T12:00:00').toLocaleDateString('es-AR', {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric'
+        });
+    },
+
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    async _enviar(cliente, cargas) {
+        const nombre = cliente.nombre || 'Cliente';
+        const doc = await this._pdf(cliente, cargas);
+        const archivoNombre = `saldo-${nombre.replace(/[^\w\-]+/g, '-')}.pdf`;
+        const texto = `Hola ${nombre}, te paso el saldo por carga y el total.`;
+        if (!WhatsAppService.normalizePhone(cliente.telefono)) {
+            doc.save(archivoNombre);
+            Utils.avisar(`Se descargó el PDF del saldo. ${nombre} no tiene un teléfono válido para WhatsApp.`);
+            return;
+        }
+        await EnvioPdf.enviar({ telefono: cliente.telefono, texto, doc, nombre: archivoNombre, destinatario: nombre });
+    },
+
+    _htmlPdf(cliente, cargas) {
+        const nombre = cliente?.nombre || 'Cliente';
+        const total = cargas.reduce((sum, carga) => sum + carga.saldo, 0);
+        const una = cargas.length === 1;
+        const generado = new Date().toLocaleString('es-AR');
+        const filas = [];
+        cargas.forEach(carga => {
+            const fecha = this._fechaLarga(carga.fecha);
+            filas.push({ fecha, detalle: 'Carga', monto: Utils.formatCurrency(carga.total), pago: false });
+            this._pagos(carga).forEach(pago => {
+                filas.push({ fecha: '', detalle: pago.texto, monto: Utils.formatCurrency(pago.monto), pago: true });
+            });
+            if (!una && carga.pagado > 0.01) {
+                filas.push({ fecha: '', detalle: 'Quedó de este día', monto: Utils.formatCurrency(carga.saldo), pago: false });
+            }
+        });
+        const cuerpo = filas.map((fila, indice) => `
+            <tr class="${indice % 2 === 0 ? 'row-even' : 'row-odd'}">
+                <td>${this._esc(fila.fecha)}</td>
+                <td class="${fila.pago ? 'pago' : ''}">${this._esc(fila.detalle)}</td>
+                <td class="col-money ${fila.pago ? 'pago' : ''}">${fila.monto}</td>
+            </tr>`).join('');
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Saldo</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 13px; color: #1e293b; padding: 32px 40px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 4px; }
+                .cliente-box { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 4px solid #1a73e8; padding: 16px 20px; border-radius: 8px; margin-bottom: 24px; }
+                .cliente-box .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; font-weight: 600; }
+                .cliente-box .name { font-size: 22px; font-weight: 700; color: #1e293b; margin-top: 4px; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+                thead th.col-money { color: #fff; text-align: right; }
+                tbody td { padding: 11px 14px; border-bottom: 1px solid #e2e8f0; }
+                .row-even { background: #fff; }
+                .row-odd { background: #f8fafc; }
+                td.col-money { text-align: right; font-weight: 700; color: #1a73e8; white-space: nowrap; }
+                td.pago, td.col-money.pago { color: #15803d; }
+                .totals-wrap { margin-top: 20px; display: flex; justify-content: flex-end; }
+                .totals-table { width: 280px; box-shadow: none; }
+                .totals-table td { padding: 10px 14px; font-size: 16px; font-weight: 700; border: none; }
+                .totals-table tr.saldo td { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; }
+                .totals-table tr.saldo td:first-child { color: rgba(255,255,255,0.9); font-weight: 500; }
+                .totals-table td:last-child { text-align: right; }
+                .footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Saldo del cliente</p></div>
+                <div class="doc-meta"><strong>Saldo a pagar</strong>${Utils.formatCurrency(total)}<br><span>Generado: ${this._esc(generado)}</span></div>
+            </div>
+            <div class="cliente-box"><div class="label">Cliente</div><div class="name">${this._esc(nombre)}</div></div>
+            <table>
+                <thead><tr><th>Fecha</th><th>Detalle</th><th class="col-money">Importe</th></tr></thead>
+                <tbody>${cuerpo}</tbody>
+            </table>
+            <div class="totals-wrap"><table class="totals-table"><tr class="saldo"><td>Saldo a pagar</td><td>${Utils.formatCurrency(total)}</td></tr></table></div>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
+
+    async _pdf(cliente, cargas) {
+        const JsPDF = await Precios._cargarJsPdf();
+        const html2canvas = await Camiones._cargarHtml2Canvas();
+        const marco = document.createElement('iframe');
+        marco.setAttribute('aria-hidden', 'true');
+        marco.style.cssText = 'position:fixed;left:-2000px;top:0;width:794px;height:1400px;border:0;background:#fff;';
+        document.body.appendChild(marco);
+        const docMarco = marco.contentDocument;
+        docMarco.open();
+        docMarco.write(this._htmlPdf(cliente, cargas));
+        docMarco.close();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const alto = Math.max(docMarco.body.scrollHeight, 400);
+        marco.style.height = alto + 'px';
+        try {
+            const canvas = await html2canvas(docMarco.body, {
+                scale: 2,
+                backgroundColor: '#ffffff',
+                windowWidth: 794,
+                width: 794,
+                height: alto
+            });
+            const doc = new JsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+            doc.__lienzos = [canvas];
+            const pageW = doc.internal.pageSize.getWidth();
+            const pageH = doc.internal.pageSize.getHeight();
+            const img = canvas.toDataURL('image/jpeg', 0.92);
+            const imgH = canvas.height * pageW / canvas.width;
+            let altoRestante = imgH;
+            let posicion = 0;
+            doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+            altoRestante -= pageH;
+            while (altoRestante > 2) {
+                posicion -= pageH;
+                doc.addPage();
+                doc.addImage(img, 'JPEG', 0, posicion, pageW, imgH);
+                altoRestante -= pageH;
+            }
+            return doc;
+        } finally {
+            marco.remove();
+        }
+    }
+};
+
+// Deudas de un cliente o proveedor separadas por la fecha en que quedaron. El total va solo como referencia.
+const DeudasPorFecha = {
+    // accion: texto del onclick del botón de cada línea; "{fecha}" se reemplaza por la fecha (YYYY-MM-DD).
+    html(deudas, total, aFavor, accion) {
+        const lineas = (deudas || []).map(d => {
+            const fecha = Utils.fechaIso(d.fecha);
+            const rotulo = fecha ? Utils.formatDate(fecha) : 'Anterior';
+            const onclick = d.onclick || (accion && fecha ? accion.replace('{fecha}', fecha) : '');
+            const boton = onclick
+                ? `<button class="btn btn-primary btn-sm" type="button" onclick="${onclick}">${Utils.esc(d.boton || 'Pagar')}</button>`
+                : '';
+            const deshacer = d.onclick2
+                ? `<button class="btn btn-secondary btn-sm" type="button" onclick="${d.onclick2}">${Utils.esc(d.boton2 || 'Deshacer')}</button>`
+                : '';
+            const nota = d.nota ? `<small class="fila-nota">${Utils.esc(d.nota)}</small>` : '';
+            return `<div class="deuda-fecha">
+                <span class="deuda-fecha-dia">${Utils.esc(rotulo)}${nota}</span>
+                <strong class="deuda-fecha-monto">${Utils.formatCurrency(Utils.parsePrice(d.saldo) || 0)}</strong>
+                ${boton}${deshacer}
+            </div>`;
+        }).join('');
+        const favor = aFavor > 0.009 ? `<div class="deuda-total-ref">A favor: ${Utils.formatCurrency(aFavor)}</div>` : '';
+        return `<div class="deuda-fechas">${lineas}<div class="deuda-total-ref">Total (referencia): ${Utils.formatCurrency(total)}</div>${favor}</div>`;
+    }
+};
+
+const Cobranzas = {
+    _agregando: false,
+    _guardando: false,
+    _filaEl: null,
+    _borrador: { cliente_id: '', total: '', fecha: '', nota: '' },
+
+    async load() {
+        const tbody = document.getElementById('cobranzas-tbody');
+        if (!tbody) return;
+
+        const cached = CacheManager.peek('cobranzas:all:all');
+        const hasStale = AppState.cobranzas.length > 0 || cached;
+        if (hasStale) {
+            const todas = cached || AppState.cobranzas;
+            AppState.cobranzas = (Array.isArray(todas) ? todas : []).filter(c => Utils.isCobranzaPendiente(c));
+            this.render();
+        } else {
+            Utils.showTableLoader(tbody);
+        }
+
+        try {
+            if (!AppState.clientes.length) {
+                AppState.clientes = await API.getClientes().catch(() => []);
+            }
+            const todas = await API.getCobranzas();
+            AppState.cobranzas = todas.filter(c => Utils.isCobranzaPendiente(c));
+            this.render();
+        } catch (error) {
+            console.error('Error loading cobranzas:', error);
+            if (!hasStale) Utils.hideTableLoader(tbody);
+        }
+    },
+    
+    render() {
+        const tbody = document.getElementById('cobranzas-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        
+        const fila = this._agregando ? this._filaNueva() : null;
+        if (!fila) this._filaEl = null;
+        Utils.limpiarFilasConservando(tbody, fila);
+        
+        if (AppState.cobranzas.length === 0) {
+            const vacia = document.createElement('tr');
+            vacia.innerHTML = '<td colspan="4" style="text-align: center; padding: 30px; color: #666;">' +
+                'No hay cobranzas pendientes.' +
+                '</td>';
+            tbody.appendChild(vacia);
+            return;
+        }
+        
+        // Una tarjeta por cliente, con cada deuda en su fecha (no se suman entre sí).
+        const porCliente = new Map();
+        AppState.cobranzas.forEach(cobranza => {
+            const clave = Utils.cuentaDe(cobranza.cliente_id).clave;
+            if (!porCliente.has(clave)) porCliente.set(clave, []);
+            porCliente.get(clave).push(cobranza);
+        });
+        porCliente.forEach(cobranzas => {
+            cobranzas.sort((a, b) => String(Utils.fechaIso(a.fecha) || '').localeCompare(String(Utils.fechaIso(b.fecha) || '')));
+            const tr = document.createElement('tr');
+            const cliente = this._clienteDe(cobranzas[0]);
+            const cuenta = Utils.cuentaDe(cobranzas[0].cliente_id);
+            const total = cobranzas.reduce((suma, c) => suma + Utils.getCobranzaSaldo(c), 0);
+            tr.dataset.clienteId = String(cobranzas[0].cliente_id || '');
+            tr.dataset.cobranzaIds = cobranzas.map(c => String(c.id || '')).join(' ');
+            const lineas = cobranzas.map(c => ({
+                fecha: c.fecha,
+                saldo: Utils.getCobranzaSaldo(c),
+                nota: [cuenta.titular ? this._clienteDe(c).nombre : '', c.origen === 'manual' ? 'Deuda anterior' + (c.nota ? ' · ' + c.nota : '') : ''].filter(Boolean).join(' · '),
+                onclick: `Cobranzas.cobrar('${c.id}')`,
+                boton: 'Cobrar',
+                onclick2: (Utils.parsePrice(c.pagado) || 0) > 0.009 ? `Cobranzas.deshacerPago('${c.id}')` : '',
+                boton2: 'Deshacer pago'
+            }));
+            tr.innerHTML = `
+                <td data-label="Cliente">${Utils.esc(cuenta.titular || cliente.nombre || '')}</td>
+                <td data-label="Te debe">${DeudasPorFecha.html(lineas, total, 0, '')}</td>
+                <td data-label="Fecha">${Utils.formatDate(cobranzas[0].fecha)}${cobranzas.length > 1 ? `<small class="fila-nota">y ${cobranzas.length - 1} más</small>` : ''}</td>
+                <td data-label="Estado"><span class="status-badge status-pendiente">Pendiente</span><div class="pagos-acciones"><button type="button" class="btn btn-secondary btn-sm" onclick="Cuenta.abrir('cliente', '${cobranzas[0].cliente_id}')">Cuenta corriente</button></div></td>
+            `;
+            tbody.appendChild(tr);
+        });
+        Dashboard.resaltarFila('cliente');
+    },
+
+    // Fila de la tabla para agregar lo que un cliente ya debía (antes de usar la app o una deuda vieja).
+    _filaNueva() {
+        if (this._filaEl) return this._filaEl;
+        const b = this._borrador;
+        if (!b.fecha) b.fecha = Utils.ayerAR();
+        const clientes = (AppState.clientes || [])
+            .filter(c => c.activo !== false && c.activo !== 'false')
+            .slice().sort((a, c) => String(a.nombre || '').localeCompare(String(c.nombre || ''), 'es'));
+        const tr = document.createElement('tr');
+        tr.className = 'fila-nueva';
+        tr.innerHTML = `
+            <td data-label="Cliente">
+                <select id="nueva-cobranza-cliente" class="form-control" aria-label="Cliente">
+                    <option value="">Elegí el cliente…</option>
+                    ${clientes.map(c => `<option value="${Utils.esc(c.id)}"${String(c.id) === String(b.cliente_id) ? ' selected' : ''}>${Utils.esc(c.nombre)}</option>`).join('')}
+                </select>
+                <input type="text" id="nueva-cobranza-nota" class="form-control fila-nueva-nota" placeholder="Nota (opcional)" maxlength="120" value="${Utils.esc(b.nota)}" aria-label="Nota">
+            </td>
+            <td data-label="Te debe"><input type="text" id="nueva-cobranza-total" class="form-control" data-price-input="true" inputmode="numeric" placeholder="$ 0" value="${Utils.esc(b.total)}" aria-label="Cuánto te debe"></td>
+            <td data-label="Fecha"><input type="date" id="nueva-cobranza-fecha" class="form-control" max="${Utils.ayerAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha te debe"></td>
+            <td data-label="Estado">
+                <span class="status-badge status-pendiente">Nueva</span>
+                <div class="pagos-acciones">
+                    <button type="button" class="btn btn-primary btn-sm" id="nueva-cobranza-guardar">Guardar</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="nueva-cobranza-cancelar">Cancelar</button>
+                </div>
+            </td>`;
+        const leer = () => {
+            this._borrador = {
+                cliente_id: tr.querySelector('#nueva-cobranza-cliente').value,
+                total: tr.querySelector('#nueva-cobranza-total').value,
+                fecha: tr.querySelector('#nueva-cobranza-fecha').value,
+                nota: tr.querySelector('#nueva-cobranza-nota').value
+            };
+        };
+        tr.addEventListener('input', leer);
+        tr.addEventListener('change', leer);
+        tr.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); this.guardarNueva(); }
+            if (e.key === 'Escape') this.cancelarNueva();
+        });
+        tr.querySelector('#nueva-cobranza-guardar').addEventListener('click', () => this.guardarNueva());
+        tr.querySelector('#nueva-cobranza-cancelar').addEventListener('click', () => this.cancelarNueva());
+        Utils.enablePriceInputs(tr);
+        this._filaEl = tr;
+        return tr;
+    },
+
+    async agregar() {
+        if (!(AppState.clientes || []).length) {
+            try { AppState.clientes = await API.getClientes(); } catch (error) { /* se avisa abajo */ }
+        }
+        if (!(AppState.clientes || []).length) {
+            Utils.showError('Todavía no hay clientes cargados. Agregalos en Configuración → Clientes.');
+            return;
+        }
+        this._agregando = true;
+        this.render();
+        const fila = this._filaEl;
+        fila?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        fila?.querySelector(this._borrador.cliente_id ? '#nueva-cobranza-total' : '#nueva-cobranza-cliente')?.focus();
+    },
+
+    cancelarNueva() {
+        if (this._guardando) return;
+        this._agregando = false;
+        this._filaEl = null;
+        this._borrador = { cliente_id: '', total: '', fecha: '', nota: '' };
+        this.render();
+    },
+
+    async guardarNueva() {
+        if (this._guardando || !this._filaEl) return;
+        const fila = this._filaEl;
+        const cliente_id = fila.querySelector('#nueva-cobranza-cliente').value;
+        const total = Utils.parsePrice(fila.querySelector('#nueva-cobranza-total').value) || 0;
+        const fecha = fila.querySelector('#nueva-cobranza-fecha').value;
+        const nota = fila.querySelector('#nueva-cobranza-nota').value.trim();
+        if (!cliente_id) { Utils.showError('Elegí el cliente.'); return; }
+        if (total <= 0) { Utils.showError('Poné cuánto te debe.'); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) { Utils.showError('Poné desde qué fecha te debe.'); return; }
+        if (fecha >= fechaHoyAR()) { Utils.showError('La fecha tiene que ser anterior a hoy. Lo de hoy se carga con los pedidos y los precios.'); return; }
+
+        this._guardando = true;
+        fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = true; });
+        try {
+            const creada = await API.agregarCobranzaPendiente({ cliente_id, fecha, total, nota });
+            AppState.cobranzas = [creada, ...(AppState.cobranzas || []).filter(c => String(c.id) !== String(creada.id))];
+            CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+            this._agregando = false;
+            this._filaEl = null;
+            this._borrador = { cliente_id: '', total: '', fecha: '', nota: '' };
+            this.render();
+            const tr = document.querySelector(`#cobranzas-tbody tr[data-cobranza-ids~="${creada.id}"]`);
+            if (tr) {
+                tr.classList.add('fila-recien-agregada');
+                tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            Utils.avisar(`Se agregó la deuda de ${creada.cliente_nombre || 'el cliente'}: ${Utils.formatCurrency(creada.total)}`);
+        } catch (error) {
+            console.error('Error agregando la cobranza:', error);
+            Utils.showError('No se pudo agregar la cobranza: ' + (error && error.message ? String(error.message).replace(/^Error:\s*/, '') : 'revisá la conexión'));
+            fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = false; });
+        } finally {
+            this._guardando = false;
+        }
+    },
+
+    _clienteDe(cobranza) {
+        const id = String(cobranza?.cliente_id || '');
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === id);
+        return cliente || {
+            id,
+            nombre: cobranza?.cliente_nombre || Utils.nombreCatalogo(cobranza, 'cliente'),
+            telefono: ''
+        };
+    },
+
+    async cobrar(cobranzaId) {
+        const cobranza = (AppState.cobranzas || []).find(c => String(c.id) === String(cobranzaId));
+        if (!cobranza) {
+            Utils.showError('Cobranza no encontrada');
+            return;
+        }
+        const cliente = this._clienteDe(cobranza);
+        const saldo = Utils.getCobranzaSaldo(cobranza);
+        const nombre = cliente.nombre || 'este cliente';
+        if (saldo <= 0) {
+            Utils.showInfo(`"${nombre}" está al día. No hay nada para cobrar.`);
+            return;
+        }
+
+        // Arranca vacío: el botón "Todo en efectivo" completa el saldo si hace falta.
+        const inicial = MediosPago.vacio();
+        const yaPagado = Utils.parsePrice(cobranza.pagado) || 0;
+        const yaPago = yaPagado > 0.01
+            ? `<p class="modal-hint"><strong>Ya pagó ${Utils.formatCurrency(yaPagado)}</strong>${MediosPago.texto(cobranza.medios) !== '—' ? ' · ' + MediosPago.texto(cobranza.medios) : ''}${Depositos.htmlTexto(Depositos.deCobranza(cobranza))}</p>`
+            : '';
+        const content = `
+            <div class="form-group">
+                <label for="modal-cobro-deuda">Te debe${cobranza.fecha ? ' del ' + Utils.formatDate(cobranza.fecha) : ''}</label>
+                <input type="text" id="modal-cobro-deuda" class="form-control" value="${Utils.formatCurrency(saldo)}" readonly tabindex="-1">
+            </div>
+            ${yaPago}
+            <p class="modal-hint">Repartí el pago. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deCliente, inicial)}
+        `;
+
+        Utils.showModal('Cobrar a ' + nombre, content, async () => {
+            const leido = MediosPago.leer();
+            if (leido.total <= 0) {
+                Utils.showError('Poné cuánto te paga.');
+                throw new Error('Monto inválido');
+            }
+            const deposito = leido.depositos;
+            if (deposito.error) {
+                Utils.showError(deposito.error);
+                throw new Error(deposito.error);
+            }
+            const saldoAnterior = cobranza.saldo;
+            const pagadoAnterior = cobranza.pagado;
+            const estadoAnterior = cobranza.estado;
+            const mediosAnteriores = MediosPago.parse(cobranza.medios);
+            const depositosAnteriores = Array.isArray(cobranza.depositos) ? cobranza.depositos.slice() : [];
+            cobranza.medios = MediosPago.sumar(mediosAnteriores, leido.medios);
+            cobranza.depositos = depositosAnteriores.concat(deposito.lineas);
+            cobranza.pagado = (Utils.parsePrice(cobranza.pagado) || 0) + Math.min(leido.total, saldo);
+            cobranza.saldo = Math.max(0, saldo - leido.total);
+            cobranza.estado = cobranza.saldo > 0.01 ? 'pendiente' : 'pagado';
+            CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+            this.render();
+            Utils.avisar(leido.total > saldo + 0.01
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado. Los ${Utils.formatCurrency(leido.total - saldo)} que sobran se descuentan de las otras cargas del cliente`
+                : leido.total >= saldo
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
+                : `Cobro registrado. Queda ${Utils.formatCurrency(cobranza.saldo)}`);
+
+            this._ultimoCobro = {
+                cobranzaId: cobranza.id,
+                clienteId: cliente.id,
+                monto: leido.total,
+                medios: leido.medios,
+                saldoRestante: cobranza.saldo,
+                fecha: cobranza.fecha
+            };
+            if (cliente.telefono && String(cliente.telefono).trim()) {
+                this.programarAvisoWhatsApp(cliente, this._ultimoCobro, nombre);
+            }
+
+            Utils.enSegundoPlano(() => API.registrarCobro({
+                cobranza_id: cobranza.id,
+                medios: leido.lista,
+                // El cobro de una deuda cargada a mano entra a la caja de hoy, no del día de la deuda.
+                fecha: cobranza.origen === 'manual' ? fechaHoyAR() : (cobranza.fecha || AppState.currentDate),
+                depositos: deposito.lineas,
+                permitir_exceso: true
+            }).then(respuesta => this._avisarDescuento(respuesta)), () => {
+                cobranza.saldo = saldoAnterior;
+                cobranza.pagado = pagadoAnterior;
+                cobranza.estado = estadoAnterior;
+                cobranza.medios = mediosAnteriores;
+                cobranza.depositos = depositosAnteriores;
+                CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+                this.render();
+                Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Cobrar');
+
+        MediosPago.enganchar(saldo, { tope: false });
+    },
+    
+    // Cuando el cliente paga de más, el servidor descuenta el sobrante de sus otras cargas pendientes (la siguiente
+    // primero). Acá se avisa de cuáles y se vuelve a leer la lista, porque cambiaron cargas que no eran la cobrada.
+    async _avisarDescuento(respuesta) {
+        const aplicado = respuesta && Array.isArray(respuesta.aplicado_en) ? respuesta.aplicado_en : [];
+        if (!aplicado.length) return;
+        const detalle = aplicado.map(a => `${Utils.formatCurrency(a.monto)} de la carga del ${Utils.formatDate(a.fecha)}`).join(' y ');
+        Utils.showSuccess(`El sobrante se descontó: ${detalle}.`);
+        CacheManager.invalidatePattern('cobranzas');
+        try { await this.load(); } catch (error) { /* se actualiza al volver a abrir la pantalla */ }
+    },
+
+    // Saca lo cobrado por error: se elige cuánto deshacer en cada medio (por defecto, todo).
+    deshacerPago(cobranzaId) {
+        const cobranza = AppState.cobranzas.find(c => c.id === cobranzaId);
+        if (!cobranza) {
+            Utils.showError('Cobranza no encontrada');
+            return;
+        }
+        const nombre = this._clienteDe(cobranza).nombre || 'este cliente';
+        const pagadoTotal = Utils.parsePrice(cobranza.pagado) || 0;
+        let pagado = MediosPago.parse(cobranza.medios);
+        if (MediosPago.total(pagado) <= 0.009) pagado = Object.assign(MediosPago.vacio(), { efectivo: pagadoTotal });
+        const campos = MediosPago.deCliente.concat(MediosPago.historicos).filter(([id]) => pagado[id] > 0.009);
+        if (!campos.length) {
+            Utils.showInfo('Esta deuda no tiene pagos para deshacer.');
+            return;
+        }
+        const filas = campos.map(([id, label]) => `
+            <div class="form-group medios-campo">
+                <label for="deshacer-${id}">${label} (pagó ${Utils.formatCurrency(pagado[id])})</label>
+                <input type="text" id="deshacer-${id}" class="form-control deshacer-monto" data-medio="${id}" data-price-input="true" value="${Utils.formatPrice(pagado[id])}" placeholder="0" inputmode="numeric">
+            </div>`).join('');
+        const content = `
+            <p class="modal-hint">Deuda${cobranza.fecha ? ' del ' + Utils.formatDate(cobranza.fecha) : ''}: ya pagó <strong>${Utils.formatCurrency(pagadoTotal)}</strong>.
+            Poné cuánto querés deshacer en cada medio. Esa plata vuelve a figurar como deuda y en la Caja queda un egreso de hoy.</p>
+            ${filas}
+        `;
+        Utils.showModal('Deshacer pago de ' + nombre, content, async () => {
+            const medios = MediosPago.vacio();
+            let total = 0;
+            document.querySelectorAll('.deshacer-monto').forEach(input => {
+                const id = input.dataset.medio;
+                const monto = Utils.parsePrice(input.value) || 0;
+                if (monto - pagado[id] > 0.01) {
+                    Utils.showError('No podés deshacer más de lo que pagó en ' + id + '.');
+                    throw new Error('Monto mayor al pagado');
+                }
+                medios[id] = monto;
+                total += monto;
+            });
+            if (total <= 0.009) {
+                Utils.showError('Poné cuánto querés deshacer.');
+                throw new Error('Monto inválido');
+            }
+            const respaldo = {
+                pagado: cobranza.pagado, saldo: cobranza.saldo, estado: cobranza.estado,
+                medios: cobranza.medios, depositos: Array.isArray(cobranza.depositos) ? cobranza.depositos.slice() : []
+            };
+            const nuevoPagado = Math.max(0, Math.round((pagadoTotal - Math.min(total, pagadoTotal)) * 100) / 100);
+            cobranza.medios = MediosPago.vacio();
+            Object.keys(medios).forEach(id => { cobranza.medios[id] = Math.max(0, Math.round((pagado[id] - medios[id]) * 100) / 100); });
+            cobranza.pagado = nuevoPagado;
+            cobranza.saldo = Math.max(0, Math.round(((Utils.parsePrice(cobranza.total) || 0) - nuevoPagado) * 100) / 100);
+            cobranza.estado = nuevoPagado <= 0.009 ? 'pendiente' : 'parcial';
+            CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+            this.render();
+            Utils.avisar('Pago deshecho');
+            Utils.enSegundoPlano(() => API.deshacerPagoCobranza({ cobranza_id: cobranza.id, medios }), () => {
+                Object.assign(cobranza, respaldo);
+                CacheManager.set('cobranzas:all:all', AppState.cobranzas);
+                this.render();
+                Utils.showError('No se pudo deshacer el pago. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Deshacer pago');
+    },
+
+    async registrar() {
+        const cobranzas = AppState.cobranzas.filter(c => Utils.isCobranzaPendiente(c));
+        
+        if (cobranzas.length === 0) {
+            Utils.showError('No hay cobranzas pendientes');
+            return;
+        }
+        
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <select id="modal-cobranza-cliente" class="form-control">
+                    <option value="">Seleccionar...</option>
+                    ${cobranzas.map(c => `<option value="${c.id}">${Utils.esc(c.cliente_nombre)} - ${Utils.formatCurrency(Utils.getCobranzaSaldo(c))}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Monto</label>
+                <input type="text" id="modal-cobranza-monto" class="form-control" data-price-input="true" placeholder="0">
+            </div>
+        `;
+        
+        Utils.showModal('Registrar cobro', content, async () => {
+            const cobranzaId = document.getElementById('modal-cobranza-cliente').value;
+            const monto = Utils.parsePrice(document.getElementById('modal-cobranza-monto').value);
+            
+            if (!cobranzaId || !monto) {
+                Utils.showError('Complete todos los campos');
+                throw new Error('Campos incompletos');
+            }
+
+            const cobranza = cobranzas.find(c => String(c.id) === String(cobranzaId));
+            const saldo = cobranza ? Utils.getCobranzaSaldo(cobranza) : 0;
+            if (monto > saldo) {
+                Utils.showError('El monto supera el saldo pendiente (' + Utils.formatCurrency(saldo) + ').');
+                throw new Error('Monto mayor al saldo');
+            }
+            
+            try {
+                await API.registrarCobro({
+                    cobranza_id: cobranzaId,
+                    monto: monto,
+                    fecha: AppState.currentDate
+                });
+                
+                Utils.showSuccess('Cobro registrado correctamente');
+                await Cobranzas.load();
+            } catch (error) {
+                console.error('Error registering cobro:', error);
+                Utils.showError('Error al registrar cobro: ' + error.message);
+            }
+        });
+    },
+    
+    metodoLabel(metodo) {
+        const labels = { efectivo: 'efectivo', transferencia: 'transferencia', cheque: 'cheque' };
+        return labels[metodo] || metodo || 'efectivo';
+    },
+
+    construirMensajeWhatsApp(cliente, cobro) {
+        const nombre = cliente?.nombre || 'cliente';
+        const fecha = cobro?.fecha || AppState.currentDate;
+        const fechaLabel = DiaOperativo.formatFechaLabel(fecha);
+        if (cobro && cobro.monto > 0) {
+            const detalle = cobro.medios ? MediosPago.texto(cobro.medios) : this.metodoLabel(cobro.metodo);
+            let mensaje = `Hola ${nombre}, registramos tu pago de ${Utils.formatCurrency(cobro.monto)} (${detalle}) del ${fechaLabel}.\n\n`;
+            if (cobro.saldoRestante > 0) {
+                mensaje += `Saldo pendiente: ${Utils.formatCurrency(cobro.saldoRestante)}.\n\n`;
+            } else {
+                mensaje += 'Quedamos al día.\n\n';
+            }
+            mensaje += 'Muchas gracias.';
+            return mensaje;
+        }
+        const saldo = Utils.parsePrice(cliente?.saldo) || 0;
+        if (saldo > 0) {
+            return `Hola ${nombre}, te recordamos que queda un saldo de ${Utils.formatCurrency(saldo)} del ${fechaLabel}.\n\nMuchas gracias.`;
+        }
+        return `Hola ${nombre}, te confirmamos que no queda saldo pendiente. Quedamos al día.\n\nMuchas gracias.`;
+    },
+
+    programarAvisoWhatsApp(cliente, cobro, nombre) {
+        if (!cliente) return;
+        setTimeout(() => this.abrirModalWhatsApp(cliente, cobro, nombre), 350);
+    },
+
+    abrirModalWhatsApp(cliente, cobro = null, nombreCliente = '') {
+        if (!cliente) return;
+        const nombre = nombreCliente || cliente.nombre || 'cliente';
+        const sinTelefono = !cliente.telefono || !String(cliente.telefono).trim();
+        const mensajeDefault = this.construirMensajeWhatsApp({ ...cliente, nombre }, cobro);
+        const saveLabel = AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp';
+        const saldo = Utils.parsePrice(cliente.saldo) || 0;
+        const monto = cobro?.monto > 0 ? cobro.monto : (saldo > 0 ? saldo : 0);
+        const metodo = cobro?.medios ? MediosPago.texto(cobro.medios) : (cobro?.metodo ? this.metodoLabel(cobro.metodo) : '—');
+        const saldoDespues = cobro && cobro.monto > 0 ? (cobro.saldoRestante || 0) : saldo;
+
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <p class="modal-static-value">${nombre}</p>
+                <small class="modal-hint">${sinTelefono
+                    ? 'Este cliente no tiene teléfono. Configuralo en Clientes.'
+                    : (cliente.telefono || '')}</small>
+            </div>
+            <div class="form-group">
+                <label>Detalle del aviso</label>
+                <div class="modal-pedido-preview-box">
+                    <table class="modal-pedido-detalle-table">
+                        <thead><tr><th>Concepto</th><th>Valor</th></tr></thead>
+                        <tbody>
+                            <tr><td>Cobro</td><td>${monto > 0 ? Utils.formatCurrency(monto) : '—'}</td></tr>
+                            <tr><td>Método</td><td>${metodo}</td></tr>
+                            <tr><td>Saldo después</td><td>${Utils.formatCurrency(saldoDespues)}</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Mensaje de WhatsApp</label>
+                <textarea id="modal-cobro-preview-mensaje" class="whatsapp-preview form-control" rows="8"></textarea>
+            </div>
+        `;
+
+        Utils.showModal('Avisar cobro por WhatsApp', content, async () => {
+            const mensaje = document.getElementById('modal-cobro-preview-mensaje')?.value.trim();
+            if (!mensaje) {
+                Utils.showError('Escribí un mensaje para WhatsApp');
+                throw new Error('Mensaje requerido');
+            }
+            await Pagos.ejecutarEnvioWhatsApp({ ...cliente, nombre }, mensaje);
+        }, saveLabel);
+
+        const previewMensaje = document.getElementById('modal-cobro-preview-mensaje');
+        if (previewMensaje) previewMensaje.value = mensajeDefault;
+        const saveBtn = document.getElementById('modal-save');
+        if (saveBtn) saveBtn.disabled = sinTelefono;
+    },
+
+    async ver(id) {
+        const cobranza = AppState.cobranzas.find(c => c.id === id);
+        if (!cobranza) {
+            Utils.showError('Cobranza no encontrada');
+            return;
+        }
+        
+        const content = `
+            <div class="form-group">
+                <label>Cliente</label>
+                <input type="text" class="form-control" value="${Utils.esc(cobranza.cliente_nombre || '')}" readonly>
+            </div>
+            <div class="form-group">
+                <label>Fecha</label>
+                <input type="text" class="form-control" value="${Utils.formatDate(cobranza.fecha)}" readonly>
+            </div>
+            <div class="form-group">
+                <label>Total</label>
+                <input type="text" class="form-control" value="${Utils.formatCurrency(cobranza.total || 0)}" readonly>
+            </div>
+            <div class="form-group">
+                <label>Pagado</label>
+                <input type="text" class="form-control" value="${Utils.formatCurrency(cobranza.pagado || 0)}" readonly>
+            </div>
+            <div class="form-group">
+                <label>Saldo</label>
+                <input type="text" class="form-control" value="${Utils.formatCurrency(cobranza.saldo || 0)}" readonly>
+            </div>
+            <div class="form-group">
+                <label>Estado</label>
+                <input type="text" class="form-control" value="${cobranza.estado || 'Pendiente'}" readonly>
+            </div>
+        `;
+        
+        // Modal de solo lectura (sin callback onSave)
+        Utils.showModal('Detalle de cobranza', content, null);
+    }
+};
+
+// CobranzasHoy
+const CobranzasHoy = {
+    _cobrados: new Set(), // cliente_ids ya cobrados en la sesión
+    _lastTotales: [],
+    _revision: 0,
+    _pagadoConocido: true,
+    _fechaTotales: null,
+    _optimo: {},
+
+    normalizarTotales(totales) {
+        const fecha = AppState.currentDate;
+        return (totales || []).map(item => {
+            const total = parseFloat(item.total) || 0;
+            const pagado = parseFloat(item.pagado) || 0;
+            const saldo = Math.max(0, total - pagado);
+            let estado = 'sin_cobrar';
+            if (pagado > 0 && saldo <= 0) estado = 'pagado';
+            else if (pagado > 0) estado = 'parcial';
+            let depositos = Array.isArray(item.depositos) ? item.depositos : [];
+            if (!depositos.length) depositos = Depositos.de(fecha, item.cliente_id);
+            return { ...item, total, pagado, saldo, estado, medios: MediosPago.parse(item.medios), depositos };
+        });
+    },
+
+    _fusionarServidor(totales) {
+        const fecha = AppState.currentDate;
+        const fusionados = (totales || []).map(row => {
+            const id = String(row.cliente_id || '');
+            const local = this._optimo[id];
+            const serverDepositos = Array.isArray(row.depositos) ? row.depositos : [];
+            if (serverDepositos.length) Depositos.guardar(fecha, id, serverDepositos);
+            const depositos = serverDepositos.length
+                ? serverDepositos
+                : ((local?.depositos && local.depositos.length) ? local.depositos : Depositos.de(fecha, id));
+            if (!local) return { ...row, depositos };
+            const localPagado = parseFloat(local.pagado) || 0;
+            const serverPagado = parseFloat(row.pagado) || 0;
+            if (Math.abs(localPagado - serverPagado) > 0.05) {
+                const total = parseFloat(row.total) || 0;
+                const saldo = Math.max(0, total - localPagado);
+                let estado = 'sin_cobrar';
+                if (localPagado > 0 && saldo <= 0.01) estado = 'pagado';
+                else if (localPagado > 0) estado = 'parcial';
+                return { ...row, pagado: localPagado, saldo, estado, medios: local.medios, depositos };
+            }
+            return { ...row, depositos };
+        });
+        return this.normalizarTotales(fusionados);
+    },
+
+    async load() {
+        const tbody = document.getElementById('cobros-hoy-tbody');
+        if (!tbody) return;
+
+        if (!DiaOperativo.diasPendientes.length) {
+            const cachedDias = CacheManager.get('flujo:dias-pendientes');
+            if (Array.isArray(cachedDias)) DiaOperativo.diasPendientes = cachedDias;
+        }
+
+        const revision = this._revision;
+        this._cargarOptimo();
+        if (DiaOperativo.diaCerrado(AppState.currentDate)) {
+            this.render([]);
+            return;
+        }
+        const preciosDia = CacheManager.get(`precios:${AppState.currentDate}`);
+        if (DiaOperativo.diaSinPedidos(AppState.currentDate) || (Array.isArray(preciosDia) && preciosDia.length === 0)) {
+            this._lastTotales = [];
+            this.render([]);
+            return;
+        }
+
+        const mismaFecha = this._fechaTotales === AppState.currentDate;
+        const locales = this._desdePrecios(AppState.currentDate);
+        if (mismaFecha && this._lastTotales.length && this._pagadoConocido !== false) {
+            this.render(this._lastTotales);
+        } else if (locales) {
+            this._lastTotales = this._fusionarServidor(locales);
+            this._fechaTotales = AppState.currentDate;
+            this._pagadoConocido = true;
+            this.render(this._lastTotales);
+        } else if (this._lastTotales.length && this._pagadoConocido !== false) {
+            this.render(this._lastTotales);
+        } else {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">Buscando cobros…</td></tr>';
+        }
+
+        try {
+            const totales = await API.getTotalesClientesHoy(AppState.currentDate);
+            if (revision !== this._revision) return;
+            this._pagadoConocido = true;
+            this._fechaTotales = AppState.currentDate;
+            this._lastTotales = this._fusionarServidor(Array.isArray(totales) ? totales : []);
+            this.render(this._lastTotales);
+        } catch (error) {
+            console.error('Error loading cobros-hoy:', error);
+            if (revision !== this._revision) return;
+            if (this._lastTotales.length) {
+                this.render(this._lastTotales);
+                return;
+            }
+            Utils.hideTableLoader(tbody);
+            if (AppState.currentPage === 'cobros-hoy') {
+                Utils.showError('Error al cargar los datos de cobranza. Intente nuevamente.');
+            }
+        }
+    },
+
+    _desdePrecios(fecha) {
+        const precios = CacheManager.peek(`precios:${fecha}`)
+            || (AppState.fechaCargada === fecha ? AppState.precios : null);
+        if (!Array.isArray(precios)) return null;
+        const cobranzas = (CacheManager.peek('cobranzas:all:all') || AppState.cobranzas || [])
+            .filter(cobranza => Utils.fechaIso(cobranza.fecha) === fecha);
+        const grupos = new Map();
+        precios.forEach(precio => {
+            const id = String(precio.cliente_id || '');
+            if (!id) return;
+            const cantidad = parseFloat(precio.cantidad) || 0;
+            const unit = Utils.parsePrice(precio.precio_cliente);
+            const comision = Utils.parseComision(precio.comision_unitaria);
+            const subtotal = Math.round(cantidad * unit) + Math.round(cantidad * comision);
+            if (!grupos.has(id)) {
+                grupos.set(id, {
+                    cliente_id: precio.cliente_id,
+                    cliente_nombre: precio.cliente_nombre || Utils.nombreCatalogo(precio, 'cliente'),
+                    total: 0,
+                    items: []
+                });
+            }
+            const grupo = grupos.get(id);
+            grupo.total += subtotal;
+            grupo.items.push({
+                producto_nombre: precio.producto_nombre || '',
+                cantidad,
+                precio_cliente: unit,
+                subtotal
+            });
+        });
+        return [...grupos.values()].map(grupo => {
+            const cobranza = cobranzas.find(item => String(item.cliente_id) === String(grupo.cliente_id));
+            const pagado = cobranza ? Utils.parsePrice(cobranza.pagado) : 0;
+            const saldo = Math.max(0, grupo.total - pagado);
+            let estado = 'sin_cobrar';
+            if (pagado > 0 && saldo <= 0) estado = 'pagado';
+            else if (pagado > 0) estado = 'parcial';
+            const depositosGuardados = Array.isArray(cobranza?.depositos) ? cobranza.depositos : [];
+            return {
+                ...grupo,
+                pagado,
+                saldo,
+                estado,
+                cobranza_id: cobranza ? cobranza.id : null,
+                medios: cobranza ? cobranza.medios : null,
+                depositos: depositosGuardados.length ? depositosGuardados : Depositos.de(fecha, grupo.cliente_id)
+            };
+        });
+    },
+
+    render(totales) {
+        const tbody = document.getElementById('cobros-hoy-tbody');
+        if (!tbody) return;
+        Utils.hideTableLoader(tbody);
+        tbody.innerHTML = '';
+
+        const hint = document.getElementById('cobros-hoy-hint');
+        if (DiaOperativo.diaCerrado(AppState.currentDate)) {
+            if (hint) {
+                hint.textContent = 'Este día está cerrado. Lo que quedó sin cobrar está en Cobranzas a clientes (pendientes).';
+            }
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">' +
+                'Este día está cerrado.<br>' +
+                '<small style="color:#999">Lo que quedó sin cobrar está en Cobranzas a clientes (pendientes).</small>' +
+                '</td></tr>';
+            return;
+        }
+        if (hint) {
+            hint.textContent = 'Cobrás en efectivo, transferencia o cheque, o le hacés un descuento. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).';
+        }
+
+        if (totales.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:#666;">' +
+                'No hay precios al cliente cargados para el día de hoy.<br>' +
+                '<small style="color:#999">Completá el paso "Precios al cliente" primero.</small>' +
+                '</td></tr>';
+            return;
+        }
+
+        totales.forEach(t => {
+            const tr = document.createElement('tr');
+            const pagado = parseFloat(t.pagado) || 0;
+            const saldo = parseFloat(t.saldo) || 0;
+            const total = parseFloat(t.total) || 0;
+            const pagadoTotal = saldo <= 0 || t.estado === 'pagado';
+
+            let estadoBadge;
+            if (pagadoTotal) {
+                estadoBadge = '<span class="status-badge status-activo">Pagado</span>';
+            } else if (pagado > 0) {
+                estadoBadge = '<span class="status-badge status-pendiente">Parcial</span>';
+            } else {
+                estadoBadge = '<span class="status-badge">Sin cobrar</span>';
+            }
+
+            tr.innerHTML = `
+                <td>${Utils.nombreCatalogo(t, 'cliente')}</td>
+                <td>${Utils.formatCurrency(total)}</td>
+                <td>${pagado > 0 ? Utils.formatCurrency(pagado) : '—'}</td>
+                <td class="medios-texto">${MediosPago.texto(t.medios)}${Depositos.htmlTexto(t.depositos)}</td>
+                <td style="${saldo > 0 ? 'color:#dc3545;font-weight:bold' : 'color:#28a745'}">${Utils.formatCurrency(saldo)}</td>
+                <td>${estadoBadge}</td>
+                <td>
+                    <button class="btn btn-secondary btn-sm" type="button" onclick="CobranzasHoy.abrirAcciones('${t.cliente_id}')">Acciones</button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+    },
+
+    _fila(clienteId) {
+        return (this._lastTotales || []).find(t => String(t.cliente_id) === String(clienteId)) || null;
+    },
+
+    _cliente(clienteId) {
+        return (AppState.clientes || []).find(c => String(c.id) === String(clienteId)) || null;
+    },
+
+    abrirAcciones(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const total = parseFloat(fila.total) || 0;
+        const pagado = parseFloat(fila.pagado) || 0;
+        const saldo = parseFloat(fila.saldo) || 0;
+        const cliente = this._cliente(clienteId);
+        const telefono = cliente?.telefono ? String(cliente.telefono).trim() : '';
+        const estado = saldo <= 0
+            ? '<span class="status-badge status-activo">Pagado</span>'
+            : (pagado > 0
+                ? '<span class="status-badge status-pendiente">Parcial</span>'
+                : '<span class="status-badge">Sin cobrar</span>');
+
+        const botones = [];
+        if (saldo > 0) {
+            botones.push(`<button type="button" class="btn btn-primary" onclick="CobranzasHoy.cobrar('${clienteId}', ${total}, ${saldo})">Cobrar</button>`);
+        }
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.verDetalle('${clienteId}')">Ver detalle</button>`);
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="Cuenta.abrir('cliente', '${clienteId}')">Cuenta corriente</button>`);
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="SaldoCliente.abrir('${clienteId}')">Enviar saldo</button>`);
+        botones.push(`<button type="button" class="btn btn-whatsapp" onclick="CobranzasHoy.avisarWhatsApp('${clienteId}')">${telefono ? 'Avisar por WhatsApp' : 'WhatsApp (falta teléfono)'}</button>`);
+        if (pagado > 0) {
+            botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.editarCobro('${clienteId}')">Editar lo cobrado</button>`);
+            botones.push(`<button type="button" class="btn btn-danger" onclick="CobranzasHoy.anularCobro('${clienteId}')">Eliminar cobro</button>`);
+        }
+        botones.push(`<button type="button" class="btn btn-secondary" onclick="CobranzasHoy.deshacerPago('${clienteId}')">Deshacer pago</button>`);
+
+        const content = `
+            <div class="pedido-acciones-resumen">
+                <div class="pedido-acciones-resumen-top">
+                    <strong>${nombre}</strong>
+                    <div class="pedido-acciones-badges">${estado}</div>
+                </div>
+                <p>Total ${Utils.formatCurrency(total)} · Cobrado ${Utils.formatCurrency(pagado)}</p>
+                <p class="pedido-acciones-proveedor">Adeudado: ${Utils.formatCurrency(saldo)}</p>
+                <p class="pedido-acciones-proveedor">${MediosPago.texto(fila.medios)}</p>
+                ${Depositos.htmlTexto(fila.depositos)}
+            </div>
+            <div class="pedido-acciones-lista">
+                ${botones.join('')}
+            </div>
+        `;
+
+        Utils.showModal('Acciones del cobro', content, null);
+        const cancelBtn = document.getElementById('modal-cancel');
+        if (cancelBtn) cancelBtn.textContent = 'Cerrar';
+    },
+
+    verDetalle(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const items = Array.isArray(fila.items) ? fila.items : [];
+        const filas = items.length
+            ? items.map(item => `
+                <tr>
+                    <td>${Utils.esc(item.producto_nombre || 'Producto')}</td>
+                    <td>${item.cantidad ?? ''}</td>
+                    <td>${Utils.formatCurrency(item.precio_cliente || 0)}</td>
+                    <td>${Utils.formatCurrency(item.subtotal || 0)}</td>
+                </tr>
+            `).join('')
+            : '<tr><td colspan="4">No hay detalle de productos cargado.</td></tr>';
+        const content = `
+            <p class="modal-hint">${nombre}</p>
+            <div class="modal-pedido-preview-box">
+                <table class="modal-pedido-detalle-table">
+                    <thead>
+                        <tr><th>Producto</th><th>Cant.</th><th>Precio</th><th>Total</th></tr>
+                    </thead>
+                    <tbody>${filas}</tbody>
+                </table>
+            </div>
+            <p>Total del día: <strong>${Utils.formatCurrency(fila.total || 0)}</strong></p>
+            <p>Cómo cobró: ${MediosPago.texto(fila.medios)}</p>
+            ${Depositos.htmlTexto(fila.depositos)}
+            <p>Adeudado: <strong>${Utils.formatCurrency(fila.saldo || 0)}</strong></p>
+        `;
+        Utils.showModal('Detalle del cobro', content, null);
+        const cancelBtn = document.getElementById('modal-cancel');
+        if (cancelBtn) cancelBtn.textContent = 'Cerrar';
+    },
+
+    avisarWhatsApp(clienteId) {
+        const fila = this._fila(clienteId);
+        const cliente = this._cliente(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        const telefono = cliente?.telefono ? String(cliente.telefono).trim() : '';
+        if (!telefono) {
+            Utils.showError('Este cliente no tiene teléfono. Cargalo en Clientes.');
+            return;
+        }
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const fecha = DiaOperativo.formatFechaLabel(AppState.currentDate);
+        const lineas = (fila.items || []).slice(0, 12).map(item =>
+            `${item.producto_nombre || 'Producto'} x ${item.cantidad ?? ''} — ${Utils.formatCurrency(item.subtotal || 0)}`
+        );
+        const mensaje = [
+            `Hola ${nombre}, te paso la cuenta del ${fecha}.`,
+            lineas.length ? lineas.join('\n') : '',
+            `Total: ${Utils.formatCurrency(fila.total || 0)}`,
+            `Cobrado: ${Utils.formatCurrency(fila.pagado || 0)}`,
+            `Adeudado: ${Utils.formatCurrency(fila.saldo || 0)}`,
+            MediosPago.texto(fila.medios) !== '—' ? MediosPago.texto(fila.medios) : ''
+        ].filter(Boolean).join('\n');
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        WhatsAppService.openChat(telefono, mensaje);
+        Utils.avisar(`WhatsApp abierto para ${nombre}`);
+    },
+
+    editarCobro(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        const total = parseFloat(fila.total) || 0;
+        const pagado = parseFloat(fila.pagado) || 0;
+        const mediosAntes = MediosPago.parse(fila.medios);
+        const inicial = MediosPago.total(mediosAntes) > 0 ? mediosAntes : Object.assign(MediosPago.vacio(), { efectivo: pagado });
+        const content = `
+            <p class="modal-hint">Repartí lo que ya te pagó. El máximo es ${Utils.formatCurrency(total)}. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deCliente, inicial)}
+        `;
+        Utils.showModal('Editar lo cobrado', content, async () => {
+            const leido = MediosPago.leer();
+            if (leido.total > total + 0.01) {
+                Utils.showError('La suma supera el total del día (' + Utils.formatCurrency(total) + ').');
+                throw new Error('Monto mayor al total');
+            }
+            if (leido.depositos.error) {
+                Utils.showError(leido.depositos.error);
+                throw new Error(leido.depositos.error);
+            }
+            const mediosPrevios = MediosPago.parse(fila.medios);
+            const pagadoPrevio = parseFloat(fila.pagado) || 0;
+            const depositosPrevios = Array.isArray(fila.depositos) ? fila.depositos.slice() : [];
+            this._aplicarMediosLocal(clienteId, leido.medios, leido.depositos.lineas);
+            Utils.avisar('Cobro actualizado');
+            Utils.enSegundoPlano(() => API.ajustarCobroClienteHoy({
+                fecha: AppState.currentDate,
+                cliente_id: clienteId,
+                medios: leido.medios,
+                depositos: leido.depositos.lineas
+            }), () => {
+                this._aplicarMediosLocal(
+                    clienteId,
+                    MediosPago.total(mediosPrevios) > 0 ? mediosPrevios : Object.assign(MediosPago.vacio(), { efectivo: pagadoPrevio }),
+                    depositosPrevios
+                );
+                Utils.showError('No se pudo editar el cobro. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Guardar');
+        MediosPago.enganchar(total);
+        Depositos.precargar(fila.depositos);
+        if ((parseFloat(MediosPago.leer().medios.transferencia) || 0) > 0) Depositos.sync(MediosPago.leer().medios.transferencia);
+    },
+
+    // Deshace pagos hechos sobre las deudas que el cliente tiene pendientes (Cobranzas a clientes).
+    async deshacerPago(clienteId) {
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        let pendientes = [];
+        try {
+            const todas = await API.getCobranzas();
+            AppState.cobranzas = (Array.isArray(todas) ? todas : []).filter(c => Utils.isCobranzaPendiente(c));
+            const clave = Utils.cuentaDe(clienteId).clave;
+            pendientes = AppState.cobranzas
+                .filter(c => Utils.cuentaDe(c.cliente_id).clave === clave && (Utils.parsePrice(c.pagado) || 0) > 0.009)
+                .sort((a, b) => String(Utils.fechaIso(a.fecha) || '').localeCompare(String(Utils.fechaIso(b.fecha) || '')));
+        } catch (error) {
+            Utils.showError('No se pudieron cargar los pagos de este cliente. Probá de nuevo.');
+            return;
+        }
+        if (!pendientes.length) {
+            const fila = this._fila(clienteId);
+            Utils.showInfo((parseFloat(fila?.pagado) || 0) > 0
+                ? 'No hay pagos sobre deudas anteriores. Lo cobrado en este día se saca con "Eliminar cobro" o "Editar lo cobrado".'
+                : 'Este cliente no tiene pagos para deshacer en sus deudas pendientes.');
+            return;
+        }
+        if (pendientes.length === 1) {
+            Cobranzas.deshacerPago(pendientes[0].id);
+            return;
+        }
+        const nombre = Utils.nombreCatalogo(this._fila(clienteId) || {}, 'cliente') || 'este cliente';
+        const lista = pendientes.map(c => `
+            <div class="deuda-fecha">
+                <span class="deuda-fecha-dia">${Utils.esc(Utils.formatDate(c.fecha))}<small class="fila-nota">Ya pagó ${Utils.formatCurrency(Utils.parsePrice(c.pagado) || 0)}</small></span>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="document.getElementById('modal-overlay')?.classList.remove('active'); Cobranzas.deshacerPago('${c.id}')">Deshacer pago</button>
+            </div>`).join('');
+        Utils.showModal('Deshacer pago de ' + nombre, `<p class="modal-hint">Elegí la deuda donde se cargó el pago.</p><div class="deuda-fechas">${lista}</div>`, null);
+    },
+
+    async anularCobro(clienteId) {
+        const fila = this._fila(clienteId);
+        if (!fila) {
+            Utils.showError('No encontré esa cobranza');
+            return;
+        }
+        document.getElementById('modal-overlay')?.classList.remove('active');
+        const nombre = Utils.nombreCatalogo(fila, 'cliente');
+        const ok = await Utils.showConfirm(`¿Eliminar el cobro de ${nombre}? Queda de nuevo el saldo completo. El cliente sigue en la lista.`);
+        if (!ok) return;
+        const mediosPrevios = MediosPago.parse(fila.medios);
+        const depositosPrevios = Array.isArray(fila.depositos) ? fila.depositos.slice() : [];
+        this._aplicarMediosLocal(clienteId, MediosPago.vacio(), []);
+        Utils.avisar('Cobro eliminado');
+        Utils.enSegundoPlano(() => API.ajustarCobroClienteHoy({
+            fecha: AppState.currentDate,
+            cliente_id: clienteId,
+            medios: MediosPago.vacio(),
+            depositos: []
+        }), () => {
+            this._aplicarMediosLocal(clienteId, mediosPrevios, depositosPrevios);
+            Utils.showError('No se pudo eliminar el cobro. Publicá el script si todavía no lo hiciste.');
+        });
+    },
+
+    _aplicarMediosLocal(clienteId, medios, depositos) {
+        const fila = this._fila(clienteId);
+        if (!fila) return;
+        const total = parseFloat(fila.total) || 0;
+        fila.medios = MediosPago.parse(medios);
+        if (depositos !== undefined) fila.depositos = depositos;
+        const pagado = MediosPago.total(fila.medios);
+        fila.pagado = pagado;
+        fila.saldo = Math.max(0, total - pagado);
+        fila.estado = pagado <= 0 ? 'sin_cobrar' : (fila.saldo <= 0.01 ? 'pagado' : 'parcial');
+        if (fila.saldo <= 0.01) this._cobrados.add(String(clienteId));
+        else this._cobrados.delete(String(clienteId));
+        this._fechaTotales = AppState.currentDate;
+        this._revision = (this._revision || 0) + 1;
+        this._optimo[String(clienteId)] = {
+            pagado: fila.pagado,
+            medios: fila.medios,
+            depositos: Array.isArray(fila.depositos) ? fila.depositos.slice() : []
+        };
+        Depositos.guardar(AppState.currentDate, clienteId, fila.depositos);
+        this._guardarOptimo();
+        this._reflejarCobro(fila);
+        this.render(this._lastTotales);
+    },
+
+    _cargarOptimo() {
+        if (Object.keys(this._optimo).length) return;
+        try {
+            const raw = sessionStorage.getItem('sg_cobros_optimos');
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (!parsed || parsed.fecha !== AppState.currentDate || !parsed.data) return;
+            this._optimo = parsed.data;
+        } catch (e) {
+            // storage no disponible
+        }
+    },
+
+    _guardarOptimo() {
+        try {
+            sessionStorage.setItem('sg_cobros_optimos', JSON.stringify({
+                fecha: AppState.currentDate,
+                data: this._optimo
+            }));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    _reflejarCobro(fila) {
+        const fecha = Utils.fechaIso(AppState.currentDate);
+        const tocar = (lista) => {
+            if (!Array.isArray(lista)) return false;
+            const index = lista.findIndex(item =>
+                String(item.cliente_id) === String(fila.cliente_id) &&
+                (!item.fecha || Utils.fechaIso(item.fecha) === fecha)
+            );
+            if (index < 0) return false;
+            lista[index] = {
+                ...lista[index],
+                pagado: fila.pagado,
+                saldo: fila.saldo,
+                estado: fila.estado,
+                medios: fila.medios,
+                depositos: fila.depositos || []
+            };
+            return true;
+        };
+        [`cobranzas:all:all`, `cobranzas:${fecha}:all`, `cobranzas:totales:${AppState.currentDate}`].forEach(key => {
+            const lista = CacheManager.peek(key);
+            if (tocar(lista)) CacheManager.set(key, lista);
+        });
+        const boot = CacheManager.peek(`bootstrap:${AppState.currentDate}`);
+        if (boot && tocar((boot.dashboard || boot).cobranzas)) CacheManager.set(`bootstrap:${AppState.currentDate}`, boot);
+        const dash = CacheManager.peek(`dashboard:${AppState.currentDate}`);
+        if (dash && tocar(dash.cobranzas)) CacheManager.set(`dashboard:${AppState.currentDate}`, dash);
+        tocar(AppState.cobranzas);
+    },
+
+    async cobrar(clienteId, total, saldoActual) {
+        const inicial = MediosPago.vacio();
+        const content = `
+            <p class="modal-hint">Total del día ${Utils.formatCurrency(total)}. Repartí el cobro. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deCliente, inicial)}
+        `;
+
+        Utils.showModal('Registrar cobro', content, async () => {
+            const leido = MediosPago.leer();
+            if (leido.total <= 0) {
+                Utils.showError('Poné cuánto te paga.');
+                throw new Error('Monto inválido');
+            }
+            if (leido.depositos.error) {
+                Utils.showError(leido.depositos.error);
+                throw new Error(leido.depositos.error);
+            }
+            const fila = this._fila(clienteId);
+            const mediosPrevios = MediosPago.parse(fila?.medios);
+            const depositosPrevios = Array.isArray(fila?.depositos) ? fila.depositos.slice() : [];
+            this._aplicarMediosLocal(clienteId, MediosPago.sumar(mediosPrevios, leido.medios), depositosPrevios.concat(leido.depositos.lineas));
+            Utils.avisar(leido.total >= saldoActual
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
+                : `Cobro registrado. Queda ${Utils.formatCurrency(Math.max(0, saldoActual - leido.total))}`);
+            Utils.enSegundoPlano(() => API.cobrarClienteHoy({
+                fecha: AppState.currentDate,
+                cliente_id: clienteId,
+                medios: leido.lista,
+                depositos: leido.depositos.lineas,
+                permitir_exceso: true
+            }), () => {
+                this._aplicarMediosLocal(clienteId, mediosPrevios, depositosPrevios);
+                Utils.showError('No se pudo registrar el cobro. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Cobrar');
+        MediosPago.enganchar(saldoActual, { tope: false });
+    }
+};
+
+// Pagos
+const Pagos = {
+    _agregando: false,
+    _guardando: false,
+    _filaEl: null,
+    _borrador: { proveedor_id: '', monto: '', fecha: '', nota: '' },
+    _pagados: new Set(),
+    _montosHoy: {},
+    _ultimoPago: null,
+    _optimo: {},
+    vista: 'hoy',
+
+    _cargarOptimo() {
+        if (Object.keys(this._optimo).length) return;
+        try {
+            const raw = sessionStorage.getItem('sg_pagos_optimos');
+            const parsed = raw ? JSON.parse(raw) : null;
+            if (!parsed || typeof parsed !== 'object') return;
+            this._optimo = parsed;
+        } catch (e) {
+            // storage no disponible
+        }
+    },
+
+    _guardarOptimo() {
+        try {
+            sessionStorage.setItem('sg_pagos_optimos', JSON.stringify(this._optimo));
+        } catch (e) {
+            // cuota excedida
+        }
+    },
+
+    _fusionar(proveedores) {
+        this._cargarOptimo();
+        return (proveedores || []).map(proveedor => {
+            const local = this._optimo[String(proveedor.id)];
+            if (!local) return proveedor;
+            const serverSaldo = Utils.parsePrice(proveedor.saldo) || 0;
+            const localSaldo = parseFloat(local.saldo) || 0;
+            const mediosServer = MediosPago.total(MediosPago.parse(proveedor.medios));
+            const mediosLocal = MediosPago.total(MediosPago.parse(local.medios));
+            if (mediosLocal > mediosServer + 0.05 && serverSaldo + 0.05 >= localSaldo) {
+                return { ...proveedor, saldo: localSaldo, medios: local.medios, deudas: local.deudas || proveedor.deudas };
+            }
+            if (mediosLocal > mediosServer + 0.05) {
+                return { ...proveedor, medios: local.medios };
+            }
+            return proveedor;
+        });
+    },
+
+    _reflejarPago(proveedorId) {
+        const actual = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+        const local = this._optimo[String(proveedorId)] || (actual ? { saldo: actual.saldo, medios: actual.medios, deudas: actual.deudas } : null);
+        if (!local) return;
+        const tocar = (lista) => {
+            if (!Array.isArray(lista)) return;
+            const index = lista.findIndex(item => String(item.id) === String(proveedorId));
+            if (index < 0) return;
+            lista[index] = { ...lista[index], saldo: local.saldo, medios: local.medios, deudas: local.deudas || lista[index].deudas };
+        };
+        tocar(CacheManager.peek('proveedores'));
+        tocar(AppState.proveedores);
+        Object.keys(CacheManager.cache || {}).forEach(key => {
+            if (!key.startsWith('bootstrap:')) return;
+            const boot = CacheManager.cache[key];
+            if (boot) tocar(boot.proveedores);
+        });
+    },
+
+    async load() {
+        const tbody = document.getElementById('pagos-tbody');
+        if (!tbody) return;
+
+        if (!DiaOperativo.diasPendientes.length) {
+            const cachedDias = CacheManager.get('flujo:dias-pendientes');
+            if (Array.isArray(cachedDias)) DiaOperativo.diasPendientes = cachedDias;
+        }
+        if (!AppState.proveedores.length) {
+            const cacheProv = CacheManager.get('proveedores');
+            if (Array.isArray(cacheProv)) AppState.proveedores = cacheProv;
+        }
+        const recepcionCache = CacheManager.get(`recepcion:${AppState.currentDate}`);
+        if (Array.isArray(recepcionCache)) this._aplicarRecepcionHoy(recepcionCache);
+        else if (AppState.recepcion) this._aplicarRecepcionHoy(AppState.recepcion);
+
+        const sinPedidos = this.vista !== 'pendientes' && DiaOperativo.diaSinPedidos(AppState.currentDate);
+        this._cargarOptimo();
+        this.render(AppState.proveedores);
+        if (sinPedidos) return;
+        if (this.vista === 'pendientes' && AppState.proveedores.length) return;
+        if (this.vista !== 'pendientes' && Array.isArray(recepcionCache) && AppState.proveedores.length) return;
+
+        try {
+            const [proveedores, recepcion] = await Promise.all([
+                API.getProveedores(),
+                API.getRecepcion(AppState.currentDate)
+            ]);
+
+            AppState.recepcion = recepcion || [];
+            this._aplicarRecepcionHoy(recepcion);
+            AppState.proveedores = this._fusionar(proveedores);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this.render(AppState.proveedores);
+        } catch (error) {
+            console.error('Error loading pagos:', error);
+            Utils.hideTableLoader(tbody);
+            if (!AppState.proveedores.length && AppState.currentPage === 'pagos') {
+                Utils.showError('Error al cargar los proveedores. Intente nuevamente.');
+            }
+        }
+    },
+    
+    render(proveedores) {
+        const tbody = document.getElementById('pagos-tbody');
+        if (!tbody) return;
+
+        Utils.hideTableLoader(tbody);
+
+        const soloPendientes = this.vista === 'pendientes';
+        const btnAgregar = document.getElementById('btn-agregar-pago-pendiente');
+        if (btnAgregar) btnAgregar.hidden = !soloPendientes;
+        if (!soloPendientes) { this._agregando = false; this._filaEl = null; }
+        const fila = this._agregando ? this._filaNueva() : null;
+        if (!fila) this._filaEl = null;
+        Utils.limpiarFilasConservando(tbody, fila);
+        const diaCerrado = DiaOperativo.diaCerrado(AppState.currentDate);
+        const titulo = document.getElementById('pagos-titulo');
+        const hint = document.getElementById('pagos-hint');
+        const diaBar = document.getElementById('pagos-dia-bar');
+        if (diaBar) diaBar.hidden = soloPendientes;
+        if (titulo) titulo.textContent = soloPendientes ? 'Pagos a proveedores (pendientes)' : 'Pagar al proveedor';
+        if (hint) {
+            hint.textContent = soloPendientes
+                ? 'Acá queda lo que todavía le debés. Podés pagar una parte en efectivo y otra en transferencia, y dejar el resto adeudado. Si ya le debías de antes, agregalo con "Agregar pago a proveedor pendiente".'
+                : (diaCerrado
+                    ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
+                    : 'Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).');
+        }
+
+        // "Pagar al proveedor" (el del día) muestra solo lo que se le debe de la fecha del pedido; las deudas
+        // de otras fechas se ven y se pagan en "Pagos a proveedores (pendientes)".
+        const fechaDia = AppState.currentDate;
+        const saldoDe = (p) => {
+            if (soloPendientes || !Array.isArray(p.deudas)) return Utils.parsePrice(p.saldo) || 0;
+            const deuda = p.deudas.find(d => Utils.fechaIso(d.fecha) === fechaDia);
+            return Utils.parsePrice(deuda?.saldo) || 0;
+        };
+        const lista = [...this._fusionar(proveedores)]
+            .filter(p => {
+                const saldo = saldoDe(p);
+                if (soloPendientes) return saldo > 0;
+                if (diaCerrado) return false;
+                return (this._montosHoy[String(p.id)] || 0) > 0;
+            })
+            .sort((a, b) => {
+            const saldoA = saldoDe(a);
+            const saldoB = saldoDe(b);
+            const hoyA = this._montosHoy[String(a.id)] || 0;
+            const hoyB = this._montosHoy[String(b.id)] || 0;
+            const pendA = saldoA > 0 || hoyA > 0;
+            const pendB = saldoB > 0 || hoyB > 0;
+            if (pendA !== pendB) return pendA ? -1 : 1;
+            return String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es');
+        });
+
+        let totalDeuda = 0;
+        let pendientes = 0;
+        lista.forEach(p => {
+            const saldo = saldoDe(p);
+            if (saldo > 0) {
+                totalDeuda += saldo;
+                pendientes++;
+            }
+        });
+
+        const resumen = document.getElementById('pagos-resumen');
+        if (resumen) {
+            resumen.hidden = lista.length === 0;
+            resumen.innerHTML = `
+                <div class="pagos-resumen-card is-deuda">
+                    <span>Total a pagar</span>
+                    <strong>${Utils.formatCurrency(totalDeuda)}</strong>
+                </div>
+                <div class="pagos-resumen-card">
+                    <span>Con saldo pendiente</span>
+                    <strong>${pendientes}</strong>
+                </div>
+                ${soloPendientes ? '' : `<div class="pagos-resumen-card">
+                    <span>Al día</span>
+                    <strong>${Math.max(0, lista.length - pendientes)}</strong>
+                </div>`}
+            `;
+        }
+
+        if (lista.length === 0) {
+            const vacio = soloPendientes
+                ? 'No hay pagos pendientes a proveedores.'
+                : (diaCerrado
+                    ? 'Este día está cerrado. Lo que quedó por pagar está en Pagos a proveedores (pendientes).'
+                    : 'No hay mercadería confirmada para pagar en este día.');
+            const vaciaTr = document.createElement('tr');
+            vaciaTr.innerHTML = `<td colspan="4" style="text-align:center;padding:30px;color:#666;">${vacio}</td>`;
+            tbody.appendChild(vaciaTr);
+            if (resumen) resumen.hidden = true;
+            Depositos.pintarEnPagos();
+            return;
+        }
+
+        lista.forEach(proveedor => {
+            const tr = document.createElement('tr');
+            const pagado = this._pagados.has(proveedor.id);
+            const deudaHoy = this._montosHoy[String(proveedor.id)] || 0;
+            const saldo = saldoDe(proveedor);
+            const pendiente = saldo > 0;
+            const puedePagar = pendiente && !pagado;
+            // En pendientes, cada fecha adeudada se paga por separado desde su propia línea.
+            const porFecha = soloPendientes && Array.isArray(proveedor.deudas) && proveedor.deudas.length > 0;
+            // En el pago del día, el pago descuenta de la deuda de esta fecha (no de las más viejas).
+            const opcionesPago = !soloPendientes && Array.isArray(proveedor.deudas) ? `, { fecha: '${fechaDia}' }` : '';
+            const btnPagar = puedePagar && !porFecha
+                ? `<button class="btn btn-primary btn-sm" type="button" onclick="Pagos.registrar('${proveedor.id}'${opcionesPago})">Pagar</button>`
+                : '';
+            const celdaDebes = porFecha
+                ? DeudasPorFecha.html(proveedor.deudas, saldo, Utils.parsePrice(proveedor.a_favor) || 0, pagado ? '' : `Pagos.registrar('${proveedor.id}', { fecha: '{fecha}' })`)
+                : Utils.formatCurrency(saldo);
+            const identificados = Depositos.deProveedor(proveedor.id);
+            const vino = identificados.length
+                ? `<div class="deposito-texto">${identificados.map(item => `${Depositos._esc(item.cuenta)} · vino de ${Depositos._esc(item.cliente)} ${Utils.formatCurrency(item.monto)}`).join('<br>')}</div>`
+                : '';
+            tr.dataset.proveedorId = String(proveedor.id || '');
+            tr.innerHTML = `
+                <td data-label="Proveedor">${Utils.esc(proveedor.nombre || '')}${vino}</td>
+                <td data-label="Le debés" style="${saldo > 0 && !porFecha ? 'color:#dc3545;font-weight:700;' : ''}">${celdaDebes}${btnPagar}</td>
+                <td data-label="Mercadería de hoy">${deudaHoy > 0 ? Utils.formatCurrency(deudaHoy) : '<span style="color:#aaa">—</span>'}</td>
+                <td data-label="Estado"><span class="status-badge ${pendiente ? 'status-pendiente' : 'status-activo'}">${pendiente ? 'Pendiente' : 'Al día'}</span>${soloPendientes ? `<div class="pagos-acciones"><button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.historial('${proveedor.id}')">Ver pagos / anular</button> <button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.cuenta('${proveedor.id}')">Cuenta corriente</button></div>` : ''}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+        Depositos.pintarEnPagos();
+        Dashboard.resaltarFila('proveedor');
+    },
+
+    // Fila de la tabla para agregar lo que ya se le debía a un proveedor (antes de usar la app).
+    _filaNueva() {
+        if (this._filaEl) return this._filaEl;
+        const b = this._borrador;
+        if (!b.fecha) b.fecha = Utils.ayerAR();
+        const proveedores = (AppState.proveedores || [])
+            .filter(p => p.activo !== false && p.activo !== 'false')
+            .slice().sort((a, c) => String(a.nombre || '').localeCompare(String(c.nombre || ''), 'es'));
+        const tr = document.createElement('tr');
+        tr.className = 'fila-nueva';
+        tr.innerHTML = `
+            <td data-label="Proveedor">
+                <select id="nueva-deuda-proveedor" class="form-control" aria-label="Proveedor">
+                    <option value="">Elegí el proveedor…</option>
+                    ${proveedores.map(p => `<option value="${Utils.esc(p.id)}"${String(p.id) === String(b.proveedor_id) ? ' selected' : ''}>${Utils.esc(p.nombre)}</option>`).join('')}
+                </select>
+                <input type="text" id="nueva-deuda-nota" class="form-control fila-nueva-nota" placeholder="Nota (opcional)" maxlength="120" value="${Utils.esc(b.nota)}" aria-label="Nota">
+            </td>
+            <td data-label="Le debés"><input type="text" id="nueva-deuda-monto" class="form-control" data-price-input="true" inputmode="numeric" placeholder="$ 0" value="${Utils.esc(b.monto)}" aria-label="Cuánto le debés"></td>
+                        <td data-label="Deuda desde"><small class="fila-nueva-etiqueta">Deuda desde</small><input type="date" id="nueva-deuda-fecha" class="form-control" max="${fechaHoyAR()}" value="${Utils.esc(b.fecha)}" aria-label="Desde qué fecha le debés"></td>
+            <td data-label="Estado">
+                <span class="status-badge status-pendiente">Nueva</span>
+                <div class="pagos-acciones">
+                    <button type="button" class="btn btn-primary btn-sm" id="nueva-deuda-guardar">Guardar</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="nueva-deuda-cancelar">Cancelar</button>
+                </div>
+            </td>`;
+        const leer = () => {
+            this._borrador = {
+                proveedor_id: tr.querySelector('#nueva-deuda-proveedor').value,
+                monto: tr.querySelector('#nueva-deuda-monto').value,
+                fecha: tr.querySelector('#nueva-deuda-fecha').value,
+                nota: tr.querySelector('#nueva-deuda-nota').value
+            };
+        };
+        tr.addEventListener('input', leer);
+        tr.addEventListener('change', leer);
+        tr.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.preventDefault(); this.guardarNueva(); }
+            if (e.key === 'Escape') this.cancelarNueva();
+        });
+        tr.querySelector('#nueva-deuda-guardar').addEventListener('click', () => this.guardarNueva());
+        tr.querySelector('#nueva-deuda-cancelar').addEventListener('click', () => this.cancelarNueva());
+        Utils.enablePriceInputs(tr);
+        this._filaEl = tr;
+        return tr;
+    },
+
+    async agregar() {
+        if (!(AppState.proveedores || []).length) {
+            try { AppState.proveedores = await API.getProveedores(); } catch (error) { /* se avisa abajo */ }
+        }
+        if (!(AppState.proveedores || []).length) {
+            Utils.showError('Todavía no hay proveedores cargados. Agregalos en Configuración → Proveedores.');
+            return;
+        }
+        this._agregando = true;
+        this.render(AppState.proveedores);
+        const fila = this._filaEl;
+        fila?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        fila?.querySelector(this._borrador.proveedor_id ? '#nueva-deuda-monto' : '#nueva-deuda-proveedor')?.focus();
+    },
+
+    cancelarNueva() {
+        if (this._guardando) return;
+        this._agregando = false;
+        this._filaEl = null;
+        this._borrador = { proveedor_id: '', monto: '', fecha: '', nota: '' };
+        this.render(AppState.proveedores);
+    },
+
+    async guardarNueva() {
+        if (this._guardando || !this._filaEl) return;
+        const fila = this._filaEl;
+        const proveedor_id = fila.querySelector('#nueva-deuda-proveedor').value;
+        const monto = Utils.parsePrice(fila.querySelector('#nueva-deuda-monto').value) || 0;
+        const fecha = fila.querySelector('#nueva-deuda-fecha').value;
+        const nota = fila.querySelector('#nueva-deuda-nota').value.trim();
+        if (!proveedor_id) { Utils.showError('Elegí el proveedor.'); return; }
+        if (monto <= 0) { Utils.showError('Poné cuánto le debés.'); return; }
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) { Utils.showError('Poné desde qué fecha le debés.'); return; }
+        if (fecha > fechaHoyAR()) { Utils.showError('La fecha no puede ser futura.'); return; }
+
+        this._guardando = true;
+        fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = true; });
+        try {
+            const creada = await API.agregarDeudaProveedor({ proveedor_id, fecha, monto, nota });
+            // El saldo lo calcula el servidor: se vuelve a leer para mostrar el número real.
+            CacheManager.invalidate('proveedores');
+            const proveedores = await API.getProveedores();
+            AppState.proveedores = this._fusionar(proveedores);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this._agregando = false;
+            this._filaEl = null;
+            this._borrador = { proveedor_id: '', monto: '', fecha: '', nota: '' };
+            this.render(AppState.proveedores);
+            const tr = document.querySelector(`#pagos-tbody tr[data-proveedor-id="${creada.proveedor_id}"]`);
+            if (tr) {
+                tr.classList.add('fila-recien-agregada');
+                tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+            Utils.avisar(`Se agregó la deuda con ${creada.proveedor_nombre || 'el proveedor'}: ${Utils.formatCurrency(creada.monto)}`);
+        } catch (error) {
+            console.error('Error agregando la deuda al proveedor:', error);
+            Utils.showError('No se pudo agregar el pago pendiente: ' + (error && error.message ? String(error.message).replace(/^Error:\s*/, '') : 'revisá la conexión'));
+            fila.querySelectorAll('button, input, select').forEach(el => { el.disabled = false; });
+        } finally {
+            this._guardando = false;
+        }
+    },
+
+    _aplicarRecepcionHoy(recepcion) {
+        this._montosHoy = {};
+        const fecha = AppState.currentDate;
+        (recepcion || []).forEach(item => {
+            if (fecha && item.fecha && Utils.fechaIso(item.fecha) !== fecha) return;
+            if (item.confirmado === true || item.confirmado === 'true') {
+                const provId = String(item.proveedor_id || '');
+                if (!provId) return;
+                const subtotal = (parseFloat(item.llego) || 0) * (Utils.parsePrice(item.precio_real) || 0);
+                this._montosHoy[provId] = (this._montosHoy[provId] || 0) + subtotal;
+            }
+        });
+    },
+
+    async _asegurarRecepcionHoy() {
+        if (AppState.recepcion?.length || Object.keys(this._montosHoy || {}).length) {
+            if (!Object.keys(this._montosHoy || {}).length) this._aplicarRecepcionHoy(AppState.recepcion);
+            return;
+        }
+        try {
+            const recepcion = await API.getRecepcion(AppState.currentDate);
+            AppState.recepcion = recepcion || [];
+            this._aplicarRecepcionHoy(recepcion);
+        } catch (error) {
+            console.error('Error cargando recepción para el pago:', error);
+        }
+    },
+
+    _estimadoPedidosProveedor(proveedorId) {
+        const id = String(proveedorId || '');
+        if (!id) return 0;
+        const precios = {};
+        (AppState.recepcion || []).forEach(item => {
+            const precio = Utils.parsePrice(item.precio_real) || 0;
+            if (precio > 0) precios[String(item.producto_id)] = precio;
+        });
+        let total = 0;
+        (AppState.pedidos || []).forEach(pedido => {
+            const { proveedor } = Pedidos.resolverProveedorPedido(pedido);
+            if (String(proveedor?.id) !== id) return;
+            const precio = precios[String(pedido.producto_id)] || 0;
+            total += (parseFloat(pedido.cantidad) || 0) * precio;
+        });
+        return total;
+    },
+
+    // Lo que queda de cada deuda por fecha después de pagar. Con fecha, solo toca esa; sin fecha, de la más vieja a la más nueva.
+    _descontarDeudas(deudas, monto, fecha) {
+        let resto = monto;
+        return (deudas || []).map(d => {
+            const saldo = Utils.parsePrice(d.saldo) || 0;
+            if (resto <= 0 || (fecha && Utils.fechaIso(d.fecha) !== fecha)) return d;
+            const aplicado = Math.min(resto, saldo);
+            resto -= aplicado;
+            return { ...d, saldo: saldo - aplicado, pagado: (Utils.parsePrice(d.pagado) || 0) + aplicado };
+        }).filter(d => (Utils.parsePrice(d.saldo) || 0) > 0.009);
+    },
+
+    _dineroAPagar(proveedorId, saldoPendiente) {
+        if (saldoPendiente > 0) return saldoPendiente;
+        const mercaderiaHoy = this._montosHoy[String(proveedorId)] || 0;
+        if (mercaderiaHoy > 0) return mercaderiaHoy;
+        return this._estimadoPedidosProveedor(proveedorId);
+    },
+
+    async registrar(proveedorId = null, opciones = {}) {
+        const desdePedido = !!opciones.desdePedido;
+        // Si viene una fecha, el pago es de la deuda de ese día; si no, descuenta de las más viejas primero.
+        const fechaDeuda = opciones.fecha ? Utils.fechaIso(opciones.fecha) : '';
+        if (!proveedorId) return;
+        if (this._pagados.has(proveedorId)) {
+            Utils.showInfo('En esta sesión ya registraste un pago a este proveedor. Si falta algo, usá Pagos a proveedores.');
+            return;
+        }
+
+        let proveedorNombre = '';
+        let proveedorSaldo = 0;
+        let proveedorCompleto = null;
+        if (proveedorId) {
+            const proveedores = await API.getProveedores();
+            const proveedor = proveedores.find(p => String(p.id) === String(proveedorId));
+            if (proveedor) {
+                proveedorCompleto = proveedor;
+                proveedorNombre = proveedor.nombre;
+                proveedorSaldo = Utils.parsePrice(proveedor.saldo) || 0;
+            }
+        }
+
+        const saldoTotal = Utils.parsePrice(proveedorSaldo) || 0;
+        let saldoPendiente = saldoTotal;
+        if (fechaDeuda) {
+            const deudaFecha = (proveedorCompleto?.deudas || []).find(d => Utils.fechaIso(d.fecha) === fechaDeuda);
+            saldoPendiente = Utils.parsePrice(deudaFecha?.saldo) || 0;
+        }
+        if (saldoPendiente <= 0 && !desdePedido) {
+            Utils.showInfo(`"${proveedorNombre || 'Este proveedor'}" está al día. No hay nada para pagar.`);
+            return;
+        }
+
+        await this._asegurarRecepcionHoy();
+
+        const anticipo = desdePedido && saldoPendiente <= 0 && !fechaDeuda;
+        const mercaderiaHoy = this._montosHoy[String(proveedorId)] || 0;
+        const dineroAPagar = this._dineroAPagar(proveedorId, saldoPendiente);
+
+        const inicial = MediosPago.vacio();
+        if (!anticipo && saldoPendiente > 0) inicial.efectivo = saldoPendiente;
+        const chipHoy = !fechaDeuda && mercaderiaHoy > 0 && mercaderiaHoy < saldoPendiente
+            ? `<button type="button" class="pago-chip" id="pago-chip-hoy">Lo de hoy (${Utils.formatCurrency(mercaderiaHoy)})</button>`
+            : '';
+        const deudaElegida = fechaDeuda ? (proveedorCompleto?.deudas || []).find(d => Utils.fechaIso(d.fecha) === fechaDeuda) : null;
+        const yaPagadoProv = Utils.parsePrice(deudaElegida?.pagado) || 0;
+        const yaPago = yaPagadoProv > 0.01
+            ? `<p class="modal-hint"><strong>Ya pagaste ${Utils.formatCurrency(yaPagadoProv)}</strong> de ${Utils.formatCurrency(Utils.parsePrice(deudaElegida.debe) || 0)}</p>`
+            : '';
+        const content = `
+            <div class="form-group">
+                <label for="modal-pago-deuda">${fechaDeuda ? 'Le debés del ' + Utils.formatDate(fechaDeuda) : 'Le debés'}</label>
+                <input type="text" id="modal-pago-deuda" class="form-control" value="${Utils.formatCurrency(fechaDeuda ? saldoPendiente : dineroAPagar)}" readonly tabindex="-1">
+            </div>
+            ${yaPago}
+            <p class="modal-hint">Repartí el pago en efectivo y transferencia. Lo que no cargues queda adeudado.</p>
+            ${MediosPago.html(MediosPago.deProveedor, inicial)}
+            <div class="pago-chips">${chipHoy}</div>
+        `;
+
+        Utils.showModal('Pagar a ' + proveedorNombre, content, async () => {
+            const leido = MediosPago.leer();
+            if (leido.total <= 0 || !proveedorId) {
+                Utils.showError('Poné cuánto le pagás.');
+                throw new Error('Monto inválido');
+            }
+            const deMas = !anticipo && leido.total > saldoPendiente + 0.01;
+            if (deMas) {
+                const aceptado = await Utils.showConfirm(
+                    `Le debés ${Utils.formatCurrency(saldoPendiente)} y le vas a pagar ${Utils.formatCurrency(leido.total)}. Los ${Utils.formatCurrency(leido.total - saldoPendiente)} que sobran quedan a favor y se descuentan de la próxima carga. ¿Confirmás?`,
+                    null, null, { title: 'Pagás de más', accept: 'Sí, pagar' }
+                );
+                if (!aceptado) throw new Error('Pago de más cancelado');
+            }
+
+            const saldoRestante = Math.max(0, saldoTotal - leido.total);
+            const proveedorLocal = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+            const saldoPrevio = proveedorLocal ? proveedorLocal.saldo : saldoPendiente;
+            const mediosPrevios = MediosPago.parse(proveedorLocal?.medios);
+            const deudasPrevias = proveedorLocal ? proveedorLocal.deudas : undefined;
+            const deudasNuevas = this._descontarDeudas(proveedorCompleto?.deudas, leido.total, fechaDeuda);
+            const optimoPrevio = this._optimo[String(proveedorId)];
+            if (proveedorLocal) {
+                proveedorLocal.saldo = saldoRestante;
+                proveedorLocal.medios = MediosPago.sumar(mediosPrevios, leido.medios);
+                proveedorLocal.deudas = deudasNuevas;
+            }
+            this._optimo[String(proveedorId)] = {
+                saldo: saldoRestante,
+                medios: proveedorLocal ? proveedorLocal.medios : leido.medios,
+                deudas: deudasNuevas
+            };
+            this._guardarOptimo();
+            if (!anticipo && leido.total >= saldoTotal) this._pagados.add(proveedorId);
+            CacheManager.set('proveedores', AppState.proveedores);
+            this._reflejarPago(proveedorId);
+            this.render(AppState.proveedores);
+            Utils.avisar(saldoRestante > 0
+                ? `Pago de ${Utils.formatCurrency(leido.total)} registrado. Queda ${Utils.formatCurrency(saldoRestante)}`
+                : `Pago de ${Utils.formatCurrency(leido.total)} registrado`);
+
+            this._ultimoPago = {
+                proveedorId,
+                monto: leido.total,
+                medios: leido.medios,
+                saldoRestante,
+                anticipo
+            };
+
+            Utils.enSegundoPlano(() => API.registrarPago({
+                proveedor_id: proveedorId,
+                medios: leido.lista,
+                fecha: AppState.currentDate,
+                anticipo: anticipo,
+                permitir_exceso: deMas,
+                aplica_fecha: fechaDeuda,
+                nota: anticipo ? 'Pago al hacer el pedido' : ''
+            }), () => {
+                if (proveedorLocal) {
+                    proveedorLocal.saldo = saldoPrevio;
+                    proveedorLocal.medios = mediosPrevios;
+                    proveedorLocal.deudas = deudasPrevias;
+                }
+                if (optimoPrevio) this._optimo[String(proveedorId)] = optimoPrevio;
+                else delete this._optimo[String(proveedorId)];
+                this._guardarOptimo();
+                this._pagados.delete(proveedorId);
+                CacheManager.set('proveedores', AppState.proveedores);
+                this._reflejarPago(proveedorId);
+                this.render(AppState.proveedores);
+                Utils.showError('No se pudo registrar el pago. Publicá el script si todavía no lo hiciste.');
+            });
+        }, 'Pagar');
+
+        const actualizar = MediosPago.enganchar(saldoPendiente, { tope: false, ocultarAdeudado: anticipo });
+        document.getElementById('pago-chip-hoy')?.addEventListener('click', () => {
+            const soloHoy = MediosPago.vacio();
+            soloHoy.efectivo = mercaderiaHoy;
+            MediosPago.poner(soloHoy);
+            actualizar();
+        });
+    },
+
+    // Historial de lo pagado a proveedores, con la opción de anular un pago.
+    async historial(proveedorId = '') {
+        const hoy = Utils.formatCurrency;
+        Utils.showModal('Pagos a proveedores', '<p class="modal-hint">Cargando…</p>');
+        let pagos = [];
+        let proveedores = AppState.proveedores || [];
+        try {
+            [pagos, proveedores] = await Promise.all([API.getPagosProveedores(), API.getProveedores()]);
+        } catch (error) {
+            Utils.showError('No se pudieron cargar los pagos. Intentá de nuevo.');
+            return;
+        }
+        const nombres = {};
+        proveedores.forEach(p => { nombres[String(p.id)] = p.nombre || ''; });
+        const conPagos = [...new Set(pagos.map(p => String(p.proveedor_id)))]
+            .filter(id => nombres[id] !== undefined)
+            .sort((a, b) => nombres[a].localeCompare(nombres[b], 'es'));
+        const elegido = conPagos.includes(String(proveedorId)) ? String(proveedorId) : '';
+        const lista = pagos
+            .filter(p => !elegido || String(p.proveedor_id) === elegido)
+            .sort((a, b) => String(Utils.fechaIso(b.fecha) || '').localeCompare(String(Utils.fechaIso(a.fecha) || '')))
+            .slice(0, 80);
+        const prov = elegido ? proveedores.find(p => String(p.id) === elegido) : null;
+        const aFavor = Utils.parsePrice(prov?.a_favor) || 0;
+        const filas = lista.map(p => `
+            <tr>
+                <td data-label="Fecha">${Utils.formatDate(Utils.fechaIso(p.fecha))}</td>
+                <td data-label="Proveedor">${Utils.esc(nombres[String(p.proveedor_id)] || '—')}</td>
+                <td data-label="Monto"><strong>${hoy(Utils.parsePrice(p.monto) || 0)}</strong> · ${Utils.esc(this.metodoPagoLabel(p.metodo))}${p.nota ? `<br><small>${Utils.esc(p.nota)}</small>` : ''}</td>
+                <td data-label=""><button type="button" class="btn btn-secondary btn-sm" onclick="Pagos.anular('${Utils.esc(String(p.id))}', '${elegido}')">Anular</button></td>
+            </tr>`).join('');
+        const content = `
+            <div class="form-group">
+                <label for="historial-proveedor">Proveedor</label>
+                <select id="historial-proveedor" class="form-control">
+                    <option value="">Todos</option>
+                    ${conPagos.map(id => `<option value="${Utils.esc(id)}"${id === elegido ? ' selected' : ''}>${Utils.esc(nombres[id])}</option>`).join('')}
+                </select>
+            </div>
+            ${aFavor > 0.009 ? `<p class="modal-hint"><strong>Saldo a favor: ${hoy(aFavor)}</strong>. Se descuenta de la próxima carga.</p>` : ''}
+            ${lista.length ? `<div class="table-container"><table class="data-table"><thead><tr><th>Fecha</th><th>Proveedor</th><th>Pago</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>
+            <p class="modal-hint">Al anular un pago, vuelve a deberse ese monto y en la caja queda anotado como ingreso de hoy.</p>
+            <div class="page-actions"><button type="button" class="btn btn-secondary" onclick="Pagos.cuenta('${elegido}')">Ver cuenta corriente</button></div>`
+                : '<p class="modal-hint">Todavía no hay pagos registrados.</p>'}
+        `;
+        Utils.showModal('Pagos a proveedores', content);
+        document.getElementById('historial-proveedor')?.addEventListener('change', (e) => this.historial(e.target.value));
+    },
+
+    async anular(pagoId, proveedorId = '') {
+        const aceptado = await Utils.showConfirm(
+            'Se anula este pago: vuelve a deberse ese monto y en la caja queda anotado como ingreso de hoy. ¿Confirmás?',
+            null, null, { title: 'Anular pago', accept: 'Sí, anular' }
+        );
+        if (!aceptado) return;
+        try {
+            const res = await API.anularPagoProveedor({ id: pagoId });
+            const pid = String(res?.proveedor_id || proveedorId || '');
+            if (pid) {
+                delete this._optimo[pid];
+                this._guardarOptimo();
+                this._pagados.delete(pid);
+                this._pagados.delete(Number(pid));
+            }
+            Utils.avisar('Pago anulado');
+            const proveedores = await API.getProveedores();
+            AppState.proveedores = proveedores;
+            CacheManager.set('proveedores', proveedores);
+            if (AppState.currentPage === 'pagos') this.render(proveedores);
+            this.historial(proveedorId);
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo anular el pago.');
+        }
+    },
+
+    // Cuenta corriente (extracto con saldo corrido): ver la clase Cuenta.
+    cuenta(proveedorId = '') { return Cuenta.abrir('proveedor', proveedorId); },
+
+    metodoPagoLabel(metodo) {
+        const labels = {
+            efectivo: 'efectivo',
+            transferencia: 'transferencia',
+            cheque: 'cheque'
+        };
+        return labels[metodo] || metodo || 'efectivo';
+    },
+
+    construirMensajeWhatsApp(proveedor, pago) {
+        const nombre = proveedor?.nombre || 'proveedor';
+        const fechaLabel = DiaOperativo.formatFechaLabel(AppState.currentDate);
+
+        if (pago && pago.monto > 0) {
+            const detalle = pago.medios ? MediosPago.texto(pago.medios) : this.metodoPagoLabel(pago.metodo);
+            let mensaje = `Hola ${nombre}, te confirmamos el pago de ${Utils.formatCurrency(pago.monto)} (${detalle}) del ${fechaLabel}.\n\n`;
+            if (pago.anticipo && !(pago.saldoRestante > 0)) {
+                mensaje += 'Queda registrado como anticipo.\n\n';
+            } else if (pago.saldoRestante > 0) {
+                mensaje += `Saldo pendiente: ${Utils.formatCurrency(pago.saldoRestante)}.\n\n`;
+            } else {
+                mensaje += 'Quedamos al día.\n\n';
+            }
+            mensaje += 'Muchas gracias.';
+            return mensaje;
+        }
+
+        const saldo = Utils.parsePrice(proveedor?.saldo) || 0;
+        if (saldo > 0) {
+            return (
+                `Hola ${nombre}, te confirmamos el pago de ${Utils.formatCurrency(saldo)} del ${fechaLabel}.\n\n` +
+                'Quedamos al día.\n\nMuchas gracias.'
+            );
+        }
+
+        return `Hola ${nombre}, te confirmamos que no tenemos saldo pendiente. Quedamos al día.\n\nMuchas gracias.`;
+    },
+
+    async ensureDatosWhatsApp() {
+        if (AppState.whatsappAutoEnvio !== undefined) return;
+        try {
+            const status = await API.getWhatsAppStatus();
+            AppState.whatsappAutoEnvio = !!status.autoEnvioActivo;
+            AppState.whatsappModo = status.modo || 'manual';
+        } catch (error) {
+            AppState.whatsappAutoEnvio = false;
+            AppState.whatsappModo = 'manual';
+        }
+    },
+
+    programarAvisoWhatsApp(proveedor, pago) {
+        if (!proveedor?.id) return;
+        setTimeout(() => this.abrirModalWhatsApp(proveedor, pago), 350);
+    },
+
+    async enviarWhatsApp(proveedorId) {
+        try {
+            await this.ensureDatosWhatsApp();
+            const proveedor = (AppState.proveedores || []).find(p => String(p.id) === String(proveedorId));
+            if (!proveedor) {
+                Utils.showError('Proveedor no encontrado');
+                return;
+            }
+            const ultimo = this._ultimoPago && String(this._ultimoPago.proveedorId) === String(proveedorId)
+                ? this._ultimoPago
+                : null;
+            this.abrirModalWhatsApp(proveedor, ultimo);
+        } catch (error) {
+            console.error('Error preparando WhatsApp de pago:', error);
+            if (error instanceof WhatsAppError) {
+                Utils.showError(error.message);
+                return;
+            }
+            Utils.showError('No se pudo preparar el WhatsApp: ' + (error.message || 'intentá de nuevo.'));
+        }
+    },
+
+    abrirModalWhatsApp(proveedor, pago = null) {
+        if (!proveedor) return;
+
+        const sinTelefono = !proveedor.telefono || !String(proveedor.telefono).trim();
+        const mensajeDefault = this.construirMensajeWhatsApp(proveedor, pago);
+        const saveLabel = AppState.whatsappAutoEnvio ? 'Enviar WhatsApp' : 'Abrir WhatsApp';
+        const saldo = Utils.parsePrice(proveedor.saldo) || 0;
+        const monto = pago?.monto > 0 ? pago.monto : (saldo > 0 ? saldo : 0);
+        const metodo = pago?.medios ? MediosPago.texto(pago.medios) : (pago?.metodo ? this.metodoPagoLabel(pago.metodo) : '—');
+        const saldoDespues = pago ? (pago.saldoRestante || 0) : Math.max(0, saldo - monto);
+
+        const content = `
+            <div class="form-group">
+                <label>Proveedor</label>
+                <p class="modal-static-value">${Utils.esc(proveedor.nombre || '-')}</p>
+                <small class="modal-hint">${sinTelefono
+                    ? 'Este proveedor no tiene teléfono. Configuralo en Proveedores.'
+                    : (proveedor.telefono || '')}</small>
+            </div>
+            <div class="form-group">
+                <label>Detalle del aviso</label>
+                <div class="modal-pedido-preview-box">
+                    <table class="modal-pedido-detalle-table">
+                        <thead>
+                            <tr>
+                                <th>Concepto</th>
+                                <th>Valor</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Pago</td>
+                                <td>${monto > 0 ? Utils.formatCurrency(monto) : '—'}</td>
+                            </tr>
+                            <tr>
+                                <td>Método</td>
+                                <td>${metodo}</td>
+                            </tr>
+                            <tr>
+                                <td>Saldo después</td>
+                                <td>${pago || monto > 0 ? Utils.formatCurrency(saldoDespues) : Utils.formatCurrency(saldo)}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Mensaje de WhatsApp</label>
+                <textarea id="modal-pago-preview-mensaje" class="whatsapp-preview form-control" rows="8"></textarea>
+            </div>
+        `;
+
+        Utils.showModal('Avisar pago por WhatsApp', content, async () => {
+            const mensaje = document.getElementById('modal-pago-preview-mensaje')?.value.trim();
+            if (!mensaje) {
+                Utils.showError('Escribí un mensaje para WhatsApp');
+                throw new Error('Mensaje requerido');
+            }
+            await this.ejecutarEnvioWhatsApp(proveedor, mensaje);
+        }, saveLabel);
+
+        const previewMensaje = document.getElementById('modal-pago-preview-mensaje');
+        if (previewMensaje) previewMensaje.value = mensajeDefault;
+
+        const saveBtn = document.getElementById('modal-save');
+        if (saveBtn) saveBtn.disabled = sinTelefono;
+    },
+
+    async ejecutarEnvioWhatsApp(proveedor, mensaje) {
+        try {
+            if (!proveedor?.telefono || !String(proveedor.telefono).trim()) {
+                throw new WhatsAppError(
+                    `El proveedor "${proveedor?.nombre || ''}" no tiene teléfono configurado.`
+                );
+            }
+
+            const modoEnvio = await WhatsAppService.sendOrOpen(
+                proveedor.telefono,
+                mensaje,
+                API,
+                AppState.whatsappAutoEnvio
+            );
+
+            Utils.showSuccess(modoEnvio === 'auto'
+                ? `WhatsApp enviado a ${proveedor.nombre}.`
+                : `WhatsApp abierto para ${proveedor.nombre}.`);
+        } catch (error) {
+            if (error instanceof WhatsAppError) {
+                Utils.showError(error.message);
+            } else {
+                Utils.showError('Error al enviar WhatsApp: ' + error.message);
+            }
+            throw error;
+        }
+    }
+};
+
+// Stock
+const Stock = {
+    _filas(stock) {
+        const lista = Array.isArray(stock) ? stock : (AppState.stock || []);
+        const porId = new Map(lista.map(item => [String(item.producto_id), item]));
+        const productos = AppState.productos || [];
+        const filas = productos.length
+            ? productos.map(producto => {
+                const item = porId.get(String(producto.id)) || {};
+                return {
+                    producto_id: producto.id,
+                    producto_nombre: producto.nombre || item.producto_nombre || '',
+                    tipo: producto.tipo || item.tipo || '',
+                    stock_actual: parseFloat(item.stock_actual) || 0,
+                    minimo: item.minimo === undefined || item.minimo === '' ? 10 : (parseFloat(item.minimo) || 0)
+                };
+            })
+            : lista.map(item => ({
+                producto_id: item.producto_id,
+                producto_nombre: item.producto_nombre || '',
+                tipo: item.tipo || '',
+                stock_actual: parseFloat(item.stock_actual) || 0,
+                minimo: parseFloat(item.minimo) || 10
+            }));
+        return filas.sort((a, b) => {
+            const tipo = String(a.tipo).localeCompare(String(b.tipo), 'es');
+            if (tipo) return tipo;
+            return String(a.producto_nombre).localeCompare(String(b.producto_nombre), 'es');
+        });
+    },
+
+    _tipo(tipo) {
+        if (tipo === 'bebida') return 'Bebida';
+        if (tipo === 'verdura') return 'Verdura';
+        if (tipo === 'mercadería') return 'Mercadería';
+        if (tipo === 'fruta') return 'Fruta';
+        return tipo ? String(tipo) : '';
+    },
+
+    _cantidad(valor) {
+        return String(Math.round((parseFloat(valor) || 0) * 1000) / 1000);
+    },
+
+    async _asegurarProductos() {
+        if (AppState.productos?.length) return;
+        const cache = CacheManager.peek('productos');
+        if (Array.isArray(cache) && cache.length) {
+            AppState.productos = cache;
+            return;
+        }
+        AppState.productos = await API.getProductos();
+    },
+
+    async load() {
+        const tbody = document.getElementById('stock-tbody');
+        if (!tbody) return;
+
+        const cached = CacheManager.peek('stock');
+        const hasStale = AppState.stock.length > 0 || cached;
+        if (hasStale) {
+            if (!AppState.stock.length && cached) AppState.stock = cached;
+            await this._asegurarProductos();
+            this.render();
+        } else {
+            Utils.showTableLoader(tbody);
+        }
+
+        try {
+            await this._asegurarProductos();
+            AppState.stock = await API.getStock();
+            this.render();
+        } catch (error) {
+            console.error('Error loading stock:', error);
+            if (!hasStale) Utils.hideTableLoader(tbody);
+        }
+    },
+    
+    render() {
+        const tbody = document.getElementById('stock-tbody');
+        if (!tbody) return;
+        
+        Utils.hideTableLoader(tbody);
+        tbody.innerHTML = '';
+
+        const filas = this._filas();
+        if (filas.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No hay productos cargados</td></tr>';
+            return;
+        }
+        
+        filas.forEach(item => {
+            const estado = item.stock_actual <= item.minimo ? 'BAJO' : 'OK';
+            const nombre = String(item.producto_nombre || '').replace(/'/g, "\\'");
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${Utils.esc(item.producto_nombre || '')}</td>
+                <td>${this._tipo(item.tipo)}</td>
+                <td>${this._cantidad(item.stock_actual)}</td>
+                <td><span class="status-badge ${estado === 'BAJO' ? 'status-bajo' : 'status-activo'}">${estado}</span></td>
+                <td>
+                    <button class="btn btn-secondary" onclick="Stock.edit('${item.producto_id}', '${nombre}', ${item.stock_actual || 0})">Editar</button>
+                    <button class="btn btn-danger" onclick="Stock.delete('${item.producto_id}', '${nombre}')">Eliminar</button>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+    },
+    
+    async ajustar() {
+        await this._asegurarProductos();
+        const productos = (AppState.productos || []).slice().sort((a, b) =>
+            String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es')
+        );
+        
+        const content = `
+            <div class="form-group">
+                <label>Producto</label>
+                <select id="modal-stock-producto" class="form-control">
+                    <option value="">Seleccionar...</option>
+                    ${productos.map(p => `<option value="${p.id}">${Utils.esc(p.nombre)} · ${this._tipo(p.tipo)}</option>`).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Cantidad</label>
+                <input type="number" id="modal-stock-cantidad" class="form-control" min="0" step="0.01">
+            </div>
+        `;
+        
+        Utils.showModal('Ajustar stock', content, async () => {
+            const productoId = document.getElementById('modal-stock-producto').value;
+            const cantidad = parseFloat(document.getElementById('modal-stock-cantidad').value);
+            
+            if (!productoId || Number.isNaN(cantidad) || cantidad < 0) {
+                Utils.showError('Complete todos los campos');
+                return;
+            }
+            
+            try {
+                await API.updateStock(productoId, cantidad);
+                Utils.showSuccess('Stock actualizado correctamente');
+                await this.load();
+            } catch (error) {
+                console.error('Error updating stock:', error);
+            }
+        });
+    },
+    
+    async edit(productoId, productoNombre, stockActual) {
+        const content = `
+            <div class="form-group">
+                <label>Producto</label>
+                <input type="text" class="form-control" value="${productoNombre}" disabled>
+            </div>
+            <div class="form-group">
+                <label>Cantidad en stock</label>
+                <input type="number" id="modal-stock-edit-cantidad" class="form-control" min="0" step="0.01" value="${stockActual}">
+            </div>
+        `;
+
+        Utils.showModal('Editar stock', content, async () => {
+            const cantidad = parseFloat(document.getElementById('modal-stock-edit-cantidad').value);
+
+            if (isNaN(cantidad) || cantidad < 0) {
+                Utils.showError('Ingrese una cantidad válida');
+                return;
+            }
+
+            try {
+                await API.updateStock(productoId, cantidad);
+                Utils.showSuccess('Stock actualizado correctamente');
+                CacheManager.invalidate('stock');
+                AppState.stock = await API.getStock();
+                this.render();
+            } catch (error) {
+                console.error('Error updating stock:', error);
+                Utils.showError('Error al actualizar stock: ' + error.message);
+            }
+        });
+    },
+
+    async delete(productoId, productoNombre) {
+        const confirmMsg = `⚠️ ADVERTENCIA: ¿Está seguro de ELIMINAR el registro de stock de "${productoNombre}"?\n\nEsta acción NO se puede deshacer.\n\n¿Desea continuar?`;
+
+        const confirmar = await Utils.showConfirm(confirmMsg);
+        if (!confirmar) return;
+
+        Utils.showLoader();
+        try {
+            await API.deleteStock(productoId);
+            Utils.showSuccess('Registro de stock eliminado correctamente');
+            CacheManager.invalidate('stock');
+            AppState.stock = await API.getStock();
+            this.render();
+        } catch (error) {
+            console.error('Error deleting stock:', error);
+            Utils.showError('Error al eliminar stock: ' + error.message);
+        } finally {
+            Utils.hideLoader();
+        }
+    },
+
+    async verificarStockBajo() {
+        const confirmar = await Utils.showConfirm('¿Desea verificar el stock bajo y enviar notificación por email?');
+        if (!confirmar) {
+            return;
+        }
+        
+        try {
+            const resultado = await API.verificarStockBajo();
+
+            if (resultado && resultado.success === false) {
+                Utils.showInfo(resultado.message || 'No se pudo verificar el stock.');
+                return;
+            }
+            
+            if (resultado.productos && resultado.productos.length > 0) {
+                Utils.showSuccess(`Se encontraron ${resultado.productos.length} producto(s) con stock bajo. Se ha enviado una notificación por email.`);
+            } else {
+                Utils.showSuccess('No hay productos con stock bajo. ¡Todo está OK!');
+            }
+        } catch (error) {
+            console.error('Error verificando stock:', error);
+            Utils.showError('Error al verificar stock: ' + error.message);
+        }
+    },
+    
+    async configurarNotificaciones() {
+        try {
+            const config = await API.getConfiguracionNotificaciones();
+            
+            const content = `
+                <div class="form-group">
+                    <label>Email(s) para notificaciones</label>
+                    <input type="text" id="modal-email-notif" class="form-control" value="${Utils.esc(config.email_notificaciones || '')}" placeholder="email1@correo.com, email2@correo.com" required>
+                    <small>Se enviarán alertas de stock bajo a estos correos. Separa múltiples emails con comas.</small>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="modal-notif-activas" ${config.notificaciones_activas ? 'checked' : ''}>
+                        Activar notificaciones automáticas
+                    </label>
+                    <small style="display: block; margin-top: 5px;">Las notificaciones se enviarán automáticamente cada día según el trigger configurado</small>
+                </div>
+            `;
+            
+            Utils.showModal('Configurar notificaciones', content, async () => {
+                const emailsInput = document.getElementById('modal-email-notif').value.trim();
+                const activas = document.getElementById('modal-notif-activas').checked;
+                
+                if (!emailsInput) {
+                    Utils.showError('El email es obligatorio');
+                    throw new Error('Email requerido');
+                }
+                
+                // Separar emails por comas y validar cada uno
+                const emails = emailsInput.split(',').map(e => e.trim()).filter(e => e.length > 0);
+                const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                
+                // Validar que todos los emails sean válidos
+                const emailsInvalidos = emails.filter(email => !emailRegex.test(email));
+                if (emailsInvalidos.length > 0) {
+                    Utils.showError(`Email(s) con formato inválido: ${emailsInvalidos.join(', ')}`);
+                    throw new Error('Email(s) inválido(s)');
+                }
+                
+                try {
+                    // Guardar emails limpios (sin espacios extra)
+                    const emailsLimpios = emails.join(', ');
+                    
+                    await API.saveConfiguracionNotificaciones({
+                        email_notificaciones: emailsLimpios,
+                        notificaciones_activas: activas
+                    });
+                    
+                    const cantidadEmails = emails.length;
+                    const mensaje = cantidadEmails === 1 
+                        ? 'Configuración guardada correctamente'
+                        : `Configuración guardada. Se enviarán notificaciones a ${cantidadEmails} destinatarios`;
+                    Utils.showSuccess(mensaje);
+                } catch (error) {
+                    console.error('Error guardando configuración:', error);
+                    Utils.showError('Error al guardar configuración: ' + error.message);
+                    throw error;
+                }
+            });
+        } catch (error) {
+            console.error('Error cargando configuración:', error);
+            Utils.showError('Error al cargar configuración: ' + error.message);
+        }
+    }
+};
+
+// Historial
+// Links para clientes — cada cliente pide desde su propio link (pedir.html), sin usuario ni contraseña.
+const LinksClientes = {
+    datos: null,
+
+    urlDe(token) {
+        return `${location.origin}/pedir.html?l=${encodeURIComponent(token)}`;
+    },
+
+    async load() {
+        const tbody = document.getElementById('links-clientes-tbody');
+        if (!tbody) return;
+        if (!this._listo) {
+            this._listo = true;
+            document.getElementById('links-clientes').addEventListener('click', e => this._click(e));
+            document.getElementById('links-clientes').addEventListener('change', e => {
+                if (e.target.matches('[data-sin-stock]')) this._marcarSinStock(e.target);
+            });
+            document.getElementById('links-sin-stock-buscar').addEventListener('input', () => this._renderSinStock());
+        }
+        if (!this.datos) Utils.showTableLoader(tbody);
+        try {
+            this._aplicar(await API.request('links-clientes', 'GET'));
+        } catch (error) {
+            console.error('Error cargando links de clientes:', error);
+            Utils.hideTableLoader(tbody);
+            Utils.showError('No se pudieron cargar los links: ' + (error && error.message || ''));
+        }
+    },
+
+    _aplicar(datos) {
+        this.datos = datos;
+        this.render();
+    },
+
+    render() {
+        const tbody = document.getElementById('links-clientes-tbody');
+        const config = document.getElementById('links-config');
+        if (!tbody || !config || !this.datos) return;
+        Utils.hideTableLoader(tbody);
+        const c = this.datos.config;
+        const esFecha = /^\d{4}-\d{2}-\d{2}$/.test(String(c.dia));
+        config.innerHTML = `
+            <label class="links-check"><input type="checkbox" id="links-activo"${c.activo ? ' checked' : ''}> Recibir pedidos por link</label>
+            <label>Los clientes piden para
+                <select id="links-dia">
+                    <option value="manana"${c.dia === 'manana' ? ' selected' : ''}>mañana</option>
+                    <option value="hoy"${c.dia === 'hoy' ? ' selected' : ''}>hoy</option>
+                    <option value="fecha"${esFecha ? ' selected' : ''}>otra fecha</option>
+                </select>
+            </label>
+            <label id="links-fecha-label"${esFecha ? '' : ' hidden'}>Fecha
+                <input type="date" id="links-fecha" min="${Cuenta.hoyAR()}" value="${esFecha ? Utils.esc(c.dia) : ''}">
+            </label>
+            <button type="button" class="btn btn-primary" data-links="config">Guardar</button>
+            ${c.fecha ? `<small class="links-sin">Ahora los clientes están pidiendo para el ${Utils.esc(Cuenta.fechaLarga(c.fecha))}.</small>` : ''}`;
+        document.getElementById('links-dia').addEventListener('change', (e) => {
+            document.getElementById('links-fecha-label').hidden = e.target.value !== 'fecha';
+        });
+
+        this._renderSinStock();
+
+        const clientes = this.datos.clientes || [];
+        if (!clientes.length) {
+            tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No hay clientes cargados</td></tr>';
+            return;
+        }
+        tbody.innerHTML = clientes.map(cli => {
+            const id = Utils.esc(cli.id);
+            if (!cli.token) {
+                return `<tr><td>${Utils.esc(cli.nombre)}</td><td class="links-sin">Todavía no tiene link</td>
+                    <td><button type="button" class="btn btn-primary btn-sm" data-links="generar" data-id="${id}">Generar link</button></td></tr>`;
+            }
+            return `<tr><td>${Utils.esc(cli.nombre)}</td>
+                <td class="links-url">${Utils.esc(this.urlDe(cli.token))}</td>
+                <td><div class="links-botones">
+                    <button type="button" class="btn btn-primary btn-sm" data-links="copiar" data-id="${id}">Copiar</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-links="whatsapp" data-id="${id}">WhatsApp</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-links="nuevo" data-id="${id}">Link nuevo</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-links="quitar" data-id="${id}">Desactivar</button>
+                </div></td></tr>`;
+        }).join('');
+    },
+
+    // Productos sin stock: el cliente los ve marcados y no puede sumarlos.
+    _renderSinStock() {
+        const cont = document.getElementById('links-sin-stock');
+        if (!cont) return;
+        const q = (document.getElementById('links-sin-stock-buscar')?.value || '').trim().toLowerCase();
+        const productos = (this.datos.productos || []).slice()
+            .sort((a, b) => Number(b.sin_stock) - Number(a.sin_stock) || String(a.nombre).localeCompare(String(b.nombre), 'es'));
+        const cuantos = productos.filter(p => p.sin_stock).length;
+        document.getElementById('links-sin-stock-cuenta').textContent = cuantos ? `${cuantos} sin stock` : 'Todos con stock';
+        const visibles = productos.filter(p => !q || String(p.nombre).toLowerCase().includes(q));
+        cont.innerHTML = visibles.length ? visibles.map(p => `
+            <label class="links-prod${p.sin_stock ? ' sin' : ''}">
+                <input type="checkbox" data-sin-stock="${Utils.esc(p.id)}"${p.sin_stock ? ' checked' : ''}>
+                <span>${Utils.esc(p.nombre)}</span>
+            </label>`).join('') : '<p class="links-sin">No hay productos con ese nombre.</p>';
+    },
+
+    async _marcarSinStock(check) {
+        const sinStock = check.checked;
+        check.disabled = true;
+        try {
+            this._aplicar(await API.request('links-clientes/sin-stock', 'POST', { producto_id: check.dataset.sinStock, sin_stock: sinStock }));
+        } catch (error) {
+            check.checked = !sinStock;
+            check.disabled = false;
+            Utils.showError('No se pudo guardar: ' + (error && error.message || ''));
+        }
+    },
+
+    _cliente(id) {
+        return (this.datos?.clientes || []).find(c => String(c.id) === String(id));
+    },
+
+    async _click(e) {
+        const boton = e.target.closest('[data-links], #btn-links-generar-todos');
+        if (!boton || boton.disabled) return;
+        const accion = boton.id === 'btn-links-generar-todos' ? 'todos' : boton.dataset.links;
+        const cli = this._cliente(boton.dataset.id);
+        try {
+            if (accion === 'copiar') return await this._copiar(cli);
+            if (accion === 'whatsapp') return this._whatsapp(cli);
+            if (accion === 'config') {
+                const activo = document.getElementById('links-activo').checked;
+                let dia = document.getElementById('links-dia').value;
+                if (dia === 'fecha') {
+                    dia = document.getElementById('links-fecha').value;
+                    if (!dia) return Utils.showError('Elegí la fecha para la que piden los clientes');
+                }
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/config', 'POST', { activo, dia }));
+                }, 'Guardando...');
+                return Utils.avisar('Configuración guardada');
+            }
+            if (accion === 'todos') {
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/generar-todos', 'POST', {}));
+                }, 'Generando...');
+                return Utils.avisar('Links generados');
+            }
+            if (!cli) return;
+            if (accion === 'generar') {
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/generar', 'POST', { cliente_id: cli.id }));
+                }, 'Generando...');
+                return;
+            }
+            if (accion === 'nuevo') {
+                if (!await Utils.showConfirm(`¿Generar un link nuevo para "${cli.nombre}"?\n\nEl link anterior deja de funcionar y hay que pasarle el nuevo.`)) return;
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/generar', 'POST', { cliente_id: cli.id, regenerar: true }));
+                }, 'Generando...');
+                return Utils.avisar('Link nuevo generado');
+            }
+            if (accion === 'quitar') {
+                if (!await Utils.showConfirm(`¿Desactivar el link de "${cli.nombre}"?\n\nDeja de funcionar. Podés generar otro cuando quieras.`)) return;
+                await Utils.withButtonLoader(boton, async () => {
+                    this._aplicar(await API.request('links-clientes/desactivar', 'POST', { cliente_id: cli.id }));
+                }, 'Desactivando...');
+            }
+        } catch (error) {
+            Utils.showError('No se pudo completar: ' + (error && error.message || ''));
+        }
+    },
+
+    async _copiar(cli) {
+        if (!cli || !cli.token) return;
+        const url = this.urlDe(cli.token);
+        try {
+            await navigator.clipboard.writeText(url);
+            Utils.avisar(`Link de ${cli.nombre} copiado`);
+        } catch (error) {
+            window.prompt('Copiá el link:', url);
+        }
+    },
+
+    _whatsapp(cli) {
+        if (!cli || !cli.token) return;
+        const texto = `Hola ${cli.nombre}! Este es tu link para hacer el pedido: ${this.urlDe(cli.token)}`;
+        let tel = String(cli.telefono || '').replace(/\D/g, '').replace(/^00/, '').replace(/^0/, '');
+        if (tel && tel.length >= 10 && tel.length <= 11 && !tel.startsWith('54')) tel = '54' + tel;
+        window.open(`https://wa.me/${tel}?text=${encodeURIComponent(texto)}`, '_blank', 'noopener');
+    }
+};
+
+// Mantenimiento — reset completo de datos
+const Mantenimiento = {
+    CONFIRM_PHRASE: 'BORRAR TODO',
+
+    limpiarDatosLocales() {
+        CacheManager.clear();
+        sessionStorage.removeItem('sg_work_date');
+        localStorage.removeItem('precios-selected-cliente');
+        localStorage.removeItem('precios-comision');
+
+        AppState.currentDate = fechaHoyAR();
+        AppState.pedidos = [];
+        AppState.productos = [];
+        AppState.clientes = [];
+        AppState.proveedores = [];
+        AppState.recepcion = [];
+        AppState.precios = [];
+        AppState.cobranzas = [];
+        AppState.pagos = [];
+        AppState.stock = [];
+        AppState.cierres = [];
+
+        // Limpiar requests pendientes y bootstraps en vuelo
+        API._bootstrapPromise = null;
+        API._pending = {};
+        DataLoader.invalidate();
+        DiaOperativo.diasPendientes = [];
+        DiaOperativo.workDate = AppState.currentDate;
+        sessionStorage.setItem('sg_work_date', AppState.currentDate);
+    },
+
+    solicitarReset() {
+        const content = `
+            <p style="margin-bottom:12px;color:#991b1b;line-height:1.5;">
+                Vas a borrar <strong>todos</strong> los datos de la app.
+                Antes de borrar se guarda una <strong>copia completa</strong> en Google Drive, con la fecha de hoy.
+            </p>
+            <div class="form-group">
+                <label for="reset-confirm-input">Escribí <strong>${this.CONFIRM_PHRASE}</strong> para confirmar:</label>
+                <input type="text" id="reset-confirm-input" class="form-control" autocomplete="off" placeholder="${this.CONFIRM_PHRASE}">
+            </div>
+        `;
+
+        Utils.showModal('Eliminar todos los datos', content, async () => {
+            const input = document.getElementById('reset-confirm-input');
+            const valor = (input?.value || '').trim();
+            if (valor !== this.CONFIRM_PHRASE) {
+                Utils.showError(`Debes escribir exactamente: ${this.CONFIRM_PHRASE}`);
+                throw new Error('Confirmación incorrecta');
+            }
+            await this.ejecutarReset();
+        }, 'Eliminar todo');
+    },
+
+    async _despuesDeBorrar(resultado) {
+        this.limpiarDatosLocales();
+        CacheManager.clear();
+        await DiaOperativo.refresh();
+        const respaldo = resultado && resultado.respaldo;
+        if (respaldo && respaldo.nombre) {
+            Utils.showModal('Datos eliminados', `
+                <p>La app quedó vacía. Antes de borrar se guardó una copia completa de todos los datos en Google Drive:</p>
+                <p style="margin:12px 0;"><strong>${Utils.esc(respaldo.nombre)}</strong></p>
+                ${respaldo.url ? `<p><a href="${Utils.esc(respaldo.url)}" target="_blank" rel="noopener">Abrir la copia</a></p>` : ''}
+            `, null);
+        } else {
+            Utils.showSuccess('Todos los datos fueron eliminados. El sistema quedó limpio.');
+        }
+        Navigation.navigateTo('dashboard');
+    },
+
+    async ejecutarReset() {
+        Utils.showLoader();
+        try {
+            const resultado = await API.resetAllDatos(this.CONFIRM_PHRASE);
+            await this._despuesDeBorrar(resultado);
+        } catch (error) {
+            const mensaje = String(error.message || '');
+            const puedeHaberBorrado = mensaje.includes('No se pudo conectar') || mensaje.includes('tardó más de');
+            if (puedeHaberBorrado) {
+                try {
+                    CacheManager.clear();
+                    const [clientes, productos] = await Promise.all([
+                        API.request('clientes', 'GET'),
+                        API.request('productos', 'GET')
+                    ]);
+                    if ((clientes || []).length === 0 && (productos || []).length === 0) {
+                        await this._despuesDeBorrar();
+                        return;
+                    }
+                } catch (verifyError) {
+                    console.warn('No se pudo verificar el borrado:', verifyError.message);
+                }
+            }
+            console.error('Error en reset de datos:', error);
+            Utils.showError('Error al eliminar datos: ' + error.message);
+            throw error;
+        } finally {
+            Utils.hideLoader();
+        }
+    }
+};
+
+const Historial = {
+    async load() {
+        const tbody = document.getElementById('historial-tbody');
+        if (!tbody) return;
+        this.cargarDrive();
+        
+        const cached = CacheManager.peek('historial');
+        if (Array.isArray(cached)) {
+            AppState.cierres = cached;
+            this.render(cached);
+        } else {
+            Utils.showTableLoader(tbody);
+        }
+        
+        try {
+            const cierres = await API.getHistorial();
+            AppState.cierres = cierres; // Guardar en AppState
+            this.render(cierres);
+        } catch (error) {
+            console.error('Error loading historial:', error);
+            Utils.hideTableLoader(tbody);
+        }
+    },
+    
+    render(cierres) {
+        const tbody = document.getElementById('historial-tbody');
+        if (!tbody) return;
+        
+        // Ocultar loader local
+        Utils.hideTableLoader(tbody);
+        
+        tbody.innerHTML = '';
+        
+        if (cierres.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="3" style="text-align: center;">No hay historial disponible</td></tr>';
+            return;
+        }
+        
+        cierres.forEach(cierre => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${Utils.formatDate(cierre.fecha)}</td>
+                <td><span class="status-badge status-${cierre.estado || 'cerrado'}">${cierre.estado || 'Cerrado'}</span></td>
+                <td>
+                    <button class="btn btn-primary btn-table-action" onclick="Historial.verDia('${cierre.fecha}')">Ver día</button>
+                    <button class="btn btn-secondary btn-table-action" onclick="Historial.generarReportePDF('${Utils.fechaIso(cierre.fecha)}')">Descargar PDF</button>
+                    ${cierre.pdf_drive
+                        ? `<a class="btn btn-secondary btn-table-action" href="${Utils.esc(cierre.pdf_drive)}" target="_blank" rel="noopener">Ver en Drive</a>`
+                        : (String(cierre.estado || 'cerrado') === 'cerrado'
+                            ? `<button class="btn btn-secondary btn-table-action" onclick="Historial.guardarEnDrive('${Utils.fechaIso(cierre.fecha)}')">Guardar en Drive</button>`
+                            : '')}
+                </td>
+            `;
+            tbody.appendChild(tr);
+        });
+    },
+    
+    async verDia(fecha) {
+        const panel = document.getElementById('historial-detalle');
+        if (!panel) return;
+        panel.hidden = false;
+        panel.innerHTML = '<p class="historial-detalle-loading">Cargando el día...</p>';
+
+        try {
+            const [pedidos, recepciones, precios, cobranzas] = await Promise.all([
+                API.getPedidos(fecha).catch(() => []),
+                API.getRecepcion(fecha).catch(() => []),
+                API.getPreciosCliente(fecha).catch(() => []),
+                API.getCobranzas(fecha).catch(() => [])
+            ]);
+
+            const filasPedidos = (pedidos || []).map(p =>
+                `<tr><td>${Utils.esc(p.cliente_nombre || '')}</td><td>${Utils.esc(p.producto_nombre || '')}</td><td class="money">${p.cantidad || 0}</td></tr>`
+            ).join('') || '<tr><td colspan="3">Sin pedidos</td></tr>';
+
+            const filasRecepcion = (recepciones || []).map(r =>
+                `<tr><td>${Utils.esc(r.producto_nombre || '')}</td><td class="money">${r.llego || 0}</td><td class="money">${Utils.formatCurrency(r.precio_real || 0)}</td><td>${r.confirmado ? 'Confirmado' : 'Pendiente'}</td></tr>`
+            ).join('') || '<tr><td colspan="4">Sin recepción</td></tr>';
+
+            const filasPrecios = (precios || []).map(p => {
+                const cantidad = parseFloat(p.cantidad) || 0;
+                const unit = Utils.parsePrice(p.precio_cliente) || 0;
+                const comision = Utils.parseComision(p.comision_unitaria) || 0;
+                const total = Math.round(cantidad * unit) + Math.round(cantidad * comision);
+                return `<tr><td>${Utils.esc(p.cliente_nombre || '')}</td><td>${Utils.esc(p.producto_nombre || '')}</td><td class="money">${cantidad}</td><td class="money">${Utils.formatCurrency(unit)}</td><td class="money">${Utils.formatCurrency(total)}</td></tr>`;
+            }).join('') || '<tr><td colspan="5">Sin precios</td></tr>';
+
+            const filasCobranzas = (cobranzas || []).map(c =>
+                `<tr><td>${Utils.esc(c.cliente_nombre || '')}</td><td class="money">${Utils.formatCurrency(c.total || 0)}</td><td class="money">${Utils.formatCurrency(c.pagado || 0)}</td><td class="money ${Utils.parsePrice(c.saldo) > 0 ? 'money-alert' : ''}">${Utils.formatCurrency(c.saldo || 0)}</td></tr>`
+            ).join('') || '<tr><td colspan="4">Sin cobranzas</td></tr>';
+
+            panel.innerHTML = `
+                <div class="historial-detalle-head">
+                    <h3>Día ${Utils.formatDate(fecha)}</h3>
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-cerrar-detalle-dia">Cerrar detalle</button>
+                </div>
+                <h4>Pedidos</h4>
+                <table class="data-table"><thead><tr><th>Cliente</th><th>Producto</th><th>Cantidad</th></tr></thead><tbody>${filasPedidos}</tbody></table>
+                <h4>Recepción</h4>
+                <table class="data-table"><thead><tr><th>Producto</th><th>Llegó</th><th>Precio real</th><th>Estado</th></tr></thead><tbody>${filasRecepcion}</tbody></table>
+                <h4>Precios al cliente</h4>
+                <table class="data-table"><thead><tr><th>Cliente</th><th>Producto</th><th>Cant.</th><th>Precio</th><th>Total</th></tr></thead><tbody>${filasPrecios}</tbody></table>
+                <h4>Cobranzas</h4>
+                <table class="data-table"><thead><tr><th>Cliente</th><th>Total</th><th>Cobrado</th><th>Saldo</th></tr></thead><tbody>${filasCobranzas}</tbody></table>
+            `;
+            document.getElementById('btn-cerrar-detalle-dia')?.addEventListener('click', () => {
+                panel.hidden = true;
+                panel.innerHTML = '';
+            });
+            panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } catch (error) {
+            panel.innerHTML = `<p class="money-alert">No se pudo cargar el día: ${error.message}</p>`;
+        }
+    },
+
+    // Reporte del cierre en PDF (mismo diseño que los demás PDF de la app): ventas por cliente,
+    // lo que llegó, cobros, proveedores y caja de ese día. Al cerrar el día se baja y además se guarda
+    // en Google Drive; desde el historial se puede bajar o guardar en Drive. Los datos se piden al
+    // servidor en el momento.
+    async generarReportePDF(fecha, opciones = {}) {
+        const dia = Utils.fechaIso(fecha);
+        if (!dia) return;
+        const descargar = opciones.descargar !== false;
+        if (!opciones.silencioso) Utils.showLoader();
+        let doc = null;
+        try {
+            const [pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores] = await Promise.all([
+                API.request('pedidos', 'GET', { fecha: dia }),
+                API.request('recepcion', 'GET', { fecha: dia }),
+                API.request('precios-cliente', 'GET', { fecha: dia }),
+                API.request('cobranzas', 'GET', { fecha: dia }),
+                API.request('pagos-proveedores', 'GET'),
+                API.request('caja', 'GET'),
+                API.request('proveedores', 'GET')
+            ]);
+            doc = await Precios._pdfDesdeHtml(this._htmlReporte(dia, { pedidos, recepcion, precios, cobranzas, pagos, caja, proveedores }));
+            if (descargar) doc.save(`cierre-${dia}.pdf`);
+            if (descargar && !opciones.silencioso && !opciones.drive) Utils.avisar('Se descargó el reporte del día en PDF.');
+        } catch (error) {
+            console.error('Error generando reporte:', error);
+            Utils.showError('No se pudo armar el reporte del día: ' + error.message + '. Podés bajarlo después desde Historial de días.');
+            if (!opciones.silencioso) Utils.hideLoader();
+            return;
+        }
+        if (!opciones.drive) {
+            if (!opciones.silencioso) Utils.hideLoader();
+            return;
+        }
+        try {
+            const pdf = doc.output('datauristring').split(',')[1];
+            const guardado = await API.subirPdfCierre(dia, pdf);
+            this._marcarEnDrive(dia, guardado && guardado.url);
+            Utils.avisar(`El reporte del ${Utils.formatDate(dia)} quedó guardado en Google Drive.`);
+        } catch (error) {
+            console.error('Error guardando el reporte en Drive:', error);
+            Utils.showError(`No se pudo guardar el reporte del ${Utils.formatDate(dia)} en Google Drive: ${error.message}`
+                + (descargar ? ' El PDF igual se descargó en la computadora.' : '')
+                + ' Podés volver a intentarlo desde Historial de días con "Guardar en Drive".');
+        } finally {
+            if (!opciones.silencioso) Utils.hideLoader();
+        }
+    },
+
+    guardarEnDrive(fecha) {
+        return this.generarReportePDF(fecha, { descargar: false, drive: true });
+    },
+
+    _marcarEnDrive(dia, url) {
+        if (!url) return;
+        (AppState.cierres || []).forEach(c => {
+            if (Utils.fechaIso(c.fecha) === dia) c.pdf_drive = url;
+        });
+        CacheManager.invalidate('historial');
+        if (AppState.currentPage === 'historial') {
+            this.render(AppState.cierres || []);
+            this.cargarDrive();
+        }
+    },
+
+    // Carpeta de Drive con los reportes y con quién está compartida.
+    async cargarDrive() {
+        const caja = document.getElementById('historial-drive');
+        if (!caja) return;
+        try {
+            this._drive = await API.getDriveConfig();
+        } catch (error) {
+            caja.innerHTML = `<p class="historial-drive-texto">Los reportes de cierre se guardan en Google Drive. ${Utils.esc(error.message)}</p>`;
+            return;
+        }
+        this._pintarDrive();
+    },
+
+    _pintarDrive() {
+        const caja = document.getElementById('historial-drive');
+        if (!caja) return;
+        const drive = this._drive || {};
+        const emails = drive.compartida_con || [];
+        const lista = emails.length
+            ? emails.map(email => `<li><span>${Utils.esc(email)}</span> <button type="button" class="btn btn-secondary btn-sm" data-quitar-drive="${Utils.esc(email)}">Quitar</button></li>`).join('')
+            : '<li class="historial-drive-vacio">Todavía no está compartida con nadie.</li>';
+        caja.innerHTML = `
+            <div class="historial-drive-head">
+                <div>
+                    <h3>Reportes en Google Drive</h3>
+                    <p class="historial-drive-texto">Cada vez que se cierra un día, el reporte en PDF se guarda solo en una carpeta de Google Drive, ordenada por año y mes.</p>
+                </div>
+                ${drive.carpeta_url
+                    ? `<a class="btn btn-primary" href="${Utils.esc(drive.carpeta_url)}" target="_blank" rel="noopener">Abrir carpeta</a>`
+                    : '<span class="historial-drive-texto">La carpeta se crea con el primer cierre.</span>'}
+            </div>
+            <div class="historial-drive-compartir">
+                <label for="historial-drive-email">Compartir la carpeta con (Gmail):</label>
+                <div class="historial-drive-fila">
+                    <input type="email" id="historial-drive-email" class="form-control" placeholder="nombre@gmail.com" autocomplete="off">
+                    <button type="button" class="btn btn-secondary" id="btn-historial-drive-compartir">Compartir</button>
+                </div>
+                <ul class="historial-drive-lista">${lista}</ul>
+            </div>
+        `;
+        caja.querySelector('#btn-historial-drive-compartir').addEventListener('click', () => this.compartirDrive());
+        caja.querySelector('#historial-drive-email').addEventListener('keydown', e => {
+            if (e.key === 'Enter') this.compartirDrive();
+        });
+        caja.querySelectorAll('[data-quitar-drive]').forEach(boton => {
+            boton.addEventListener('click', () => this.quitarAccesoDrive(boton.dataset.quitarDrive));
+        });
+    },
+
+    async compartirDrive() {
+        const input = document.getElementById('historial-drive-email');
+        const email = String(input?.value || '').trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            Utils.showError('Escribí un email válido, por ejemplo nombre@gmail.com');
+            return;
+        }
+        Utils.showLoader();
+        try {
+            this._drive = await API.compartirDrive(email);
+            this._pintarDrive();
+            Utils.avisar(`Listo: ${email} ya puede ver la carpeta (Google le manda un email con el link).`);
+        } catch (error) {
+            Utils.showError('No se pudo compartir la carpeta: ' + error.message);
+        } finally {
+            Utils.hideLoader();
+        }
+    },
+
+    async quitarAccesoDrive(email) {
+        const confirmar = await Utils.showConfirm(`¿Sacarle a ${email} el acceso a la carpeta de reportes?`);
+        if (!confirmar) return;
+        Utils.showLoader();
+        try {
+            this._drive = await API.quitarAccesoDrive(email);
+            this._pintarDrive();
+            Utils.avisar(`${email} ya no tiene acceso a la carpeta.`);
+        } catch (error) {
+            Utils.showError('No se pudo quitar el acceso: ' + error.message);
+        } finally {
+            Utils.hideLoader();
+        }
+    },
+
+    _htmlReporte(dia, datos) {
+        const esc = Utils.esc;
+        const plata = n => Utils.formatCurrency(Math.round(Number(n) || 0));
+        const cant = n => String(Math.round((parseFloat(n) || 0) * 100) / 100).replace('.', ',');
+        const delDia = lista => (lista || []).filter(x => Utils.fechaIso(x.fecha) === dia);
+        const fechaTexto = new Date(dia + 'T12:00:00').toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+        const fechaLarga = fechaTexto.charAt(0).toUpperCase() + fechaTexto.slice(1);
+        const proveedorNombre = id => ((datos.proveedores || []).find(p => String(p.id) === String(id)) || {}).nombre || 'Sin proveedor';
+
+        // Ventas por cliente (las líneas de precios del día)
+        const porCliente = {};
+        (datos.precios || []).filter(p => (parseFloat(p.cantidad) || 0) > 0).forEach(p => {
+            const c = porCliente[p.cliente_id] || (porCliente[p.cliente_id] = { nombre: p.cliente_nombre || 'Cliente', lineas: [], comision: 0, cantidad: 0, precios: [] });
+            c.precios.push(p);
+            const cantidad = parseFloat(p.cantidad) || 0;
+            const precio = Utils.parsePrice(p.precio_cliente) || 0;
+            c.lineas.push({ producto: p.producto_nombre || 'Producto', cantidad, precio, total: Math.round(cantidad * precio) });
+            c.comision += Math.round(cantidad * (Utils.parseComision(p.comision_unitaria) || 0));
+            c.cantidad += cantidad;
+        });
+        const cobranzaDe = id => (datos.cobranzas || []).find(c => String(c.cliente_id) === String(id)) || {};
+        let totalVendido = 0, totalCobrado = 0, totalDebe = 0;
+        const bloquesClientes = Object.keys(porCliente).sort((a, b) => porCliente[a].nombre.localeCompare(porCliente[b].nombre, 'es')).map(id => {
+            const c = porCliente[id];
+            const cob = cobranzaDe(id);
+            const total = c.lineas.reduce((s, l) => s + l.total, 0) + c.comision;
+            const cobrado = Utils.parsePrice(cob.pagado) || 0;
+            const debe = cob.saldo !== undefined ? (Utils.parsePrice(cob.saldo) || 0) : Math.max(0, total - cobrado);
+            totalVendido += total; totalCobrado += cobrado; totalDebe += debe;
+            const filas = c.lineas.map((l, i) => `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(l.producto)}</td><td class="num">${cant(l.cantidad)}</td><td class="num">${plata(l.precio)}</td><td class="money">${plata(l.total)}</td></tr>`).join('');
+            const comision = Comisiones.resumen(c.precios).map(r => `<tr class="row-odd"><td>Comisión de reparto</td><td class="num">${cant(r.bultos)}</td><td class="num">${Utils.formatComision(r.tarifa)}</td><td class="money">${plata(r.total)}</td></tr>`).join('');
+            return `
+                <div class="cliente-box"><span class="name">${esc(c.nombre)}</span>
+                    <span class="meta">Total ${plata(total)} · Cobrado <b class="verde">${plata(cobrado)}</b> · Debe <b class="${debe > 0 ? 'rojo' : 'verde'}">${plata(debe)}</b></span></div>
+                <table><thead><tr><th>Producto</th><th class="num">Cant.</th><th class="num">Precio</th><th class="money">Total</th></tr></thead>
+                <tbody>${filas}${comision}</tbody></table>`;
+        }).join('') || '<p class="vacio">No hubo ventas este día.</p>';
+
+        // Lo que llegó
+        let totalMercaderia = 0;
+        const recibido = (datos.recepcion || []).filter(r => r.confirmado === true || r.confirmado === 'true');
+        const filasRecepcion = recibido.map((r, i) => {
+            const total = Math.round((parseFloat(r.llego) || 0) * (Utils.parsePrice(r.precio_real) || 0));
+            totalMercaderia += total;
+            return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(r.producto_nombre || '')}</td><td>${esc(r.proveedor_nombre || proveedorNombre(r.proveedor_id))}</td><td class="num">${cant(r.pedido_total)}</td><td class="num">${cant(r.llego)}</td><td class="num">${plata(r.precio_real)}</td><td class="money">${plata(total)}</td></tr>`;
+        }).join('');
+
+        // Proveedores: mercadería del día, lo pagado ese día y lo que se le debe hoy
+        const porProveedor = {};
+        recibido.forEach(r => {
+            const id = String(r.proveedor_id || '');
+            const p = porProveedor[id] || (porProveedor[id] = { mercaderia: 0, pagado: 0 });
+            p.mercaderia += Math.round((parseFloat(r.llego) || 0) * (Utils.parsePrice(r.precio_real) || 0));
+        });
+        const pagosDia = delDia(datos.pagos);
+        pagosDia.forEach(p => {
+            const id = String(p.proveedor_id || '');
+            const x = porProveedor[id] || (porProveedor[id] = { mercaderia: 0, pagado: 0 });
+            x.pagado += Utils.parsePrice(p.monto) || 0;
+        });
+        const totalPagado = pagosDia.reduce((s, p) => s + (Utils.parsePrice(p.monto) || 0), 0);
+        const filasProveedores = Object.keys(porProveedor).map((id, i) => {
+            const prov = (datos.proveedores || []).find(p => String(p.id) === id) || {};
+            const x = porProveedor[id];
+            return `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${esc(prov.nombre || 'Sin proveedor')}</td><td class="money">${plata(x.mercaderia)}</td><td class="money verde">${plata(x.pagado)}</td><td class="money ${(Utils.parsePrice(prov.saldo) || 0) > 0 ? 'rojo' : ''}">${plata(prov.saldo)}</td></tr>`;
+        }).join('');
+
+        // Caja del día
+        const movimientos = delDia(datos.caja);
+        const ingresos = movimientos.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + (Utils.parsePrice(m.monto) || 0), 0);
+        const egresos = movimientos.filter(m => m.tipo === 'egreso').reduce((s, m) => s + (Utils.parsePrice(m.monto) || 0), 0);
+        const filasCaja = movimientos.map((m, i) => `<tr class="${i % 2 ? 'row-odd' : 'row-even'}"><td>${m.tipo === 'egreso' ? 'Egreso' : 'Ingreso'}</td><td>${esc(m.nota || '')}</td><td class="money ${m.tipo === 'egreso' ? 'rojo' : 'verde'}">${plata(m.monto)}</td></tr>`).join('');
+
+        const tabla = (cabeza, filas, vacio) => filas
+            ? `<table><thead><tr>${cabeza}</tr></thead><tbody>${filas}</tbody></table>`
+            : `<p class="vacio">${vacio}</p>`;
+
+        return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Cierre del día</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-size: 12px; color: #1e293b; padding: 30px 36px; background: #fff; }
+                .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 3px solid #1a73e8; }
+                .brand h1 { font-size: 26px; font-weight: 700; color: #1a73e8; letter-spacing: -0.5px; }
+                .brand p { font-size: 12px; color: #64748b; margin-top: 4px; }
+                .doc-meta { text-align: right; font-size: 12px; color: #475569; line-height: 1.6; }
+                .doc-meta strong { color: #1e293b; display: block; font-size: 14px; margin-bottom: 2px; }
+                .resumen { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 18px; }
+                .resumen div { background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-radius: 8px; padding: 10px 12px; }
+                .resumen span { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #64748b; font-weight: 600; }
+                .resumen b { font-size: 17px; color: #1e293b; }
+                h2 { font-size: 15px; color: #1a73e8; margin: 18px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #dbeafe; }
+                .cliente-box { background: #f1f5f9; border-left: 4px solid #1a73e8; padding: 8px 12px; border-radius: 6px; margin: 10px 0 6px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+                .cliente-box .name { font-size: 14px; font-weight: 700; }
+                .cliente-box .meta { font-size: 11px; color: #475569; }
+                table { width: 100%; border-collapse: collapse; margin-bottom: 6px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+                thead th { background: linear-gradient(135deg, #1a73e8 0%, #1557b0 100%); color: #fff; padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+                thead th.num, thead th.money { text-align: right; }
+                tbody td { padding: 7px 10px; border-bottom: 1px solid #e2e8f0; }
+                .row-even { background: #fff; } .row-odd { background: #f8fafc; }
+                td.num { text-align: right; white-space: nowrap; }
+                td.money { text-align: right; white-space: nowrap; font-weight: 700; color: #1a73e8; }
+                .verde { color: #15803d !important; } .rojo { color: #dc2626 !important; }
+                .vacio { color: #64748b; padding: 8px 0; }
+                .footer { margin-top: 26px; padding-top: 12px; border-top: 1px solid #e2e8f0; text-align: center; font-size: 11px; color: #94a3b8; }
+            </style></head><body>
+            <div class="doc-header">
+                <div class="brand"><h1>Luciano Cargas</h1><p>Reporte de cierre del día</p></div>
+                <div class="doc-meta"><strong>${esc(fechaLarga)}</strong>Generado: ${esc(new Date().toLocaleString('es-AR', { hour12: false }))}<br>${(datos.pedidos || []).length} pedidos</div>
+            </div>
+            <div class="resumen">
+                <div><span>Vendido</span><b>${plata(totalVendido)}</b></div>
+                <div><span>Cobrado</span><b class="verde">${plata(totalCobrado)}</b></div>
+                <div><span>Quedó debiendo</span><b class="${totalDebe > 0 ? 'rojo' : ''}">${plata(totalDebe)}</b></div>
+                <div><span>Mercadería recibida</span><b>${plata(totalMercaderia)}</b></div>
+            </div>
+            <h2>Ventas por cliente</h2>
+            ${bloquesClientes}
+            <h2>Lo que llegó</h2>
+            ${tabla('<th>Producto</th><th>Proveedor</th><th class="num">Pedido</th><th class="num">Llegó</th><th class="num">Precio real</th><th class="money">Total</th>', filasRecepcion, 'No se confirmó mercadería este día.')}
+            <h2>Proveedores</h2>
+            ${tabla('<th>Proveedor</th><th class="money">Mercadería del día</th><th class="money">Pagado este día</th><th class="money">Le debés hoy</th>', filasProveedores, 'Sin movimientos con proveedores este día.')}
+            <p class="vacio">Total pagado a proveedores este día: <b>${plata(totalPagado)}</b></p>
+            <h2>Caja del día</h2>
+            ${tabla('<th>Tipo</th><th>Detalle</th><th class="money">Monto</th>', filasCaja, 'Sin movimientos de caja este día.')}
+            <p class="vacio">Ingresos <b class="verde">${plata(ingresos)}</b> · Egresos <b class="rojo">${plata(egresos)}</b> · Saldo del día <b>${plata(ingresos - egresos)}</b></p>
+            <div class="footer">Documento generado por el Sistema de Gestión Luciano Cargas</div>
+            </body></html>`;
+    },
+};
+
+const Caja = {
+    async load() {
+        const tbody = document.getElementById('caja-tbody');
+        if (!tbody) return;
+        const cached = CacheManager.peek('caja');
+        if (Array.isArray(cached)) this.render(cached);
+        else Utils.showTableLoader(tbody);
+        try {
+            const movimientos = await API.getCajaMovimientos();
+            this.render(Array.isArray(movimientos) ? movimientos : []);
+        } catch (error) {
+            Utils.hideTableLoader(tbody);
+            Utils.showError('Error al cargar la caja: ' + error.message);
+        }
+    },
+
+    render(movimientos) {
+        const tbody = document.getElementById('caja-tbody');
+        const fecha = document.getElementById('caja-fecha')?.value || AppState.currentDate;
+        Utils.hideTableLoader(tbody);
+
+        const delDia = movimientos.filter(m => String(m.fecha || '').slice(0, 10) === fecha);
+        const ingresosDia = delDia.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + Utils.parsePrice(m.monto), 0);
+        const egresosDia = delDia.filter(m => m.tipo === 'egreso').reduce((s, m) => s + Utils.parsePrice(m.monto), 0);
+        const ingresosAll = movimientos.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + Utils.parsePrice(m.monto), 0);
+        const egresosAll = movimientos.filter(m => m.tipo === 'egreso').reduce((s, m) => s + Utils.parsePrice(m.monto), 0);
+
+        const set = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = Utils.formatCurrency(value);
+        };
+        set('caja-ingresos', ingresosDia);
+        set('caja-egresos', egresosDia);
+        set('caja-saldo-dia', ingresosDia - egresosDia);
+        set('caja-saldo-total', ingresosAll - egresosAll);
+
+        if (delDia.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4">No hay movimientos de caja para esta fecha.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = delDia.map(m => `
+            <tr>
+                <td data-label="Tipo">${m.tipo === 'egreso' ? 'Egreso' : 'Ingreso'}</td>
+                <td data-label="Detalle">${Utils.esc(m.nota || '')}</td>
+                <td data-label="Monto" class="money ${m.tipo === 'egreso' ? 'money-alert' : ''}">${Utils.formatCurrency(m.monto || 0)}</td>
+                <td data-label="Referencia">${m.referencia || ''}</td>
+            </tr>
+        `).join('');
+    }
+};
+
+const Reparto = {
+    clientes: [],
+    proveedores: [],
+    _listo: false,
+
+    enganchar() {
+        const root = document.getElementById('reparto-root');
+        if (!root || this._listo) return;
+        this._listo = true;
+        root.addEventListener('click', (event) => {
+            const btn = event.target.closest('[data-reparto]');
+            if (!btn) return;
+            if (btn.dataset.reparto === 'agregar') this.agregarLinea();
+            if (btn.dataset.reparto === 'sacar') this.sacarLinea(btn.dataset.id);
+            if (btn.dataset.reparto === 'todo') this.ponerTodo(btn.dataset.id);
+            if (btn.dataset.reparto === 'guardar') this.guardar();
+        });
+        root.addEventListener('input', () => {
+            this._editando = true;
+            this._refrescarResumen();
+        });
+        root.addEventListener('change', (event) => {
+            this._editando = true;
+            if (event.target.id === 'reparto-cliente') {
+                const cliente = this.clientes.find(c => c.id === event.target.value);
+                const monto = document.getElementById('reparto-monto');
+                if (cliente && monto) monto.value = Utils.formatPrice(cliente.deuda);
+            }
+            this._refrescarResumen();
+        });
+    },
+
+    async load() {
+        const root = document.getElementById('reparto-root');
+        if (!root) return;
+        this.enganchar();
+        this._editando = false;
+        const token = (this._carga = (this._carga || 0) + 1);
+        // La lista de cobranzas que trae el arranque de la app solo incluye las que tienen saldo.
+        // Acá hace falta la completa: si falta la de un cliente que ya pagó todo hoy, se lo tomaría
+        // como que debe el total del día. Por eso se descarta esa versión parcial.
+        CacheManager.invalidate('cobranzas:all:all');
+        const local = this._datosLocales();
+        if (local.listo) this._aplicar(local.cobranzas, local.proveedores, local.precios);
+        else root.innerHTML = '<p class="camion-vacio">Buscando saldos…</p>';
+
+        Promise.all([
+            API.getCobranzas().catch(() => local.cobranzas),
+            API.getProveedores().catch(() => local.proveedores)
+        ]).then(([cobranzas, proveedores]) => {
+            if (this._carga !== token || AppState.currentPage !== 'reparto' || this._editando) return;
+            if (proveedores && proveedores.length) AppState.proveedores = proveedores;
+            this._cobranzasCompletas = cobranzas || [];
+            this._aplicar(cobranzas || [], proveedores || [], this._preciosHoy());
+        }).catch(error => console.error('Error cargando reparto:', error));
+    },
+
+    _preciosHoy() {
+        const fecha = AppState.currentDate;
+        return CacheManager.peek(`precios:${fecha}`)
+            || (AppState.fechaCargada === fecha ? AppState.precios : [])
+            || [];
+    },
+
+    _datosLocales() {
+        // Solo se muestra de inmediato lo que ya se leyó completo en esta sesión.
+        const cobranzas = this._cobranzasCompletas || [];
+        const proveedores = CacheManager.peek('proveedores') || AppState.proveedores || [];
+        const precios = this._preciosHoy();
+        return {
+            cobranzas: Array.isArray(cobranzas) ? cobranzas : [],
+            proveedores: Array.isArray(proveedores) ? proveedores : [],
+            precios: Array.isArray(precios) ? precios : [],
+            listo: !!this._cobranzasCompletas && proveedores && proveedores.length > 0
+        };
+    },
+
+    _totalesHoy(precios, cobranzas) {
+        const cubiertos = new Set(
+            (cobranzas || [])
+                .filter(cobranza => Utils.fechaIso(cobranza.fecha) === AppState.currentDate)
+                .map(cobranza => String(cobranza.cliente_id))
+        );
+        const map = new Map();
+        (precios || []).forEach(precio => {
+            const id = String(precio.cliente_id || '');
+            if (!id || cubiertos.has(id)) return;
+            const cantidad = parseFloat(precio.cantidad) || 0;
+            const unit = Utils.parsePrice(precio.precio_cliente);
+            const comision = Utils.parseComision(precio.comision_unitaria);
+            const subtotal = Math.round(cantidad * unit) + Math.round(cantidad * comision);
+            if (subtotal <= 0) return;
+            map.set(id, (map.get(id) || 0) + subtotal);
+        });
+        return [...map.entries()].map(([cliente_id, saldo]) => ({
+            cliente_id,
+            cliente_nombre: this._nombreCliente(cliente_id),
+            saldo
+        }));
+    },
+
+    _aplicar(cobranzas, proveedores, precios) {
+        if (!AppState.clientes.length) {
+            AppState.clientes = CacheManager.get('clientes') || [];
+        }
+        const clientes = this._deudas(cobranzas, this._totalesHoy(precios, cobranzas));
+        const listaProv = (proveedores || [])
+            .filter(p => Utils.parsePrice(p.saldo) > 0)
+            .sort((a, b) => String(a.nombre || '').localeCompare(String(b.nombre || ''), 'es'));
+        const firma = clientes.map(c => c.id + ':' + c.deuda).join('|')
+            + '#' + listaProv.map(p => String(p.id) + ':' + Utils.parsePrice(p.saldo)).join('|');
+        if (firma === this._firma && document.getElementById('reparto-cliente')) return;
+        this._firma = firma;
+        this.clientes = clientes;
+        this.proveedores = listaProv;
+        this.render();
+    },
+
+    _nombreCliente(id) {
+        const cliente = (AppState.clientes || []).find(c => String(c.id) === String(id));
+        return cliente?.nombre || 'Cliente';
+    },
+
+    _deudas(cobranzas, totalesHoy) {
+        const map = new Map();
+        (cobranzas || []).forEach(cobranza => {
+            const saldo = Utils.parsePrice(cobranza.saldo);
+            if (saldo <= 0) return;
+            const id = String(cobranza.cliente_id);
+            const actual = map.get(id) || {
+                id,
+                nombre: cobranza.cliente_nombre || this._nombreCliente(id),
+                deuda: 0,
+                tieneFilaHoy: false
+            };
+            actual.deuda += saldo;
+            if (cobranza.cliente_nombre) actual.nombre = cobranza.cliente_nombre;
+            if (Utils.fechaIso(cobranza.fecha) === AppState.currentDate) actual.tieneFilaHoy = true;
+            map.set(id, actual);
+        });
+        (totalesHoy || []).forEach(total => {
+            const saldo = Utils.parsePrice(total.saldo);
+            if (saldo <= 0) return;
+            const id = String(total.cliente_id);
+            const actual = map.get(id);
+            if (actual?.tieneFilaHoy) return;
+            if (actual) {
+                actual.deuda += saldo;
+                return;
+            }
+            map.set(id, {
+                id,
+                nombre: total.cliente_nombre || this._nombreCliente(id),
+                deuda: saldo,
+                tieneFilaHoy: false
+            });
+        });
+        return [...map.values()]
+            .map(cliente => ({ ...cliente, deuda: Math.round(cliente.deuda) }))
+            .filter(cliente => cliente.deuda > 0)
+            .sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    _opcionesProveedor(elegido) {
+        return this.proveedores.map(p => {
+            const id = String(p.id);
+            const selected = id === String(elegido) ? ' selected' : '';
+            return `<option value="${id}"${selected}>${this._esc(p.nombre)} · debe ${this._esc(Utils.formatCurrency(p.saldo))}</option>`;
+        }).join('');
+    },
+
+    _esc(valor) {
+        return String(valor ?? '').replace(/[&<>"']/g, char => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[char]));
+    },
+
+    render() {
+        const root = document.getElementById('reparto-root');
+        if (!root) return;
+        if (!this.clientes.length) {
+            root.innerHTML = '<p class="camion-vacio">Ningún cliente tiene saldo para descontar. El efectivo se anota cuando ya hay un precio o una cobranza pendiente.</p>';
+            return;
+        }
+        const primero = this.clientes[0];
+        const opciones = this.clientes.map(c =>
+            `<option value="${c.id}">${this._esc(c.nombre)} · debe ${this._esc(Utils.formatCurrency(c.deuda))}</option>`
+        ).join('');
+        const linea = this._lineaHtml({ id: 'l-' + Date.now(), proveedor_id: '', monto: '' });
+        root.innerHTML = `
+            <section class="reparto-card">
+                <label for="reparto-cliente">Entró de</label>
+                <select id="reparto-cliente" class="form-control">${opciones}</select>
+                <p class="reparto-deuda" id="reparto-deuda">Le descontás el saldo a ${this._esc(primero.nombre)}.</p>
+                <label for="reparto-monto">Efectivo que entró</label>
+                <input id="reparto-monto" class="form-control" data-price-input="true" inputmode="numeric" value="${Utils.formatPrice(primero.deuda)}">
+            </section>
+            <section class="reparto-card">
+                <h3>De eso le das</h3>
+                <div id="reparto-lineas">${linea}</div>
+                <button type="button" class="btn btn-secondary" data-reparto="agregar">Agregar proveedor</button>
+            </section>
+            <div class="reparto-resumen" id="reparto-resumen"></div>
+            <button type="button" class="btn btn-primary reparto-guardar" id="btn-reparto-guardar" data-reparto="guardar">Descontar saldos</button>
+        `;
+        Utils.enablePriceInputs(root);
+        this._refrescarResumen();
+    },
+
+    _lineaHtml(linea) {
+        return `
+            <div class="reparto-linea" data-id="${linea.id}">
+                <select class="form-control reparto-prov">
+                    <option value="">Proveedor</option>
+                    ${this._opcionesProveedor(linea.proveedor_id)}
+                </select>
+                <input class="form-control reparto-parte" data-price-input="true" inputmode="numeric" placeholder="0" value="${linea.monto ? this._esc(linea.monto) : ''}">
+                <button type="button" class="btn btn-secondary btn-sm" data-reparto="todo" data-id="${linea.id}">Todo</button>
+                <button type="button" class="btn btn-danger btn-sm" data-reparto="sacar" data-id="${linea.id}" aria-label="Sacar proveedor">×</button>
+            </div>
+        `;
+    },
+
+    _lineasActuales() {
+        return [...document.querySelectorAll('#reparto-lineas .reparto-linea')].map(row => ({
+            id: row.dataset.id,
+            proveedor_id: row.querySelector('select')?.value || '',
+            monto: row.querySelector('input')?.value || ''
+        }));
+    },
+
+    agregarLinea() {
+        const cont = document.getElementById('reparto-lineas');
+        if (!cont) return;
+        cont.insertAdjacentHTML('beforeend', this._lineaHtml({ id: 'l-' + Date.now(), proveedor_id: '', monto: '' }));
+        Utils.enablePriceInputs(cont);
+        this._refrescarResumen();
+    },
+
+    sacarLinea(id) {
+        const filas = this._lineasActuales();
+        if (filas.length <= 1) {
+            const row = document.querySelector(`#reparto-lineas .reparto-linea[data-id="${id}"]`);
+            if (!row) return;
+            row.querySelector('select').value = '';
+            row.querySelector('input').value = '';
+            this._refrescarResumen();
+            return;
+        }
+        document.querySelector(`#reparto-lineas .reparto-linea[data-id="${id}"]`)?.remove();
+        this._refrescarResumen();
+    },
+
+    ponerTodo(id) {
+        const row = document.querySelector(`#reparto-lineas .reparto-linea[data-id="${id}"]`);
+        if (!row) return;
+        const proveedorId = row.querySelector('select')?.value;
+        const proveedor = this.proveedores.find(p => String(p.id) === String(proveedorId));
+        if (!proveedor) {
+            Utils.showError('Elegí el proveedor.');
+            return;
+        }
+        const entro = Utils.parsePrice(document.getElementById('reparto-monto')?.value);
+        const otros = this._lineasActuales()
+            .filter(linea => linea.id !== id)
+            .reduce((suma, linea) => suma + Utils.parsePrice(linea.monto), 0);
+        const disponible = Math.max(0, entro - otros);
+        const saldo = Utils.parsePrice(proveedor.saldo);
+        const monto = Math.min(saldo, disponible || saldo);
+        row.querySelector('input').value = Utils.formatPrice(monto);
+        this._refrescarResumen();
+    },
+
+    _refrescarResumen() {
+        const caja = document.getElementById('reparto-resumen');
+        const deuda = document.getElementById('reparto-deuda');
+        if (!caja) return;
+        const clienteId = document.getElementById('reparto-cliente')?.value;
+        const cliente = this.clientes.find(c => c.id === clienteId);
+        if (deuda && cliente) deuda.textContent = `${cliente.nombre} debe ${Utils.formatCurrency(cliente.deuda)}.`;
+        const entro = Utils.parsePrice(document.getElementById('reparto-monto')?.value);
+        const sale = this._lineasActuales().reduce((suma, linea) => suma + Utils.parsePrice(linea.monto), 0);
+        const queda = entro - sale;
+        let aviso = '';
+        if (cliente && entro > cliente.deuda) aviso = `Supera lo que debe ${cliente.nombre} (${Utils.formatCurrency(cliente.deuda)}).`;
+        else if (sale > entro) aviso = 'Estás repartiendo más de lo que entró.';
+        caja.innerHTML = `
+            <p>Entró <strong>${Utils.formatCurrency(entro)}</strong></p>
+            <p>Repartís <strong>${Utils.formatCurrency(sale)}</strong></p>
+            <p>Queda en la caja <strong>${Utils.formatCurrency(queda)}</strong></p>
+            ${aviso ? `<p class="reparto-aviso">${this._esc(aviso)}</p>` : ''}
+        `;
+    },
+
+    async guardar() {
+        const btn = document.getElementById('btn-reparto-guardar');
+        if (btn?.disabled) return;
+        const clienteId = document.getElementById('reparto-cliente')?.value;
+        const cliente = this.clientes.find(c => c.id === clienteId);
+        const monto = Utils.parsePrice(document.getElementById('reparto-monto')?.value);
+        const pagos = this._lineasActuales()
+            .filter(linea => linea.proveedor_id && Utils.parsePrice(linea.monto) > 0)
+            .map(linea => ({ proveedor_id: linea.proveedor_id, monto: Utils.parsePrice(linea.monto) }));
+        if (!cliente) {
+            Utils.showError('Elegí el cliente.');
+            return;
+        }
+        if (monto <= 0) {
+            Utils.showError('Poné cuánto entró en efectivo.');
+            return;
+        }
+        if (monto > cliente.deuda) {
+            Utils.showError(`${cliente.nombre} debe ${Utils.formatCurrency(cliente.deuda)}.`);
+            return;
+        }
+        const sale = pagos.reduce((suma, pago) => suma + pago.monto, 0);
+        if (sale > monto) {
+            Utils.showError('Estás repartiendo más de lo que entró.');
+            return;
+        }
+        const porProveedor = new Map();
+        pagos.forEach(pago => {
+            porProveedor.set(pago.proveedor_id, (porProveedor.get(pago.proveedor_id) || 0) + pago.monto);
+        });
+        for (const [id, total] of porProveedor) {
+            const proveedor = this.proveedores.find(p => String(p.id) === String(id));
+            const saldo = Utils.parsePrice(proveedor?.saldo);
+            if (total > saldo) {
+                Utils.showError(`${proveedor?.nombre || 'El proveedor'} tiene saldo ${Utils.formatCurrency(saldo)}.`);
+                return;
+            }
+        }
+        if (btn) btn.disabled = true;
+        try {
+            const resultado = await API.repartirEfectivo({
+                fecha: AppState.currentDate,
+                cliente_id: clienteId,
+                monto,
+                pagos
+            });
+            Utils.avisar(`Listo. ${cliente.nombre} bajó ${Utils.formatCurrency(resultado.cobrado)}. En la caja quedan ${Utils.formatCurrency(resultado.queda)}.`);
+            AppState.proveedores = [];
+            await this.load();
+        } catch (error) {
+            const mensaje = error && error.message ? error.message : 'No se pudo repartir';
+            if (mensaje.includes('Endpoint no encontrado')) {
+                Utils.showError('Publicá el script para que el reparto descuente los saldos.');
+            } else {
+                Utils.showError(mensaje);
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+};
+
+// Carga inicial unificada (1 sola llamada JSONP al backend)
+const DataLoader = {
+    _bootstrapPromise: null,
+    _bootstrapFecha: null,
+
+    bootstrap(fecha = AppState.currentDate) {
+        const cacheKey = `bootstrap:${fecha}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) {
+            this._hydrate(cached, fecha);
+            return Promise.resolve(cached);
+        }
+
+        if (this._bootstrapPromise && this._bootstrapFecha === fecha) {
+            return this._bootstrapPromise;
+        }
+
+        this._bootstrapFecha = fecha;
+        this._bootstrapPromise = API.getBootstrap(fecha, true)
+            .then(data => {
+                this._hydrate(data, fecha);
+                return data;
+            })
+            .finally(() => {
+                this._bootstrapPromise = null;
+                this._bootstrapFecha = null;
+                API._bootstrapPromise = null;
+            });
+        API._bootstrapPromise = this._bootstrapPromise;
+        return this._bootstrapPromise;
+    },
+
+    _hydrate(data, fecha) {
+        if (data.clientes) AppState.clientes = data.clientes;
+        if (data.productos) AppState.productos = data.productos;
+        if (data.proveedores) AppState.proveedores = data.proveedores;
+        if (data.diasPendientes) DiaOperativo.diasPendientes = data.diasPendientes;
+
+        const dash = data.dashboard || data;
+        if (dash.pedidos) AppState.pedidos = dash.pedidos;
+        if (dash.recepcion) AppState.recepcion = dash.recepcion;
+        if (dash.precios) AppState.precios = dash.precios;
+        if (dash.pedidos || dash.recepcion || dash.precios) AppState.fechaCargada = fecha;
+        if (dash.cobranzas) AppState.cobranzas = dash.cobranzas;
+        if (dash.stock) AppState.stock = dash.stock;
+    },
+
+    invalidate() {
+        this._bootstrapPromise = null;
+        this._bootstrapFecha = null;
+        API._bootstrapPromise = null;
+        CacheManager.invalidatePattern('bootstrap:');
+    },
+
+    _flujoPromise: null,
+    _flujoFecha: null,
+    _flujoToken: 0,
+
+    armarFlujoLocal(fecha = AppState.currentDate) {
+        const cacheKey = `flujo:${fecha}`;
+        const cached = CacheManager.get(cacheKey);
+        if (cached) return cached;
+
+        const pedidos = CacheManager.get(`pedidos:${fecha}`);
+        const recepcion = CacheManager.get(`recepcion:${fecha}`);
+        const precios = CacheManager.get(`precios:${fecha}`);
+        if (!Array.isArray(pedidos) || !Array.isArray(recepcion) || !Array.isArray(precios)) {
+            return null;
+        }
+
+        const armado = { fecha, pedidos, recepcion, precios };
+        CacheManager.set(cacheKey, armado);
+        return armado;
+    },
+
+    getFlujo(fecha = AppState.currentDate) {
+        const local = this.armarFlujoLocal(fecha);
+        if (local) {
+            this._hydrateFlujo(local, fecha);
+            return Promise.resolve(local);
+        }
+        if (this._bootstrapPromise && this._bootstrapFecha === fecha) {
+            return this._bootstrapPromise.then(() => {
+                const despues = this.armarFlujoLocal(fecha);
+                if (despues) {
+                    this._hydrateFlujo(despues, fecha);
+                    return despues;
+                }
+                return this._pedirFlujo(fecha);
+            });
+        }
+        return this._pedirFlujo(fecha);
+    },
+
+    _pedirFlujo(fecha) {
+        if (this._flujoPromise && this._flujoFecha === fecha) {
+            return this._flujoPromise;
+        }
+        const token = this._flujoToken;
+        this._flujoFecha = fecha;
+        this._flujoPromise = API.getFlujoDia(fecha)
+            .then(data => {
+                if (token !== this._flujoToken) return data;
+                this._hydrateFlujo(data, fecha);
+                return data;
+            })
+            .catch(err => {
+                this._flujoPromise = null;
+                this._flujoFecha = null;
+                throw err;
+            });
+        return this._flujoPromise;
+    },
+
+    prefetchFlujo(fecha = AppState.currentDate) {
+        if (CacheManager.get(`flujo:${fecha}`)) return;
+        this.getFlujo(fecha).catch(() => {});
+    },
+
+    _hydrateFlujo(data, fecha) {
+        if (data.pedidos) {
+            AppState.pedidos = data.pedidos;
+            CacheManager.set(`pedidos:${fecha}`, data.pedidos);
+        }
+        if (data.recepcion) {
+            // En la pantalla de Recepción la lista incluye también los productos pedidos que todavía no
+            // tienen fila guardada. Lo que llega del servidor solo trae los guardados: si se pisara,
+            // esos productos desaparecerían de la memoria y "Confirmar todos" no los vería.
+            // (Pasa al armar la lista de precios en segundo plano tras confirmar un producto.)
+            const enRecepcion = AppState.currentPage === 'recepcion' || AppState.currentPage === 'recepcion-pendientes';
+            if (!enRecepcion) AppState.recepcion = data.recepcion;
+            CacheManager.set(`recepcion:${fecha}`, data.recepcion);
+        }
+        if (data.precios) {
+            AppState.precios = data.precios;
+            CacheManager.set(`precios:${fecha}`, data.precios);
+        }
+        AppState.fechaCargada = fecha;
+        CacheManager.set(`flujo:${fecha}`, data);
+    },
+
+    invalidateFlujo(fecha = AppState.currentDate) {
+        CacheManager.invalidate(`flujo:${fecha}`);
+        CacheManager.invalidate(`pedidos:${fecha}`);
+        CacheManager.invalidate(`recepcion:${fecha}`);
+        CacheManager.invalidate(`precios:${fecha}`);
+        this._flujoToken += 1;
+        this._flujoPromise = null;
+        this._flujoFecha = null;
+    }
+};
+
+// Inicialización
+document.addEventListener('DOMContentLoaded', async () => {
+    if (window.__sinSesion) return; // sin sesión válida: ya se está yendo al ingreso
+    Navigation.init();
+    Navigation.aplicarPermisos();
+    DiaOperativo.init();
+    Sync.iniciar();
+    PlanillaPedidos.reanudar();
+
+    const cachedDias = CacheManager.get('flujo:dias-pendientes');
+    if (Array.isArray(cachedDias) && cachedDias.length) {
+        DiaOperativo.diasPendientes = cachedDias;
+    }
+    try {
+        await DiaOperativo.resolveWorkDate({ skipRefresh: true });
+    } catch (error) {
+        AppState.currentDate = DiaOperativo.today();
+    }
+    
+    const addButtonListener = (buttonId, handler, loadingText = 'Cargando...', options = {}) => {
+        const useButtonLoader = options.useButtonLoader !== false;
+        const btn = document.getElementById(buttonId);
+        if (btn) {
+            btn.addEventListener('click', async (e) => {
+                e.preventDefault();
+                
+                if (btn.disabled || btn.classList.contains('loading')) {
+                    return;
+                }
+                
+                try {
+                    if (useButtonLoader) {
+                        await Utils.withButtonLoader(btn, handler, loadingText);
+                    } else {
+                        await handler();
+                    }
+                } catch (error) {
+                    console.error(`Error en ${buttonId}:`, error);
+                    Utils.showError('Ocurrió un error: ' + error.message);
+                }
+            });
+        } else {
+            console.warn(`⚠️ Botón ${buttonId} no encontrado`);
+        }
+    };
+    
+    // Registrar todos los event listeners con textos de loading personalizados
+    addButtonListener('btn-agregar-cliente', () => Clientes.add(), 'Cargando...');
+    addButtonListener('btn-agregar-producto', () => Productos.add(), 'Cargando...');
+    addButtonListener('btn-agregar-proveedor', () => ProveedoresGestion.add(), 'Cargando...');
+    ProveedoresGestion.initActions();
+    addButtonListener('btn-agregar-pedido', () => Pedidos.add(), 'Cargando...');
+    addButtonListener('btn-guardar-pedidos', () => Pedidos.enviarPendientes(), 'Preparando...');
+    addButtonListener('btn-confirmar-recepcion-todo', () => Recepcion.confirmarCompletos(), 'Confirmando...', { useButtonLoader: false });
+    addButtonListener('btn-generar-lista-precios', () => Precios.generarLista(), 'Generando...');
+    addButtonListener('btn-guardar-precios', () => Precios.save(), 'Guardando...');
+    addButtonListener('btn-limpiar-filtro', () => Precios.limpiarFiltro(), 'Limpiando...');
+    addButtonListener('btn-exportar-pdf-precios', () => Precios.enviarExcel(), 'Preparando...');
+    addButtonListener('btn-reset-todos-datos', () => Mantenimiento.solicitarReset(), 'Eliminando...', { useButtonLoader: false });
+    
+    // Event listeners para filtros de precios
+    const preciosFiltroCliente = document.getElementById('precios-filtro-cliente');
+    if (preciosFiltroCliente) {
+        preciosFiltroCliente.addEventListener('change', (e) => {
+            Precios.filterByCliente(e.target.value || null);
+        });
+    }
+    
+    const preciosBuscador = document.getElementById('precios-buscador');
+    if (preciosBuscador) {
+        preciosBuscador.addEventListener('input', (e) => {
+            // Al borrar el texto se quita el cliente elegido y vuelven todos
+            if (!e.target.value.trim() && Precios.selectedClienteId) Precios.elegirCliente(null);
+            Precios._mostrarSugerencias(e.target.value);
+        });
+        preciosBuscador.addEventListener('keydown', (e) => Precios._teclaBuscador(e));
+        preciosBuscador.addEventListener('blur', () => Precios._ocultarSugerencias());
+    }
+
+    const preciosComision = document.getElementById('precios-comision');
+    if (preciosComision) {
+        preciosComision.addEventListener('change', () => {
+            Precios.updateComision();
+        });
+        preciosComision.addEventListener('input', () => {
+            Precios.updateComision();
+        });
+    }
+    const preciosTbody = document.getElementById('precios-tbody');
+    if (preciosTbody) {
+        const esCampoPrecio = el => el.classList && (el.classList.contains('precio-cliente') || el.classList.contains('precio-real'));
+        preciosTbody.addEventListener('input', (e) => {
+            if (!esCampoPrecio(e.target)) return;
+            Precios._tocadas.add(String(e.target.getAttribute('data-id')));
+            Precios.refrescarCalculo();
+        });
+        preciosTbody.addEventListener('focusin', (e) => {
+            if (esCampoPrecio(e.target)) e.target.dataset.alEntrar = e.target.value;
+        });
+        preciosTbody.addEventListener('focusout', (e) => {
+            if (!esCampoPrecio(e.target)) return;
+            Precios.onPrecioChange();
+            if (e.target.classList.contains('precio-cliente') && e.target.value !== e.target.dataset.alEntrar) {
+                Precios.propagarPrecio(e.target);
+            }
+        });
+        // Flechas: arriba/abajo pasan al campo de la fila anterior/siguiente (mismo tipo de precio);
+        // izquierda/derecha, al borde del texto, pasan entre precio real y precio al cliente.
+        preciosTbody.addEventListener('keydown', (e) => {
+            if (!esCampoPrecio(e.target)) return;
+            const campo = e.target;
+            const mover = (destino) => {
+                if (!destino) return;
+                e.preventDefault();
+                destino.focus();
+                destino.select();
+            };
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                const clase = campo.classList.contains('precio-cliente') ? '.precio-cliente' : '.precio-real';
+                const campos = [...preciosTbody.querySelectorAll(`tr:not(.fila-oculta) ${clase}`)];
+                const i = campos.indexOf(campo);
+                mover(campos[i + (e.key === 'ArrowDown' ? 1 : -1)]);
+            } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                const alFinal = campo.selectionStart === campo.value.length && campo.selectionEnd === campo.value.length;
+                const alInicio = campo.selectionStart === 0 && campo.selectionEnd === 0;
+                if (e.key === 'ArrowRight' && !alFinal) return;
+                if (e.key === 'ArrowLeft' && !alInicio) return;
+                const fila = [...campo.closest('tr').querySelectorAll('input.precio-real, input.precio-cliente')];
+                mover(fila[fila.indexOf(campo) + (e.key === 'ArrowRight' ? 1 : -1)]);
+            }
+        });
+        const mismoPrecio = document.getElementById('precios-mismo-precio');
+        if (mismoPrecio) {
+            mismoPrecio.checked = Precios.mismoPrecio;
+            mismoPrecio.addEventListener('change', () => { Precios.mismoPrecio = mismoPrecio.checked; });
+        }
+    }
+    Utils.enablePriceInputs(document);
+    addButtonListener('btn-seguir-recepcion', () => Navigation.navigateTo('camiones'), 'Abriendo...');
+    addButtonListener('btn-camiones-agregar', () => Camiones.agregar(), 'Agregando...', { useButtonLoader: false });
+    addButtonListener('btn-camiones-imprimir', () => Camiones.imprimirTodos(), 'Imprimiendo...', { useButtonLoader: false });
+    addButtonListener('btn-camiones-excel', () => Camiones.descargarExcel(null), 'Armando Excel...', { useButtonLoader: false });
+    addButtonListener('btn-camiones-enviar', () => Camiones.enviarTodos(), 'Preparando...', { useButtonLoader: false });
+    addButtonListener('btn-seguir-desde-camiones', () => Navigation.navigateTo('pedidos'), 'Abriendo...');
+    Camiones.enganchar();
+    addButtonListener('btn-seguir-precios', () => Navigation.navigateTo('precios'), 'Abriendo...');
+    addButtonListener('btn-seguir-cobros', () => Navigation.navigateTo('cobros-hoy'), 'Abriendo...');
+    addButtonListener('btn-seguir-cobranzas', () => Navigation.navigateTo('pagos'), 'Abriendo...');
+    addButtonListener('btn-seguir-pagos', () => Navigation.navigateTo('pagos-pendientes'), 'Abriendo...');
+    addButtonListener('btn-agregar-cobranza', () => Cobranzas.agregar(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-agregar-pago-pendiente', () => Pagos.agregar(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-historial-pagos', () => Pagos.historial(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-cuenta-proveedor', () => Pagos.cuenta(), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-cuenta-cliente', () => Cuenta.abrir('cliente'), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-cuenta-cliente-hoy', () => Cuenta.abrir('cliente'), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-seguir-cierre', () => Navigation.navigateTo('cierre'), 'Abriendo...');
+    addButtonListener('btn-volver-cierre', () => Navigation.navigateTo('pagos'), 'Volviendo...');
+    addButtonListener('btn-cerrar-dia', () => Cierre.cerrar(), 'Cerrando día...', { useButtonLoader: false });
+    addButtonListener('btn-ajustar-stock', () => Stock.ajustar(), 'Ajustando...');
+    addButtonListener('btn-verificar-stock', () => Stock.verificarStockBajo(), 'Verificando...');
+    addButtonListener('btn-saldos-pdf', () => Dashboard.descargarPdfSaldos('ambos'), 'Armando PDF...');
+    addButtonListener('btn-precios-planilla-excel', () => Precios.descargarPlanillaExcel(), 'Armando Excel...');
+    addButtonListener('btn-config-notificaciones', () => Stock.configurarNotificaciones(), 'Cargando...');
+    // Repartir efectivo está desactivado por ahora (sus botones y su pantalla están comentados en index.html).
+    // Para reactivarlo: descomentar esos bloques; el resto del código (Reparto, API y servidor) sigue acá.
+    addButtonListener('btn-ir-reparto', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-caja-repartir', () => Navigation.navigateTo('reparto'), 'Abriendo...', { useButtonLoader: false });
+    addButtonListener('btn-ver-dia', () => {
+        // Ver el primer día del historial (se puede mejorar con selección)
+        if (AppState.cierres.length > 0) {
+            Historial.verDia(AppState.cierres[0].fecha);
+        } else {
+            Utils.showError('No hay días para ver');
+        }
+    });
+    
+    // Cargar página inicial
+    const etiquetarCeldas = (table) => {
+        const headers = [...table.querySelectorAll('thead th')].map(th => (th.textContent || '').replace(/\s+/g, ' ').trim());
+        if (!headers.length) return;
+        table.querySelectorAll('tbody tr').forEach(tr => {
+            [...tr.children].forEach((td, i) => {
+                if (td.tagName !== 'TD' || td.dataset.label || td.hasAttribute('colspan') || !headers[i]) return;
+                td.dataset.label = headers[i];
+            });
+        });
+    };
+    const contenido = document.querySelector('.main-content');
+    if (contenido) {
+        const marcarTablas = () => contenido.querySelectorAll('table.data-table').forEach(etiquetarCeldas);
+        marcarTablas();
+        new MutationObserver(marcarTablas).observe(contenido, { childList: true, subtree: true });
+    }
+
+    document.getElementById('btn-menu')?.addEventListener('click', () => {
+        document.body.classList.toggle('sidebar-open');
+    });
+    document.getElementById('sidebar-backdrop')?.addEventListener('click', () => {
+        document.body.classList.remove('sidebar-open');
+    });
+    const cajaFecha = document.getElementById('caja-fecha');
+    if (cajaFecha) {
+        cajaFecha.value = AppState.currentDate;
+        cajaFecha.addEventListener('change', () => Caja.load());
+    }
+
+    Navigation.navigateTo('dashboard');
+});
+
+
+
+// Cuenta corriente de un proveedor o de un cliente: extracto con una línea por movimiento y el saldo corrido.
+// Los pagos y las deudas anteriores se pueden corregir (monto y fecha) en la misma línea.
+const Cuenta = {
+    tipo: 'proveedor',
+    datos: null,
+    editando: '',
+    opciones: [],
+
+    // Lo que cambia entre proveedores y clientes.
+    config() {
+        const proveedor = this.tipo === 'proveedor';
+        return proveedor ? {
+            etiqueta: 'Proveedor',
+            sinEntidades: 'Todavía no hay proveedores.',
+            deuda: 'Le debés',
+            aFavor: 'se descuenta de la próxima carga',
+            ayuda: 'Los pagos y las deudas anteriores se pueden editar (monto y fecha) y queda anotado qué se cambió. Si cambia el monto de un pago, la diferencia queda en la caja de hoy. La mercadería se corrige desde Recepción.',
+            pedir: id => API.getCuentaProveedor(id),
+            editar: d => API.editarMovimientoProveedor(d),
+            entidad: datos => datos.proveedor
+        } : {
+            etiqueta: 'Cliente',
+            sinEntidades: 'Todavía no hay clientes.',
+            deuda: 'Te debe',
+            aFavor: 'se descuenta de su próxima carga',
+            ayuda: 'Las deudas anteriores se pueden editar (monto y fecha) y los pagos se pueden mover de fecha o corregir de monto: queda anotado qué se cambió y, si cambia un monto, un renglón "Pago corregido" (en la caja entra o sale la diferencia, hoy). Las cargas del día se corrigen desde Precios.',
+            pedir: id => API.getCuentaCliente(id),
+            editar: d => API.editarMovimientoCliente(d),
+            entidad: datos => datos.cliente
+        };
+    },
+
+    fechaLarga(iso) {
+        const [y, m, d] = String(iso || '').split('-');
+        return d ? `${d}/${m}/${y}` : '—';
+    },
+
+    hoyAR() {
+        return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+    },
+
+    // El modal de la cuenta es más ancho que los demás; los otros modales vuelven a su tamaño.
+    _ancho(si) {
+        document.querySelector('#modal-overlay .modal')?.classList.toggle('modal-ancho', si);
+    },
+
+    async _cargarOpciones() {
+        if (this.tipo === 'proveedor') {
+            const lista = await API.getProveedores();
+            this.opciones = [...lista].map(p => ({ id: String(p.id), nombre: p.nombre || '' }));
+        } else {
+            const lista = AppState.clientes?.length ? AppState.clientes : await API.getClientes();
+            // Las listas de un mismo titular suman en una sola cuenta: aparecen una vez.
+            const vistas = new Set();
+            this.opciones = [];
+            lista.filter(c => c.activo !== false && c.activo !== 'false').forEach(c => {
+                const cuenta = Utils.cuentaDe(c.id);
+                if (vistas.has(cuenta.clave)) return;
+                vistas.add(cuenta.clave);
+                this.opciones.push({ id: String(c.id), nombre: cuenta.titular || c.nombre || '', clave: cuenta.clave });
+            });
+        }
+        this.opciones.sort((a, b) => a.nombre.localeCompare(b.nombre, 'es'));
+    },
+
+    async abrir(tipo, id = '') {
+        this.tipo = tipo;
+        this.editando = '';
+        const cfg = this.config();
+        Utils.showModal('Cuenta corriente', '<p class="modal-hint">Cargando…</p>');
+        this._ancho(true);
+        try {
+            await this._cargarOpciones();
+            let elegido = String(id || '');
+            if (tipo === 'cliente' && elegido) {
+                // El cliente puede ser una de varias listas de un titular: se muestra la cuenta del titular.
+                const clave = Utils.cuentaDe(elegido).clave;
+                elegido = this.opciones.find(o => o.clave === clave)?.id || elegido;
+            }
+            elegido = elegido || this.opciones[0]?.id || '';
+            if (!elegido) {
+                Utils.showModal('Cuenta corriente', `<p class="modal-hint">${cfg.sinEntidades}</p>`);
+                return;
+            }
+            this.datos = await cfg.pedir(elegido);
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo cargar la cuenta. Intentá de nuevo.');
+            return;
+        }
+        this.pintar();
+    },
+
+    pintar() {
+        const cfg = this.config();
+        const datos = this.datos;
+        const entidad = cfg.entidad(datos);
+        const hoy = Utils.formatCurrency;
+        const eid = String(entidad.id);
+        const maxFecha = this.hoyAR();
+        const filas = datos.movimientos.map(m => {
+            const clave = `${m.tipo}:${m.id}`;
+            if (m.editable && this.editando === clave) {
+                const monto = m.debe || m.haber;
+                const montoFijo = this.tipo === 'cliente' && m.tipo === 'pago' && /transferencia/i.test(m.concepto);
+                return `<tr>
+                    <td data-label="Fecha"><input type="date" id="cuenta-edit-fecha" class="form-control" value="${Utils.esc(m.fecha)}" max="${maxFecha}"></td>
+                    <td data-label="Detalle">${Utils.esc(m.concepto)}${montoFijo ? '<br><small>El monto de una transferencia no se cambia acá: deshacé el pago y cargalo de nuevo. La fecha sí.</small>' : ''}</td>
+                    <td data-label="Monto" colspan="2"><input type="text" id="cuenta-edit-monto" class="form-control" data-price-input="true" inputmode="numeric" value="${Utils.formatPrice(monto)}"${montoFijo ? ' disabled' : ''}></td>
+                    <td data-label=""></td>
+                    <td data-label=""><button type="button" class="btn btn-primary btn-sm" onclick="Cuenta.guardar('${m.tipo}', '${Utils.esc(m.id)}')">Guardar</button> <button type="button" class="btn btn-secondary btn-sm" onclick="Cuenta.editar('')">Cancelar</button></td>
+                </tr>`;
+            }
+            return `<tr>
+                <td data-label="Fecha">${this.fechaLarga(m.fecha)}</td>
+                <td data-label="Detalle">${Utils.esc(m.concepto)}</td>
+                <td data-label="Debe" class="money">${m.debe ? hoy(m.debe) : ''}</td>
+                <td data-label="Haber" class="money">${m.haber ? hoy(m.haber) : ''}</td>
+                <td data-label="Saldo" class="money"><strong>${hoy(m.saldo)}</strong></td>
+                <td data-label="">${m.editable ? `<button type="button" class="btn btn-secondary btn-sm" onclick="Cuenta.editar('${m.tipo}:${Utils.esc(m.id)}')">Editar</button>` : ''}</td>
+            </tr>`;
+        }).join('');
+        const saldo = datos.saldo;
+        const estado = saldo > 0.009 ? `${cfg.deuda} ${hoy(saldo)}` : (saldo < -0.009 ? `Saldo a favor: ${hoy(-saldo)} (${cfg.aFavor})` : 'Cuenta al día');
+        const seleccionada = this.tipo === 'cliente'
+            ? (this.opciones.find(o => o.clave === Utils.cuentaDe(eid).clave)?.id || eid)
+            : eid;
+        const content = `
+            <div class="form-group">
+                <label for="cuenta-entidad">${cfg.etiqueta}</label>
+                <select id="cuenta-entidad" class="form-control">
+                    ${this.opciones.map(o => `<option value="${Utils.esc(o.id)}"${o.id === seleccionada ? ' selected' : ''}>${Utils.esc(o.nombre)}</option>`).join('')}
+                </select>
+            </div>
+            <p class="modal-hint"><strong>${estado}</strong></p>
+            ${datos.movimientos.length ? `<div class="table-container"><table class="data-table"><thead><tr><th>Fecha</th><th>Detalle</th><th>Debe</th><th>Haber</th><th>Saldo</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>`
+                : '<p class="modal-hint">Todavía no tiene movimientos.</p>'}
+            <p class="modal-hint">${cfg.ayuda}</p>
+            <div class="page-actions"><button type="button" class="btn btn-secondary" onclick="Cuenta.imprimir()">Imprimir / guardar PDF</button></div>
+        `;
+        Utils.showModal(`Cuenta corriente · ${entidad.nombre || ''}`, content);
+        this._ancho(true);
+        document.getElementById('cuenta-entidad')?.addEventListener('change', (e) => this.abrir(this.tipo, e.target.value));
+    },
+
+    editar(clave) {
+        this.editando = clave;
+        this.pintar();
+    },
+
+    async guardar(tipo, id) {
+        const cfg = this.config();
+        const montoInput = document.getElementById('cuenta-edit-monto');
+        const monto = Utils.parsePrice(montoInput?.value) || 0;
+        const fecha = document.getElementById('cuenta-edit-fecha')?.value || '';
+        if (!(monto > 0)) { Utils.showError('Poné un monto mayor a cero'); return; }
+        if (!fecha) { Utils.showError('Poné la fecha'); return; }
+        const eid = String(cfg.entidad(this.datos).id);
+        try {
+            const res = await cfg.editar({ tipo, id, monto, fecha });
+            Utils.avisar(res?.cambio === false ? 'No había cambios' : 'Cambio guardado');
+            await this._refrescarPantallas(eid);
+            this.editando = '';
+            this.datos = await cfg.pedir(eid);
+            this.pintar();
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo guardar el cambio.');
+        }
+    },
+
+    // Lo que se ve detrás del modal se actualiza con el cambio.
+    async _refrescarPantallas(eid) {
+        if (this.tipo === 'proveedor') {
+            delete Pagos._optimo[eid];
+            Pagos._guardarOptimo();
+            Pagos._pagados.delete(eid);
+            Pagos._pagados.delete(Number(eid));
+            const proveedores = await API.getProveedores();
+            AppState.proveedores = proveedores;
+            CacheManager.set('proveedores', proveedores);
+            if (AppState.currentPage === 'pagos' || AppState.currentPage === 'pagos-pendientes') Pagos.render(proveedores);
+        } else {
+            if (AppState.currentPage === 'cobranzas') Cobranzas.load().catch(() => {});
+            if (AppState.currentPage === 'cobros-hoy') CobranzasHoy.load().catch(() => {});
+        }
+    },
+
+    imprimir() {
+        const cfg = this.config();
+        const datos = this.datos;
+        if (!datos) return;
+        const entidad = cfg.entidad(datos);
+        const hoy = Utils.formatCurrency;
+        const filas = datos.movimientos.map(m => `<tr>
+            <td>${this.fechaLarga(m.fecha)}</td><td>${Utils.esc(m.concepto)}</td>
+            <td class="num">${m.debe ? hoy(m.debe) : ''}</td><td class="num">${m.haber ? hoy(m.haber) : ''}</td><td class="num"><strong>${hoy(m.saldo)}</strong></td>
+        </tr>`).join('');
+        const saldo = datos.saldo;
+        const estado = saldo > 0.009 ? `Saldo adeudado: ${hoy(saldo)}` : (saldo < -0.009 ? `Saldo a favor: ${hoy(-saldo)}` : 'Cuenta al día');
+        const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cuenta corriente · ${Utils.esc(entidad.nombre || '')}</title>
+            <style>body{font-family:Arial,sans-serif;margin:24px;color:#222}h1{font-size:20px;margin:0 0 4px}p{margin:2px 0 14px;color:#555}
+            table{width:100%;border-collapse:collapse;font-size:13px}th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}
+            th{background:#f1f1f1}.num{text-align:right;white-space:nowrap}.total{margin-top:14px;font-size:15px;font-weight:bold}</style></head>
+            <body><h1>Cuenta corriente · ${Utils.esc(entidad.nombre || '')}</h1><p>Luciano Cargas · al ${this.fechaLarga(this.hoyAR())}</p>
+            <table><thead><tr><th>Fecha</th><th>Detalle</th><th class="num">Debe</th><th class="num">Haber</th><th class="num">Saldo</th></tr></thead><tbody>${filas}</tbody></table>
+            <div class="total">${estado}</div>
+            <script>window.addEventListener('load',function(){setTimeout(function(){window.print();},200);});<\/script></body></html>`;
+        try {
+            Utils.openPrintHtml(html);
+        } catch (error) {
+            Utils.showError(error?.message || 'No se pudo abrir la vista de impresión.');
+        }
+    }
+};
+
+// Buscador de cada paso: <input data-filtro-tabla="#selector"> esconde las filas de la tabla que no coinciden.
+// Solo oculta (no redibuja), y se vuelve a aplicar cada vez que el paso dibuja de nuevo sus filas.
+const FiltroTabla = {
+    _normalizar(texto) {
+        return String(texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+    },
+
+    aplicar(input, destino) {
+        const buscado = this._normalizar(input.value);
+        let visible = true;
+        destino.querySelectorAll('tbody tr, :scope > tr').forEach(tr => {
+            if (tr.classList.contains('fila-nueva') || tr.querySelector('td[colspan]') && !tr.classList.contains('recepcion-detalle')) return;
+            if (!tr.classList.contains('recepcion-detalle')) {
+                visible = !buscado || this._normalizar(tr.textContent).includes(buscado);
+            }
+            tr.classList.toggle('fila-oculta', !visible);
+        });
+    },
+
+    iniciar() {
+        document.querySelectorAll('input[data-filtro-tabla]').forEach(input => {
+            const destino = document.querySelector(input.dataset.filtroTabla);
+            if (!destino || input.dataset.filtroListo) return;
+            input.dataset.filtroListo = '1';
+            const reaplicar = () => this.aplicar(input, destino);
+            input.addEventListener('input', reaplicar);
+            new MutationObserver(reaplicar).observe(destino, { childList: true, subtree: true });
+        });
+    }
+};
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => FiltroTabla.iniciar());
+else FiltroTabla.iniciar();

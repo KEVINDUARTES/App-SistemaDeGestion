@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <script>
+        // Freno de seguridad: si esta pestaña se recarga 8 veces o más en 10 segundos, se detienen
+        // las redirecciones automáticas (en vez de parpadear sin parar) y se explica qué está pasando.
+        // Para empezar de cero: abrir login.html?limpiar=1
+        (function () {
+            try {
+                if (/[?&]limpiar=1/.test(location.search)) {
+                    localStorage.clear();
+                    sessionStorage.clear();
+                    history.replaceState(null, '', location.pathname);
+                }
+                // window.name sobrevive a las redirecciones y a cualquier limpieza de storage.
+                var ahora = Date.now();
+                var previas = [];
+                if (window.name.indexOf('sg_cargas:') === 0) { try { previas = JSON.parse(window.name.substring(10)); } catch (e) {} }
+                var cargas = previas.filter(function (t) { return ahora - t < 10000; });
+                cargas.push(ahora);
+                window.name = 'sg_cargas:' + JSON.stringify(cargas);
+                window.__bucle = cargas.length >= 8;
+            } catch (error) {}
+        })();
+    </script>
+    <script>
+        // Sin sesión válida no se arma la pantalla: se va directo al ingreso (evita el parpadeo).
+        (function() {
+            var token = localStorage.getItem('authToken') || '';
+            if (!localStorage.getItem('userEmail') || token.indexOf('.') < 1) {
+                window.__sinSesion = true;
+                if (!window.__bucle) window.location.replace('login.html');
+            }
+        })();
+    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>Luciano Cargas - Sistema de Gestión</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
+    <link rel="stylesheet" href="styles.css?v=20261116linkfecha1">
+</head>
+<body>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+    <!-- Indicador de carga global -->
+    <div id="global-loader" class="global-loader" style="display: none;" aria-busy="true" aria-label="Cargando">
+        <div class="app-loader-spinner app-loader-spinner--lg"></div>
+        <p class="app-loader-label">Cargando...</p>
+    </div>
+
+    <!-- Navegación lateral -->
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <h2>Luciano Cargas</h2>
+        </div>
+        <ul class="nav-menu">
+            <!-- Inicio -->
+            <li><a href="#" data-page="dashboard" class="nav-link active">
+                <span class="nav-icon">🏠</span>
+                <span class="nav-text">Inicio</span>
+            </a></li>
+            
+            <!-- Flujo del Día (ordenado según proceso) -->
+            <li class="nav-category">
+                <a href="#" class="nav-category-toggle">
+                    <span class="nav-icon">📋</span>
+                    <span class="nav-text">Flujo del Día</span>
+                    <span class="nav-arrow">▼</span>
+                </a>
+                <ul class="nav-submenu nav-flow-menu">
+                    <li class="nav-flow-phase"><span>Fase 1</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="pedidos" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">1</span>
+                            <span class="nav-flow-label">Planilla del día <span class="nav-flow-note">(pedido y llegó)</span></span>
+                            <span class="nav-pendiente-badge" id="nav-badge-recepcion" hidden>0</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="camiones" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">2</span>
+                            <span class="nav-flow-label">Armar camiones</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-phase"><span>Fase 2</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="precios" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">3</span>
+                            <span class="nav-flow-label">Precios al cliente</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cobros-hoy" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">4</span>
+                            <span class="nav-flow-label">Cobranza al cliente</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="pagos" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">5</span>
+                            <span class="nav-flow-label">Pagar al proveedor</span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-phase"><span>Fase 3</span></li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cobranzas" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">6</span>
+                            <span class="nav-flow-label">Cobranzas a clientes <span class="nav-flow-note">(pendientes)</span></span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="pagos-pendientes" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">7</span>
+                            <span class="nav-flow-label">Pagos a proveedores <span class="nav-flow-note">(pendientes)</span></span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="recepcion-pendientes" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">8</span>
+                            <span class="nav-flow-label">Confirmar recepción <span class="nav-flow-note">(pendientes)</span></span>
+                        </a>
+                    </li>
+                    <li class="nav-flow-item">
+                        <a href="#" data-page="cierre" class="nav-link nav-flow-link">
+                            <span class="nav-flow-badge" aria-hidden="true">9</span>
+                            <span class="nav-flow-label">Cerrar el día</span>
+                        </a>
+                    </li>
+                </ul>
+            </li>
+            
+            <!-- Configuración (datos base) -->
+            <li class="nav-category">
+                <a href="#" class="nav-category-toggle">
+                    <span class="nav-icon">⚙️</span>
+                    <span class="nav-text">Configuración</span>
+                    <span class="nav-arrow">▼</span>
+                </a>
+                <ul class="nav-submenu">
+                    <li><a href="#" data-page="clientes" class="nav-link">Clientes</a></li>
+                    <li><a href="#" data-page="proveedores" class="nav-link">Proveedores</a></li>
+                    <li><a href="#" data-page="productos" class="nav-link">Productos</a></li>
+                    <li><a href="#" data-page="stock" class="nav-link">Stock</a></li>
+                    <li><a href="#" data-page="links-clientes" class="nav-link">Links para clientes</a></li>
+                    <li><a href="#" data-page="mantenimiento" class="nav-link nav-link-danger">Limpiar datos</a></li>
+                </ul>
+            </li>
+            
+            <!-- Historial y Consultas -->
+            <li class="nav-category">
+                <a href="#" class="nav-category-toggle">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-text">Historial</span>
+                    <span class="nav-arrow">▼</span>
+                </a>
+                <ul class="nav-submenu">
+                    <li><a href="#" data-page="historial" class="nav-link">Historial de Días</a></li>
+                    <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo, junto con los otros 3 bloques marcados igual.
+                    <li><a href="#" data-page="reparto" class="nav-link">Repartir efectivo</a></li>
+                    -->
+                    <li><a href="#" data-page="caja" class="nav-link">Caja</a></li>
+                </ul>
+            </li>
+        </ul>
+    </nav>
+
+    <!-- Contenido principal -->
+    <main class="main-content">
+        <header class="header">
+            <div class="header-left">
+                <button type="button" class="btn-menu" id="btn-menu" aria-label="Abrir menú">☰</button>
+                <h1 class="header-title">Luciano Cargas</h1>
+                <span class="header-subtitle" id="page-title">Dashboard</span>
+            </div>
+            <div class="header-right">
+                <span class="user-email" id="user-email"></span>
+                <button class="btn-logout" id="btn-logout" title="Cerrar sesión">
+                    <span>🚪</span> Salir
+                </button>
+            </div>
+        </header>
+
+        <!-- Dashboard -->
+        <div id="dashboard" class="page active">
+            <div id="dashboard-pendientes-banner" class="pendientes-banner" hidden></div>
+            <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo.
+            <div class="reparto-acceso">
+                <button type="button" class="btn btn-primary" id="btn-ir-reparto">Repartir efectivo</button>
+                <p>Anotá el efectivo que entró de un cliente y descontalo a los proveedores.</p>
+            </div>
+            -->
+            <!-- Saldos por cliente y por proveedor (solo para algunos usuarios: ver Dashboard.USUARIOS_CON_SALDOS) -->
+            <div id="dashboard-saldos" class="saldos-inicio" hidden>
+                <div class="saldos-inicio-acciones">
+                    <button type="button" class="btn btn-primary btn-sm" id="btn-saldos-pdf">Descargar PDF de saldos</button>
+                    <span>Saldo de cada cliente y proveedor, y hasta qué fecha.</span>
+                </div>
+                <section class="saldos-inicio-card">
+                    <header>
+                        <h3>Clientes que te deben</h3>
+                        <strong class="saldos-inicio-total" id="saldos-clientes-total">$0</strong>
+                    </header>
+                    <ul id="saldos-clientes-lista" class="saldos-inicio-lista"></ul>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="Navigation.navigateTo('cobranzas')">Ver cobranzas pendientes</button>
+                </section>
+                <section class="saldos-inicio-card">
+                    <header>
+                        <h3>Proveedores a pagar</h3>
+                        <strong class="saldos-inicio-total" id="saldos-proveedores-total">$0</strong>
+                    </header>
+                    <ul id="saldos-proveedores-lista" class="saldos-inicio-lista"></ul>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="Navigation.navigateTo('pagos-pendientes')">Ver pagos pendientes</button>
+                </section>
+            </div>
+            <!-- Gráfico de métricas -->
+            <div class="metrics-section">
+                <div class="metrics-card">
+                    <h3 class="metrics-title">Top 5 Productos Más Vendidos (Semana)</h3>
+                    <div class="chart-container">
+                        <canvas id="topProductsChart"></canvas>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Cards informativos -->
+            <div class="dashboard-grid">
+                <div class="dashboard-card" onclick="Navigation.navigateTo('pedidos')">
+                    <h3>📋 Pedidos del día</h3>
+                    <div class="card-value" id="dashboard-pedidos-count">0</div>
+                    <p class="card-label">Total</p>
+                </div>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('cobranzas')">
+                    <h3>💵 Cobranzas a clientes</h3>
+                    <div class="card-value" id="dashboard-cobranzas-count">$0</div>
+                    <p class="card-label">Por cobrar</p>
+                </div>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('pagos-pendientes')">
+                    <h3>💳 Pagos a proveedores</h3>
+                    <div class="card-value" id="dashboard-pagos-count">$0</div>
+                    <p class="card-label">Por pagar</p>
+                </div>
+                <div class="dashboard-card" onclick="Navigation.navigateTo('stock')">
+                    <h3>📦 Stock bajo</h3>
+                    <div class="card-value" id="dashboard-stock-count">0</div>
+                    <p class="card-label">Productos</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Clientes -->
+        <div id="clientes" class="page">
+            <div class="page-header">
+                <h2>Clientes</h2>
+                <button class="btn btn-primary" id="btn-agregar-cliente">Agregar cliente</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Nombre</th>
+                            <th>Teléfono</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="clientes-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Productos -->
+        <div id="productos" class="page">
+            <div class="page-header">
+                <h2>Productos</h2>
+                <button class="btn btn-primary" id="btn-agregar-producto">Agregar producto</button>
+            </div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar producto…" aria-label="Buscar producto…" autocomplete="off" data-filtro-tabla="#productos-tbody"></div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Nombre</th>
+                            <th>Tipo</th>
+                            <th>Proveedor</th>
+                            <th>Comisión</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="productos-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Proveedores -->
+        <div id="proveedores" class="page">
+            <div class="page-header">
+                <h2>Proveedores</h2>
+                <button class="btn btn-primary" id="btn-agregar-proveedor">Agregar proveedor</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Nombre</th>
+                            <th>Rubro</th>
+                            <th>Teléfono</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="proveedores-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Pedidos del día -->
+        <div id="pedidos" class="page">
+            <div class="page-header">
+                <h2>Pedidos del día</h2>
+                <button class="btn btn-primary" id="btn-agregar-pedido">Agregar pedido</button>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="pedidos">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="pedidos-fecha-input">Pedido del día:</label>
+                    <input type="date" id="pedidos-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="pedidos-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="pedidos-fecha-texto"></span>
+                    <span class="dia-operativo-estado" id="pedidos-estado-dia"></span>
+                </div>
+                <p class="dia-operativo-hint">Tocá el 📅 para abrir el calendario (verde: día cerrado, rojo: por cerrar, sin color: no se cargó) y elegir cualquier día, pasado o futuro. Los pedidos se guardan con la fecha elegida.</p>
+            </div>
+            <div class="planilla-barra">
+                <div class="planilla-seg" role="group" aria-label="Forma de ver los pedidos" id="pedidos-vista">
+                    <button type="button" data-vista="planilla" aria-pressed="true">Planilla</button>
+                    <button type="button" data-vista="lista" aria-pressed="false">Lista</button>
+                </div>
+                <span class="planilla-guardado" id="planilla-guardado" role="status">Todo guardado</span>
+            </div>
+            <div id="pedidos-envio-resumen" class="pedidos-envio-resumen" hidden></div>
+            <div id="pedidos-planilla" class="pedidos-planilla">
+                <div class="planilla-controles">
+                    <input type="search" id="planilla-buscar" class="form-control" placeholder="Buscar producto…" aria-label="Buscar producto">
+                    <div class="planilla-seg" role="group" aria-label="Filtrar por tipo" id="planilla-filtro-tipo">
+                        <button type="button" data-tipo="todos" aria-pressed="true">Todos</button>
+                        <button type="button" data-tipo="verdura" aria-pressed="false">Verdura</button>
+                        <button type="button" data-tipo="fruta" aria-pressed="false">Fruta</button>
+                        <button type="button" data-tipo="bebida" aria-pressed="false">Bebida</button>
+                        <button type="button" data-tipo="mercaderia" aria-pressed="false">Mercadería</button>
+                    </div>
+                    <div class="planilla-seg" role="group" aria-label="Qué productos mostrar">
+                        <button type="button" id="planilla-solo-pedidos" aria-pressed="false" title="Esconde los productos que nadie pidió ese día">Ver solo lo pedido</button>
+                        <button type="button" id="planilla-solo-clientes" aria-pressed="true" title="Muestra solo los clientes que ya pidieron ese día. Con '+ Cliente' sumás otro">Solo clientes con pedido</button>
+                    </div>
+                    <select id="planilla-agregar-cliente" class="form-control" aria-label="Agregar un cliente a la planilla" hidden>
+                        <option value="">+ Cliente…</option>
+                    </select>
+                    <span class="rp-ctrl">
+                        <label for="planilla-zoom">Tamaño:</label>
+                        <select id="planilla-zoom" class="form-control" aria-label="Tamaño de la planilla">
+                            <option value="100">100 %</option>
+                            <option value="90">90 %</option>
+                            <option value="80">80 %</option>
+                            <option value="70">70 %</option>
+                            <option value="60">60 %</option>
+                            <option value="50">50 %</option>
+                        </select>
+                        <button type="button" class="btn btn-secondary btn-sm" id="planilla-btn-full">Pantalla completa</button>
+                    </span>
+                </div>
+                <p class="planilla-aviso" id="planilla-aviso" hidden></p>
+                <p class="dia-operativo-hint">Escribí la cantidad de cada cliente y pasá a la siguiente con Tab o Enter: se guarda sola. Todo va en bultos enteros, salvo los productos marcados <span class="planilla-kg">kg</span>, que van en kilos y aceptan decimales.</p>
+                <div class="planilla-scroll">
+                    <table class="planilla-pedidos" id="planilla-pedidos"></table>
+                </div>
+            </div>
+            <div class="table-container" id="pedidos-lista" hidden>
+                <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar cliente o producto…" aria-label="Buscar cliente o producto…" autocomplete="off" data-filtro-tabla="#pedidos-tbody"></div>
+                            <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Producto</th>
+                            <th>Tipo</th>
+                            <th>Cantidad</th>
+                            <th>Proveedor seleccionado</th>
+                            <th>Pedido a proveedor</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pedidos-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-guardar-pedidos">Enviar pendientes a proveedores</button>
+                <button class="btn btn-secondary" id="btn-seguir-recepcion" type="button">Seguir a camiones</button>
+            </div>
+        </div>
+
+        <!-- Camiones -->
+        <div id="camiones" class="page">
+            <div class="page-header">
+                <h2>Armar camiones</h2>
+                <div class="page-header-actions">
+                    <button class="btn btn-secondary" id="btn-camiones-imprimir" type="button">Imprimir todos</button>
+                    <button class="btn btn-secondary" id="btn-camiones-excel" type="button">Descargar Excel</button>
+                    <button class="btn btn-whatsapp" id="btn-camiones-enviar" type="button">Enviar todos</button>
+                    <button class="btn btn-primary" id="btn-camiones-agregar" type="button">Agregar camión</button>
+                </div>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="camiones">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="camiones-fecha-input">Pedido del día:</label>
+                    <input type="date" id="camiones-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="camiones-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="camiones-fecha-texto"></span>
+                </div>
+                <p class="dia-operativo-hint" id="camiones-hint">Repartí los clientes del día en camiones. Cada cliente va en uno solo. La hoja muestra cuánto va a cada uno, el total del camión y el puesto.</p>
+            </div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar producto o cliente…" aria-label="Buscar producto o cliente…" autocomplete="off" data-filtro-tabla="#camiones-root"></div>
+            <div id="camiones-root"></div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-seguir-desde-camiones" type="button">Seguir a la planilla (llegó)</button>
+            </div>
+        </div>
+
+        <!-- Recepción -->
+        <div id="recepcion" class="page">
+            <div class="page-header">
+                <h2>Confirmación de lo que llegó</h2>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="recepcion">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="recepcion-fecha-input">Pedido del día:</label>
+                    <input type="date" id="recepcion-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="recepcion-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="recepcion-fecha-texto"></span>
+                    <span class="dia-operativo-estado" id="recepcion-estado-dia"></span>
+                </div>
+                <p class="dia-operativo-hint">Confirmá <strong>cada producto</strong> cuando llegue. Al confirmar se arma la lista de precios al cliente con lo que llegó. Los que falten podés confirmarlos otro día (poné 0 en "Llegó" si no vino).</p>
+                <p class="dia-operativo-hint">En <strong>Precio real</strong> poné lo que te cobró el proveedor <strong>por cada uno</strong>, no el total. Si pediste 10 y llegaron 9, cargá el costo de <strong>uno solo</strong>. No es el precio al cliente.</p>
+            </div>
+            <div class="recepcion-filtro">
+                <label for="recepcion-filtro-proveedor">Proveedor:</label>
+                <select id="recepcion-filtro-proveedor" class="form-control" onchange="Recepcion.filtrarProveedor(this.value)">
+                    <option value="">Todos los proveedores</option>
+                </select>
+                <label for="recepcion-filtro-producto">Producto:</label>
+                <input type="search" id="recepcion-filtro-producto" class="form-control" placeholder="Buscar producto…" autocomplete="off" oninput="Recepcion.filtrarProducto(this.value)">
+                <span id="recepcion-filtro-cuenta" class="modal-hint"></span>
+                <span class="rp-ctrl">
+                    <label for="recepcion-zoom" class="rp-solo-planilla">Tamaño:</label>
+                    <select id="recepcion-zoom" class="form-control rp-solo-planilla" onchange="Recepcion.cambiarZoom(this.value)" aria-label="Tamaño de la planilla">
+                        <option value="100">100 %</option>
+                        <option value="90">90 %</option>
+                        <option value="80">80 %</option>
+                        <option value="70">70 %</option>
+                        <option value="60">60 %</option>
+                        <option value="50">50 %</option>
+                    </select>
+                    <button type="button" class="btn btn-secondary btn-sm rp-solo-planilla" id="recepcion-btn-full" onclick="Recepcion.pantallaCompleta()">Pantalla completa</button>
+                    <button type="button" class="btn btn-secondary btn-sm" id="recepcion-btn-vista" onclick="Recepcion.cambiarVista()">Ver lista simple</button>
+                </span>
+            </div>
+            <div class="table-container" id="recepcion-tabla">
+                <table class="data-table">
+                    <thead id="recepcion-thead">
+                        <tr>
+                            <th>Producto</th>
+                            <th>Pedido</th>
+                            <th>Llegó</th>
+                            <th title="Costo por unidad que te cobró el proveedor">Precio real <span class="th-hint">(costo / u)</span></th>
+                            <th>Proveedor</th>
+                            <th>Acción</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recepcion-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-confirmar-recepcion-todo" type="button">Confirmar todos los completos</button>
+                <button class="btn btn-secondary" id="btn-seguir-precios" type="button">Seguir a precios</button>
+            </div>
+        </div>
+
+        <!-- Precios al cliente -->
+        <div id="precios" class="page">
+            <div class="page-header">
+                <h2>Precios al cliente</h2>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="precios">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="precios-fecha-input">Pedido del día:</label>
+                    <input type="date" id="precios-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="precios-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="precios-fecha-texto"></span>
+                    <span class="dia-operativo-estado" id="precios-estado-dia"></span>
+                </div>
+                <p class="dia-operativo-hint">Asigná precios al cliente para el día del pedido, después de confirmar la recepción.</p>
+            </div>
+            
+            <!-- Controles de filtro y comisión -->
+            <div class="precios-controls" style="display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; align-items: flex-end;">
+                <div class="form-group" style="flex: 1; min-width: 200px;">
+                    <label for="precios-filtro-cliente" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Filtrar por cliente:</label>
+                    <select id="precios-filtro-cliente" class="form-control" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
+                        <option value="">Todos los clientes</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex: 1; min-width: 200px;">
+                    <label for="precios-comision" style="display: block; margin-bottom: 5px; font-weight: 500; color: var(--color-gray-700);">Comisión general por unidad</label>
+                    <input type="text" id="precios-comision" class="form-control" value="350" data-price-input="true" inputmode="numeric" style="width: 100%; padding: 8px; border: 1px solid var(--color-gray-300); border-radius: var(--radius-md);">
+                </div>
+                <div class="form-group">
+                    <label class="checkbox-label" for="precios-mismo-precio" title="Al cambiar el precio de un producto, los demás clientes de ese producto quedan con el mismo precio. Apagalo para dar un precio especial a un cliente.">
+                        <input type="checkbox" id="precios-mismo-precio" checked>
+                        Mismo precio para todos los clientes
+                    </label>
+                </div>
+                <div class="form-group" style="display: flex; gap: 10px;">
+                    <button class="btn btn-secondary" id="btn-limpiar-filtro" style="white-space: nowrap;">Limpiar filtro</button>
+                </div>
+            </div>
+            
+            <div id="precios-comisiones" class="precios-comisiones" hidden></div>
+
+            <div class="precios-vistas" role="tablist">
+                <button type="button" class="btn btn-sm" id="btn-precios-vista-cliente" role="tab" onclick="Precios.cambiarVista('cliente')">Por cliente</button>
+                <button type="button" class="btn btn-sm" id="btn-precios-vista-planilla" role="tab" onclick="Precios.cambiarVista('planilla')">Planilla del día</button>
+            </div>
+
+            <!-- Planilla del día: productos en filas, cada cliente en su columna, total, precio, puesto y precio total -->
+            <div id="precios-planilla" class="precios-planilla" hidden>
+                <div class="precios-planilla-acciones">
+                    <p class="modal-hint">Todos los clientes del día con el total de cada producto y su precio, para armar la diferencia.</p>
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-precios-planilla-excel">Descargar Excel</button>
+                </div>
+                <div class="table-container precios-planilla-scroll">
+                    <table class="data-table precios-planilla-tabla" id="precios-planilla-tabla"></table>
+                </div>
+            </div>
+
+            <div id="precios-vista-cliente">
+            <!-- Resumen del cliente (se muestra cuando hay filtro activo) -->
+            <div id="precios-resumen-cliente" style="display: none;">
+                <h3>Resumen del Cliente</h3>
+                <div>
+                    <div>
+                        <strong>Cliente:</strong>
+                        <span id="resumen-cliente-nombre">-</span>
+                    </div>
+                    <div>
+                        <strong>Total Productos:</strong>
+                        <span id="resumen-total-productos">$0</span>
+                    </div>
+                    <div>
+                        <strong>Ganancia:</strong>
+                        <span id="resumen-ganancia">$0</span>
+                    </div>
+                    <div>
+                        <strong>Comisión:</strong>
+                        <span id="resumen-comision">$0</span>
+                    </div>
+                    <div>
+                        <strong>Saldo Total:</strong>
+                        <span id="resumen-saldo-total">$0</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="filtro-tabla buscador-cliente"><input type="search" id="precios-buscador" class="form-control" placeholder="Buscar producto o cliente…" aria-label="Buscar producto o cliente…" autocomplete="off" data-filtro-tabla="#precios-tbody"><div id="precios-cliente-sugerencias" class="buscador-cliente-lista" hidden></div></div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Producto</th>
+                            <th>Cant.</th>
+                            <th title="Sale de la recepción. Podés cambiarlo en una línea: solo cambia la ganancia, no lo que le debés al proveedor.">Precio real <span class="th-hint">c/u · editable</span></th>
+                            <th title="Lo que le cobrás al cliente por cada unidad">Precio cliente <span class="th-hint">c/u</span></th>
+                            <th title="Comisión de reparto por unidad, según el producto">Comisión <span class="th-hint">c/u</span></th>
+                            <th>Ganancia</th>
+                            <th>Total</th>
+                        </tr>
+                    </thead>
+                    <tbody id="precios-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                    <tfoot id="precios-tfoot" hidden>
+                        <!-- Se llena dinámicamente cuando hay filtro por cliente -->
+                    </tfoot>
+                </table>
+            </div>
+            </div>
+            <div class="page-actions precios-acciones">
+                <button class="btn btn-secondary" id="btn-generar-lista-precios" type="button" title="Arma la lista con lo que ya confirmaste que llegó">Armar lista</button>
+                <button class="btn btn-primary" id="btn-guardar-precios" type="button">Guardar precios</button>
+                <button class="btn btn-whatsapp" id="btn-exportar-pdf-precios" type="button">WhatsApp Excel</button>
+                <button class="btn btn-secondary" id="btn-seguir-cobros" type="button">Seguir a cobranza</button>
+            </div>
+        </div>
+
+        <!-- Cobranza al cliente -->
+        <div id="cobros-hoy" class="page">
+            <div class="page-header">
+                <h2>Cobranza al cliente</h2>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="cobros-hoy">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="cobros-hoy-fecha-input">Pedido del día:</label>
+                    <input type="date" id="cobros-hoy-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="cobros-hoy-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="cobros-hoy-fecha-texto"></span>
+                </div>
+                <p class="dia-operativo-hint" id="cobros-hoy-hint">Cobrás en efectivo, transferencia o cheque, o le hacés un descuento. Lo que no pague queda adeudado. Al cerrar, ese saldo pasa a Cobranzas a clientes (pendientes).</p>
+            </div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar cliente…" aria-label="Buscar cliente…" autocomplete="off" data-filtro-tabla="#cobros-hoy-tbody"></div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Total del día</th>
+                            <th>Cobrado</th>
+                            <th>Cómo cobró</th>
+                            <th>Adeudado</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cobros-hoy-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-cuenta-cliente-hoy" type="button">Cuenta corriente</button>
+                <button class="btn btn-secondary" id="btn-seguir-cobranzas" type="button">Seguir a pagar al proveedor</button>
+            </div>
+        </div>
+
+        <!-- Cierre del día -->
+        <div id="cierre" class="page">
+            <div class="page-header">
+                <h2>Cierre del día</h2>
+            </div>
+            <div class="dia-operativo-bar" data-dia-page="cierre">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="cierre-fecha-input">Pedido del día:</label>
+                    <input type="date" id="cierre-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="cierre-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="cierre-fecha-texto"></span>
+                    <span class="dia-operativo-estado" id="cierre-estado-dia"></span>
+                </div>
+                    <p class="dia-operativo-hint">Último paso del día. Acá ves el resumen de lo que ya hiciste (recepción, precios, cobros y pagos) y recién ahí cerrás.</p>
+            </div>
+            <div class="cierre-container">
+                <div class="cierre-panel">
+                    <h3>Resumen de lo que ya hiciste</h3>
+                    <div class="cierre-resumen-wrap">
+                        <ul id="cierre-resumen">
+                            <li>Recepción</li>
+                            <li>Precios al cliente</li>
+                            <li>Cobranzas del día</li>
+                            <li>Proveedores</li>
+                            <li>Stock</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-secondary" id="btn-volver-cierre">Volver a pagos</button>
+                <button class="btn btn-primary" id="btn-cerrar-dia">Cerrar día</button>
+            </div>
+        </div>
+
+        <!-- Cobranzas -->
+        <div id="cobranzas" class="page">
+            <div class="page-header">
+                <h2>Cobranzas a clientes (pendientes)</h2>
+            </div>
+            <p class="dia-operativo-hint" id="cobranzas-hint">Acá queda lo que cada cliente todavía te debe. Si un cliente ya te debía de antes, agregalo con "Agregar cobranza a cliente".</p>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar cliente…" aria-label="Buscar cliente…" autocomplete="off" data-filtro-tabla="#cobranzas-tbody"></div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Te debe</th>
+                            <th>Fecha</th>
+                            <th>Estado</th>
+                        </tr>
+                    </thead>
+                    <tbody id="cobranzas-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-agregar-cobranza" type="button">Agregar cobranza a cliente</button>
+                <button class="btn btn-secondary" id="btn-cuenta-cliente" type="button">Cuenta corriente</button>
+                <button class="btn btn-secondary" id="btn-seguir-pagos" type="button">Seguir a pagos pendientes</button>
+            </div>
+        </div>
+
+        <!-- Pagos -->
+        <div id="pagos" class="page">
+            <div class="page-header">
+                <h2 id="pagos-titulo">Pagar al proveedor</h2>
+            </div>
+            <div class="dia-operativo-bar" id="pagos-dia-bar" data-dia-page="pagos">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="pagos-fecha-input">Pedido del día:</label>
+                    <input type="date" id="pagos-fecha-input" class="form-control dia-operativo-fecha" aria-describedby="pagos-fecha-texto">
+                    <span class="dia-operativo-fecha-texto" id="pagos-fecha-texto"></span>
+                </div>
+            </div>
+            <p class="dia-operativo-hint" id="pagos-hint">Pagá una parte en efectivo y otra en transferencia. Lo que no pagues queda adeudado. Al cerrar, ese saldo pasa a Pagos a proveedores (pendientes).</p>
+            <div id="pagos-depositos" class="deposito-lista" hidden></div>
+            <div id="pagos-resumen" class="pagos-resumen" hidden></div>
+            <div class="filtro-tabla"><input type="search" class="form-control" placeholder="Buscar proveedor…" aria-label="Buscar proveedor…" autocomplete="off" data-filtro-tabla="#pagos-tbody"></div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Proveedor</th>
+                            <th>Le debés</th>
+                            <th>Mercadería de hoy</th>
+                            <th>Estado</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pagos-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-agregar-pago-pendiente" type="button" hidden>Agregar pago a proveedor pendiente</button>
+                <button class="btn btn-secondary" id="btn-historial-pagos" type="button">Ver pagos / anular</button>
+                <button class="btn btn-secondary" id="btn-cuenta-proveedor" type="button">Cuenta corriente</button>
+                <button class="btn btn-secondary" id="btn-seguir-cierre" type="button">Seguir a cerrar el día</button>
+            </div>
+        </div>
+
+        <!-- Stock -->
+        <div id="stock" class="page">
+            <div class="page-header">
+                <h2>Stock de productos</h2>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Producto</th>
+                            <th>Tipo</th>
+                            <th>Stock</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="stock-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-ajustar-stock">Ajustar stock</button>
+                <button class="btn btn-secondary" id="btn-verificar-stock">🔔 Verificar stock bajo</button>
+                <button class="btn btn-secondary" id="btn-config-notificaciones">⚙️ Configurar notificaciones</button>
+            </div>
+        </div>
+
+        <!-- Links para clientes -->
+        <div id="links-clientes" class="page">
+            <div class="page-header">
+                <h2>Links para clientes</h2>
+            </div>
+            <p class="links-ayuda">Cada cliente tiene un link propio: lo abre en el celular, elige lo que necesita y el pedido entra solo en la planilla de Pedidos. No ve precios ni a otros clientes.</p>
+            <div class="links-config" id="links-config"></div>
+            <details class="links-stock">
+                <summary>Productos sin stock <span id="links-sin-stock-cuenta"></span></summary>
+                <p class="links-ayuda">Los que marques aparecen avisados en el link y los clientes no pueden sumarlos. Se guarda al tildar.</p>
+                <input type="search" id="links-sin-stock-buscar" placeholder="Buscar producto" autocomplete="off">
+                <div class="links-prods" id="links-sin-stock"></div>
+            </details>
+            <div class="page-actions links-acciones">
+                <button class="btn btn-primary" id="btn-links-generar-todos">Generar links de todos</button>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Cliente</th>
+                            <th>Link</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="links-clientes-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Mantenimiento / Limpiar datos -->
+        <div id="mantenimiento" class="page">
+            <div class="page-header">
+                <h2>Limpiar todos los datos</h2>
+            </div>
+            <div class="danger-panel">
+                <div class="danger-panel-icon">⚠️</div>
+                <div class="danger-panel-body">
+                    <h3>Zona peligrosa</h3>
+                    <p>Esta acción deja la app vacía. <strong>Antes de borrar se guarda una copia completa</strong> de todos los datos en Google Drive ("Respaldo … con la fecha"), así no se pierde nada:</p>
+                    <ul class="danger-panel-list">
+                        <li>Clientes, productos y proveedores</li>
+                        <li>Pedidos, recepciones y precios</li>
+                        <li>Cobranzas, pagos, cierres e historial</li>
+                        <li>Stock y movimientos de caja</li>
+                        <li>Caché local del navegador (excepto tu sesión)</li>
+                        <li>Google Sheets — todas las hojas vuelven a quedar vacías con solo encabezados (la copia queda aparte en Drive)</li>
+                    </ul>
+                    <p class="danger-panel-warning">Usalo solo para pruebas o empezar de cero.</p>
+                    <button type="button" class="btn btn-danger" id="btn-reset-todos-datos">Eliminar todos los datos</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Historial -->
+        <div id="historial" class="page">
+            <div class="page-header">
+                <h2>Historial de días</h2>
+            </div>
+            <div id="historial-drive" class="historial-drive"></div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Fecha</th>
+                            <th>Estado</th>
+                            <th>Acciones</th>
+                        </tr>
+                    </thead>
+                    <tbody id="historial-tbody">
+                        <!-- Se llena dinámicamente -->
+                    </tbody>
+                </table>
+            </div>
+            <div id="historial-detalle" class="historial-detalle" hidden></div>
+            <div class="page-actions">
+                <button class="btn btn-primary" id="btn-ver-dia">Ver día</button>
+            </div>
+        </div>
+
+        <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo.
+        <div id="reparto" class="page">
+            <div class="page-header">
+                <h2>Repartir efectivo</h2>
+            </div>
+            <p class="dia-operativo-hint">Entrá el efectivo de un cliente. Si de eso le das a un proveedor, se descuenta el saldo de cada uno. Lo que no repartís queda en la caja.</p>
+            <div id="reparto-root"></div>
+        </div>
+        -->
+
+        <div id="caja" class="page">
+            <div class="page-header">
+                <h2>Caja</h2>
+                <!-- DESACTIVADO POR AHORA (Repartir efectivo): descomentar para volver a activarlo.
+                <button type="button" class="btn btn-primary" id="btn-caja-repartir">Repartir efectivo</button>
+                -->
+            </div>
+            <div class="dia-operativo-bar">
+                <div class="dia-operativo-bar-main">
+                    <label class="dia-operativo-label" for="caja-fecha">Fecha</label>
+                    <input type="date" id="caja-fecha" class="form-control">
+                </div>
+                <p class="dia-operativo-hint">Ingresos de cobranzas y egresos de pagos a proveedores.</p>
+            </div>
+            <div class="dashboard-grid caja-resumen">
+                <div class="dashboard-card"><h3>Ingresos del día</h3><div class="card-value money" id="caja-ingresos">$0</div></div>
+                <div class="dashboard-card"><h3>Egresos del día</h3><div class="card-value money money-alert" id="caja-egresos">$0</div></div>
+                <div class="dashboard-card"><h3>Saldo del día</h3><div class="card-value money" id="caja-saldo-dia">$0</div></div>
+                <div class="dashboard-card"><h3>Saldo acumulado</h3><div class="card-value money" id="caja-saldo-total">$0</div></div>
+            </div>
+            <div class="table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Tipo</th>
+                            <th>Detalle</th>
+                            <th>Monto</th>
+                            <th>Referencia</th>
+                        </tr>
+                    </thead>
+                    <tbody id="caja-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modales -->
+    <div id="modal-overlay" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">Título</h3>
+                <button class="modal-close" id="modal-close">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- Contenido dinámico -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="modal-cancel">Cancelar</button>
+                <button class="btn btn-primary" id="modal-save">Guardar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alert Personalizado -->
+    <div id="custom-alert-overlay" class="custom-alert-overlay">
+        <div class="custom-alert">
+            <div class="custom-alert-icon" id="custom-alert-icon">
+                <!-- Icono dinámico -->
+            </div>
+            <div class="custom-alert-content">
+                <h3 id="custom-alert-title">Título</h3>
+                <p id="custom-alert-message">Mensaje</p>
+            </div>
+            <div class="custom-alert-footer">
+                <button class="btn btn-primary" id="custom-alert-btn">Aceptar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Personalizado -->
+    <div id="custom-confirm-overlay" class="custom-alert-overlay">
+        <div class="custom-alert custom-confirm">
+            <div class="custom-alert-icon warning">
+                <span>⚠️</span>
+            </div>
+            <div class="custom-alert-content">
+                <h3 id="custom-confirm-title">Confirmar acción</h3>
+                <p id="custom-confirm-message">¿Está seguro?</p>
+            </div>
+            <div class="custom-alert-footer">
+                <button class="btn btn-secondary" id="custom-confirm-cancel">Cancelar</button>
+                <button class="btn btn-primary" id="custom-confirm-accept">Aceptar</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <nav class="bottom-nav" aria-label="Flujo del día">
+        <a href="#" data-page="pedidos" class="nav-link"><span>1</span>Planilla</a>
+        <a href="#" data-page="camiones" class="nav-link"><span>2</span>Camiones</a>
+        <a href="#" data-page="precios" class="nav-link"><span>3</span>Precios</a>
+        <a href="#" data-page="cobros-hoy" class="nav-link"><span>4</span>Cobro</a>
+        <a href="#" data-page="pagos" class="nav-link"><span>5</span>Pago</a>
+        <a href="#" data-page="cierre" class="nav-link"><span>6</span>Cierre</a>
+    </nav>
+    <script src="auth.js?v=20261013hoja"></script>
+    <script src="services/whatsapp.js?v=20261116linkfecha1"></script>
+    <script src="services/pedidoProveedorService.js?v=20261023sinunidad"></script>
+    <script src="services/precioClienteService.js?v=20261027cierre"></script>
+    <script src="app.js?v=20261116linkfecha1"></script>
+    <script>
+        // Verificar autenticación y configurar UI
+        (function() {
+            // Verificar autenticación inmediatamente
+            if (window.__sinSesion || !Auth.isAuthenticated()) {
+                Auth.navegar('login.html');
+                return;
+            }
+            
+            // Configurar UI después de que el DOM esté listo
+            document.addEventListener('DOMContentLoaded', () => {
+                // Mostrar email del usuario
+                const userEmail = Auth.getUserEmail();
+                const userEmailEl = document.getElementById('user-email');
+                if (userEmailEl) {
+                    const hoja = Auth.getHoja();
+                    userEmailEl.textContent = userEmail + (hoja ? ' · hoja ' + hoja : '');
+                    userEmailEl.title = 'Cada usuario trabaja con su propia hoja de cálculo. Si dos usuarios muestran la misma hoja, comparten datos.';
+                }
+                
+                // Manejar logout
+                const btnLogout = document.getElementById('btn-logout');
+                if (btnLogout) {
+                    btnLogout.addEventListener('click', async () => {
+                        if (!confirm('¿Deseas cerrar sesión?')) return;
+                        // Lo que se cargó en la planilla y todavía no llegó al servidor se pierde al salir:
+                        // primero se termina de guardar.
+                        try {
+                            if (typeof PlanillaPedidos !== 'undefined' && PlanillaPedidos.pendientes() > 0) {
+                                btnLogout.disabled = true;
+                                await PlanillaPedidos.esperarGuardado();
+                            }
+                        } catch (error) {
+                            if (!confirm('Todavía hay cambios de la planilla sin guardar y se perderían al cerrar sesión. ¿Cerrar igual?')) {
+                                btnLogout.disabled = false;
+                                return;
+                            }
+                        }
+                        Auth.logout();
+                    });
+                }
+            });
+        })();
+    </script>
+</body>
+</html>
+

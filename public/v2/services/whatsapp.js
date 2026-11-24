@@ -1,0 +1,150 @@
+/**
+ * Servicio de integración con WhatsApp.
+ * - Modo automático: WhatsApp Business Cloud API (backend).
+ * - Modo manual: abre WhatsApp Web (en el celular, la app) con el mensaje precargado.
+ */
+class WhatsAppError extends Error {
+    constructor(message, code = 'WHATSAPP_ERROR') {
+        super(message);
+        this.name = 'WhatsAppError';
+        this.code = code;
+    }
+}
+
+const WhatsAppService = {
+    _extensionLista: false,
+
+    DEFAULT_COUNTRY_CODE: '54',
+    WINDOW_NAME: 'whatsapp_window',
+
+    isMobile() {
+        return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    },
+
+    normalizePhone(telefono) {
+        if (telefono === null || telefono === undefined || telefono === '') {
+            return null;
+        }
+
+        let digits = String(telefono).trim();
+
+        if (digits.startsWith('+')) {
+            digits = digits.slice(1).replace(/\D/g, '');
+        } else {
+            digits = digits.replace(/\D/g, '');
+            if (digits.startsWith('00')) {
+                digits = digits.slice(2);
+            } else if (digits.startsWith('0')) {
+                digits = digits.slice(1);
+            }
+
+            if (digits.length >= 10 && digits.length <= 11 && !digits.startsWith(this.DEFAULT_COUNTRY_CODE)) {
+                digits = this.DEFAULT_COUNTRY_CODE + digits;
+            }
+        }
+
+        if (digits.length < 10 || digits.length > 15) {
+            return null;
+        }
+
+        return digits;
+    },
+
+    // opciones.app: abre la aplicación de WhatsApp (en la computadora, la de escritorio) y no WhatsApp Web.
+    buildUrl(telefono, mensaje, opciones = {}) {
+        const phone = this.normalizePhone(telefono);
+
+        if (!phone) {
+            throw new WhatsAppError(
+                'El contacto no tiene un teléfono válido configurado.',
+                'INVALID_PHONE'
+            );
+        }
+
+        const encodedMessage = encodeURIComponent(mensaje);
+
+        if (this.isMobile() || opciones.app) {
+            return `whatsapp://send?phone=${phone}&text=${encodedMessage}`;
+        }
+
+        // En la computadora se usa siempre WhatsApp Web (es el que usan), no la aplicación:
+        // wa.me pasa por una página que ofrece abrir la app de escritorio.
+        return `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
+    },
+
+    openChat(telefono, mensaje, opciones = {}) {
+        const url = this.buildUrl(telefono, mensaje, opciones);
+
+        // Usar un nombre de ventana fijo para reutilizar la misma pestaña
+        // en vez de abrir una nueva cada vez que se envía un mensaje
+        if (this.isMobile() || opciones.app) {
+            window.location.href = url;
+        } else if (this._extensionLista) {
+            // La extensión usa la pestaña de WhatsApp Web que ya está abierta.
+            const id = String(Date.now());
+            let respondio = false;
+            const alResponder = (event) => {
+                if (event.source !== window || !event.data || event.data.id !== id) return;
+                if (event.data.tipo === 'LC_WHATSAPP_LISTO') {
+                    respondio = true;
+                    window.removeEventListener('message', alResponder);
+                } else if (event.data.tipo === 'LC_WHATSAPP_EXTENSION_CAIDA') {
+                    // Extensión recargada con esta pestaña abierta: se abre como siempre.
+                    respondio = true;
+                    this._extensionLista = false;
+                    window.removeEventListener('message', alResponder);
+                    this._wspWindow = window.open(url, this.WINDOW_NAME);
+                }
+            };
+            window.addEventListener('message', alResponder);
+            window.postMessage({ tipo: 'LC_WHATSAPP_ABRIR', id: id, url: url }, '*');
+            setTimeout(() => {
+                window.removeEventListener('message', alResponder);
+                if (!respondio) this._wspWindow = window.open(url, this.WINDOW_NAME);
+            }, 1500);
+        } else {
+            this._wspWindow = window.open(url, this.WINDOW_NAME);
+        }
+    },
+
+    /**
+     * Envía el mensaje automáticamente vía WhatsApp Business API (backend).
+     * @param {string} telefono
+     * @param {string} mensaje
+     * @param {Object} api
+     */
+    async sendMessage(telefono, mensaje, api) {
+        const phone = this.normalizePhone(telefono);
+
+        if (!phone) {
+            throw new WhatsAppError(
+                'El contacto no tiene un teléfono válido configurado.',
+                'INVALID_PHONE'
+            );
+        }
+
+        await api.enviarWhatsApp(phone, mensaje);
+    },
+
+    /**
+     * Envía automáticamente si la API está configurada; si no, abre WhatsApp manualmente.
+     * @returns {Promise<'auto'|'manual'>}
+     */
+    async sendOrOpen(telefono, mensaje, api, autoEnvioActivo) {
+        if (autoEnvioActivo) {
+            await this.sendMessage(telefono, mensaje, api);
+            return 'auto';
+        }
+
+        this.openChat(telefono, mensaje);
+        return 'manual';
+    }
+};
+
+// La extensión de Chrome avisa que está instalada.
+window.addEventListener('message', (event) => {
+    if (event.source === window && event.data && event.data.tipo === 'LC_WHATSAPP_EXTENSION') {
+        WhatsAppService._extensionLista = true;
+    }
+});
+window.postMessage({ tipo: 'LC_WHATSAPP_PING' }, '*');
