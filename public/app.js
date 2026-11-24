@@ -198,6 +198,155 @@ CacheManager._initFromStorage();
 CacheManager.hydrateAppStateFromCache();
 
 // Gestión del día del pedido (recepción puede ser al día siguiente)
+// Calendario de días con color: verde = cerrado, rojo = por cerrar (tiene pedidos y todavía no se cerró),
+// sin color = no se cargó nada. El calendario del navegador no se puede pintar, así que cada selector de día
+// tiene al lado un botón que abre este (el campo sigue siendo el mismo y se puede escribir la fecha).
+const CalendarioDias = {
+    _popup: null,
+    _input: null,
+    _mes: null,
+    _cerrados: new Set(),
+
+    enganchar() {
+        document.querySelectorAll('.dia-operativo-fecha').forEach(input => {
+            if (input.dataset.cal === '1') return;
+            input.dataset.cal = '1';
+            const boton = document.createElement('button');
+            boton.type = 'button';
+            boton.className = 'dia-cal-btn';
+            boton.textContent = '📅';
+            boton.title = 'Abrir el calendario (verde: cerrado, rojo: por cerrar)';
+            boton.setAttribute('aria-label', 'Abrir el calendario de días');
+            input.insertAdjacentElement('afterend', boton);
+            boton.addEventListener('click', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (this._popup && this._input === input) { this.cerrar(); return; }
+                this.abrir(input, boton);
+            });
+        });
+    },
+
+    _estadoDe(fecha) {
+        if (this._cerrados.has(fecha)) return 'cerrado';
+        const info = DiaOperativo.getDiaInfo(fecha);
+        if (info) {
+            if (info.estado === 'cerrado') return 'cerrado';
+            if (Number(info.pedidos_count) > 0) return 'por-cerrar';
+        }
+        return '';
+    },
+
+    async abrir(input, boton) {
+        this.cerrar();
+        this._input = input;
+        const base = /^\d{4}-\d{2}-\d{2}$/.test(input.value) ? input.value : DiaOperativo.today();
+        this._mes = { y: Number(base.slice(0, 4)), m: Number(base.slice(5, 7)) - 1 };
+
+        const popup = document.createElement('div');
+        popup.className = 'dia-cal';
+        popup.setAttribute('role', 'dialog');
+        popup.setAttribute('aria-label', 'Calendario de días');
+        popup.innerHTML = `
+            <div class="dia-cal-cab">
+                <button type="button" class="dia-cal-nav" data-nav="-1" aria-label="Mes anterior">‹</button>
+                <strong class="dia-cal-titulo"></strong>
+                <button type="button" class="dia-cal-nav" data-nav="1" aria-label="Mes siguiente">›</button>
+            </div>
+            <div class="dia-cal-sem">${['DO', 'LU', 'MA', 'MI', 'JU', 'VI', 'SA'].map(d => `<span>${d}</span>`).join('')}</div>
+            <div class="dia-cal-grilla"></div>
+            <div class="dia-cal-leyenda">
+                <span><i class="dia-cal-chip cerrado"></i> Cerrado</span>
+                <span><i class="dia-cal-chip por-cerrar"></i> Por cerrar</span>
+                <span><i class="dia-cal-chip"></i> Sin cargar</span>
+            </div>`;
+        document.body.appendChild(popup);
+        this._popup = popup;
+
+        popup.addEventListener('click', e => {
+            e.stopPropagation();
+            const nav = e.target.closest('[data-nav]');
+            if (nav) {
+                const d = new Date(this._mes.y, this._mes.m + Number(nav.dataset.nav), 1);
+                this._mes = { y: d.getFullYear(), m: d.getMonth() };
+                this._pintar();
+                return;
+            }
+            const dia = e.target.closest('[data-fecha]');
+            if (dia) this._elegir(dia.dataset.fecha);
+        });
+        this._cerrarFuera = e => { if (!popup.contains(e.target)) this.cerrar(); };
+        this._cerrarTecla = e => { if (e.key === 'Escape') this.cerrar(); };
+        setTimeout(() => document.addEventListener('click', this._cerrarFuera), 0);
+        document.addEventListener('keydown', this._cerrarTecla);
+
+        this._pintar();
+        this._ubicar(boton);
+
+        // Los días ya cerrados vienen del historial de cierres (la lista de días abiertos no los trae).
+        try {
+            const cierres = await API.getCierres();
+            this._cerrados = new Set((cierres || [])
+                .filter(c => String(c.estado || '') !== 'cerrando')
+                .map(c => Utils.fechaIso(c.fecha))
+                .filter(Boolean));
+            if (this._popup === popup) this._pintar();
+        } catch (error) {
+            // Sin el historial se muestran solo los días con pedidos sin cerrar.
+        }
+    },
+
+    _pintar() {
+        const popup = this._popup;
+        if (!popup) return;
+        const { y, m } = this._mes;
+        const titulo = new Date(y, m, 1).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+        popup.querySelector('.dia-cal-titulo').textContent = titulo.charAt(0).toUpperCase() + titulo.slice(1);
+        const dos = n => String(n).padStart(2, '0');
+        const primero = new Date(y, m, 1).getDay();
+        const cantidad = new Date(y, m + 1, 0).getDate();
+        const hoy = DiaOperativo.today();
+        const elegido = this._input && this._input.value;
+        let html = '<span></span>'.repeat(primero);
+        for (let d = 1; d <= cantidad; d++) {
+            const fecha = `${y}-${dos(m + 1)}-${dos(d)}`;
+            const estado = this._estadoDe(fecha);
+            const texto = estado === 'cerrado' ? 'cerrado' : (estado === 'por-cerrar' ? 'por cerrar' : 'sin cargar');
+            html += `<button type="button" class="dia-cal-dia ${estado}${fecha === hoy ? ' hoy' : ''}${fecha === elegido ? ' elegido' : ''}" data-fecha="${fecha}" aria-label="${d} de ${titulo}, ${texto}">${d}</button>`;
+        }
+        popup.querySelector('.dia-cal-grilla').innerHTML = html;
+    },
+
+    _ubicar(boton) {
+        const popup = this._popup;
+        if (!popup || !boton) return;
+        const r = boton.getBoundingClientRect();
+        const ancho = popup.offsetWidth || 300;
+        const alto = popup.offsetHeight || 320;
+        const izquierda = Math.max(8, Math.min(r.left, window.innerWidth - ancho - 8));
+        let arriba = r.bottom + 6;
+        if (arriba + alto > window.innerHeight - 8) arriba = Math.max(8, r.top - alto - 6);
+        popup.style.left = izquierda + 'px';
+        popup.style.top = arriba + 'px';
+    },
+
+    _elegir(fecha) {
+        const input = this._input;
+        this.cerrar();
+        if (!input) return;
+        input.value = fecha;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    },
+
+    cerrar() {
+        if (this._popup) this._popup.remove();
+        this._popup = null;
+        this._input = null;
+        document.removeEventListener('click', this._cerrarFuera);
+        document.removeEventListener('keydown', this._cerrarTecla);
+    }
+};
+
 const DiaOperativo = {
     diasPendientes: [],
     workDate: null,
@@ -404,6 +553,7 @@ const DiaOperativo = {
             const pedidos = infoActual && infoActual.pedidos_count > 0 ? ` · ${infoActual.pedidos_count} pedidos` : '';
             el.textContent = this.formatFechaLabel(actual) + pedidos;
         });
+        CalendarioDias.enganchar();
         setTimeout(() => { this._ignoreSelectChange = false; }, 0);
     },
 
@@ -4571,6 +4721,7 @@ const Camiones = {
             const id = btn.dataset.camion;
             if (btn.dataset.accion === 'quitar-cliente') this.quitarCliente(id, btn.dataset.cliente);
             if (btn.dataset.accion === 'quitar-camion') this.quitar(id);
+            if (btn.dataset.accion === 'mover-dia') this.cambiarDeDia(id);
             if (btn.dataset.accion === 'imprimir') this.imprimir(id);
             if (btn.dataset.accion === 'excel') this.descargarExcel(id);
             if (btn.dataset.accion === 'enviar') this.enviar(id);
@@ -4809,6 +4960,7 @@ const Camiones = {
                     </div>
                     ${this._tabla(camion)}
                     <div class="camion-acciones">
+                        <button class="btn btn-secondary btn-sm" type="button" data-accion="mover-dia" data-camion="${camion.id}" title="Si el camión sale otro día, pasa sus pedidos a ese día">Cambiar de día</button>
                         <button class="btn btn-secondary btn-sm" type="button" data-accion="imprimir" data-camion="${camion.id}">Imprimir</button>
                         <button class="btn btn-secondary btn-sm" type="button" data-accion="excel" data-camion="${camion.id}">Excel</button>
                         <button class="btn btn-whatsapp btn-sm" type="button" data-accion="enviar" data-camion="${camion.id}">WhatsApp</button>
@@ -4817,6 +4969,68 @@ const Camiones = {
             `;
         }).join('');
         root.innerHTML = aviso + `<div class="camion-lista">${tarjetas}</div>`;
+    },
+
+    // Si el camión sale otro día, sus pedidos van con él: se pasan los pedidos de sus clientes (y el camión) al día nuevo.
+    async cambiarDeDia(id) {
+        const camion = this.lista.find(c => String(c.id) === String(id));
+        if (!camion) return;
+        const desde = AppState.currentDate;
+        if (DiaOperativo.diaCerrado(desde)) return Utils.showError('Este día ya está cerrado: no se pueden mover sus pedidos.');
+        const clientes = (camion.clientes || []).map(String);
+        if (!clientes.length) return Utils.showError('Este camión todavía no tiene clientes.');
+        let pedidos = [];
+        try {
+            pedidos = ((await API.getPedidos(desde)) || []).filter(p => clientes.includes(String(p.cliente_id)));
+        } catch (error) {
+            return Utils.showError('No se pudieron leer los pedidos del día. Revisá la conexión.');
+        }
+        if (!pedidos.length) return Utils.showError('Los clientes de este camión no tienen pedidos en este día.');
+
+        const siguiente = new Date(desde + 'T12:00:00');
+        siguiente.setDate(siguiente.getDate() + 1);
+        const dos = n => String(n).padStart(2, '0');
+        const manana = `${siguiente.getFullYear()}-${dos(siguiente.getMonth() + 1)}-${dos(siguiente.getDate())}`;
+        const content = `
+            <p class="modal-hint"><strong>${this._esc(camion.nombre)}</strong>: ${clientes.length} cliente${clientes.length === 1 ? '' : 's'} y ${pedidos.length} pedido${pedidos.length === 1 ? '' : 's'} del ${Utils.formatDate(desde)}.</p>
+            <div class="form-group">
+                <label for="mover-dia-fecha">Pasarlos al día</label>
+                <input type="date" id="mover-dia-fecha" class="form-control" value="${manana}">
+            </div>
+            <small class="modal-hint">Se mueven los pedidos de esos clientes y el camión. Quedan pendientes de enviar al proveedor. Si ese día ya hay un pedido del mismo cliente y producto, se suman.</small>`;
+        Utils.showModal('Cambiar el camión de día', content, async () => {
+            const hasta = (document.getElementById('mover-dia-fecha') || {}).value || '';
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(hasta) || hasta === desde) {
+                Utils.showError('Elegí un día distinto del actual.');
+                throw new Error('Día inválido');
+            }
+            let resultado;
+            try {
+                resultado = await API.request('pedidos/mover', 'POST', { desde, hasta, cliente_ids: clientes, camion_id: camion.id });
+            } catch (error) {
+                Utils.showError(error && error.message ? error.message : 'No se pudieron mover los pedidos.');
+                throw error;
+            }
+            // Los dos días cambiaron: se descarta lo que se tenía guardado de ellos.
+            [desde, hasta].forEach(f => {
+                CacheManager.invalidate(`pedidos:${f}`);
+                CacheManager.invalidate(`flujo:${f}`);
+                CacheManager.invalidate(`precios:${f}`);
+                CacheManager.invalidate(`recepcion:${f}`);
+                DataLoader.invalidateFlujo(f);
+            });
+            API._invalidateFlujo();
+            AppState.fechaCargada = null;
+            this.lista = this.lista.filter(c => String(c.id) !== String(camion.id));
+            this._guardarLocal(desde, this.lista.map((c, index) => ({ id: c.id, nombre: c.nombre, orden: index + 1, clientes: c.clientes || [] })));
+            this._firmas[desde] = this._firma(this.lista);
+            try { localStorage.removeItem('sg_camiones:' + hasta); } catch (error) { /* sin almacenamiento */ }
+            delete this._firmas[hasta];
+            this.render();
+            DiaOperativo.refreshSoon();
+            const sumados = resultado && resultado.combinados ? ` (${resultado.combinados === 1 ? '1 se sumó' : resultado.combinados + ' se sumaron'} a pedidos que ya había)` : '';
+            Utils.showSuccess(`Se pasó ${this._esc(camion.nombre)} al ${Utils.formatDate(hasta)}: ${pedidos.length} pedido${pedidos.length === 1 ? '' : 's'}${sumados}. Elegí ese día para verlos.`);
+        }, 'Cambiar de día');
     },
 
     agregar() {
@@ -6957,6 +7171,40 @@ const Recepcion = {
 
     // Todas las filas de un producto juntas (para las pantallas que miran el producto entero):
     // lo que llegó se suma, el precio es el promedio ponderado y está confirmado si lo están todas.
+    // A este cliente no le tocó nada de lo que llegó de ese producto (se repartió a mano a otros): no se le cobra,
+    // así que no hace falta su precio. Es la misma regla que usa el servidor para dejar cerrar el día.
+    _clienteSinParte(clienteId, productoId) {
+        const filas = (AppState.recepcion || []).filter(r => String(r.producto_id) === String(productoId));
+        if (!filas.length) return false;
+        if (!filas.every(r => r.confirmado === true || r.confirmado === 'true' || r.confirmado === 1)) return false;
+        let total = 0;
+        for (const r of filas) {
+            const llego = parseFloat(r.llego) || 0;
+            if (llego <= 0) continue;
+            let reparto = r.reparto;
+            if (typeof reparto === 'string') { try { reparto = JSON.parse(reparto); } catch (e) { reparto = null; } }
+            if (!reparto || typeof reparto !== 'object') return false;
+            const suma = Object.values(reparto).reduce((t, n) => t + (Number(n) || 0), 0);
+            if (Math.abs(suma - llego) > 0.05) return false;
+            total += Number(reparto[String(clienteId)]) || 0;
+        }
+        return total <= 0.004;
+    },
+
+    // Las filas de recepción de un producto, una por proveedor (dos del mismo proveedor son la misma mercadería repetida:
+    // vale la confirmada). Las "extra" son proveedores agregados a mano y cuentan todas.
+    _filasUnicas(filas, productoId) {
+        const vistas = new Map();
+        (filas || []).filter(r => String(r.producto_id) === String(productoId)).forEach(r => {
+            if (r.extra === true || r.extra === 'true') { vistas.set(Symbol('extra'), r); return; }
+            const k = String(r.proveedor_id || '');
+            const previa = vistas.get(k);
+            const conf = x => x.confirmado === true || x.confirmado === 'true' || x.confirmado === 1;
+            if (!previa || (conf(r) && !conf(previa))) vistas.set(k, r);
+        });
+        return [...vistas.values()];
+    },
+
     agregadoDe(filas, productoId) {
         let propias = (filas || []).filter(r => String(r.producto_id) === String(productoId));
         // Dos filas del mismo proveedor (y que no son un "extra") son la misma mercadería repetida: vale una sola,
@@ -8694,6 +8942,42 @@ const Precios = {
 
     // Comisión por unidad de una línea. En un día cerrado vale lo que quedó guardado (es lo que se
     // cobró); en un día abierto sale de la regla del producto.
+    // Costo por unidad de la mercadería de una línea (cliente + producto), tal como se cargó en la recepción.
+    // Con un solo proveedor es exactamente el precio real que se puso al confirmar. Si el producto llegó de más de un
+    // proveedor a distinto precio y se repartió a mano, es el promedio de lo que recibió ESE cliente de cada uno
+    // (antes era el promedio de todo lo que llegó, igual para todos los clientes).
+    _costoDeLinea(precio) {
+        const agregado = Recepcion.agregadoDe(this.recepciones, precio.producto_id);
+        const confirmada = agregado && (agregado.confirmado === true || agregado.confirmado === 'true' || agregado.confirmado === 1);
+        if (!confirmada) return { costo: 0, detalle: [] };
+        const base = Utils.parsePrice(agregado.precio_real || 0);
+        const filas = Recepcion._filasUnicas(this.recepciones, precio.producto_id);
+        if (filas.length < 2) return { costo: base, detalle: [] };
+        let cantidad = 0;
+        let total = 0;
+        const detalle = [];
+        for (const fila of filas) {
+            if (!((parseFloat(fila.llego) || 0) > 0)) continue;
+            let reparto = fila.reparto;
+            if (typeof reparto === 'string') { try { reparto = JSON.parse(reparto); } catch (e) { reparto = null; } }
+            // Sin un reparto cargado a mano no se sabe cuánto de cada proveedor recibió este cliente.
+            if (!reparto || typeof reparto !== 'object') return { costo: base, detalle: [] };
+            const parte = Number(reparto[String(precio.cliente_id)]) || 0;
+            if (!(parte > 0)) continue;
+            const costo = Utils.parsePrice(fila.precio_real) || 0;
+            cantidad += parte;
+            total += parte * costo;
+            detalle.push({ proveedor: fila.proveedor_nombre || '', cantidad: parte, costo });
+        }
+        if (!(cantidad > 0)) return { costo: base, detalle: [] };
+        return { costo: Math.round(total / cantidad), detalle };
+    },
+
+    _textoMezcla(costoLinea) {
+        const partes = costoLinea.detalle.map(d => `${Utils.formatCantidad(d.cantidad)} a ${Utils.formatCurrency(d.costo)}${d.proveedor ? ' (' + d.proveedor + ')' : ''}`);
+        return `Llegó de más de un proveedor: ${partes.join(' + ')}. El costo es el promedio de lo que recibió este cliente.`;
+    },
+
     _comisionLinea(precio, precioCliente = precio.precio_cliente) {
         if (DiaOperativo.diaCerrado(AppState.currentDate)) {
             return { comision_unitaria: Utils.parseComision(precio.comision_unitaria) || 0, comision_pct: Comisiones.porcentaje(precio.comision_pct) };
@@ -8808,9 +9092,8 @@ const Precios = {
                 : Utils.parsePrice(precio.precio_cliente || 0);
             
             // Obtener precio_real de la recepción
-            const recepcion = Recepcion.agregadoDe(this.recepciones, precio.producto_id);
-            const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
-            const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            const costoLinea = this._costoDeLinea(precio);
+            const precioRealRecepcion = costoLinea.costo;
             // Se completa solo con el costo de la recepción; si lo cambian a mano, vale el de la línea.
             const precioRealLinea = realesInputs[precio.id] !== undefined
                 ? realesInputs[precio.id]
@@ -8844,7 +9127,7 @@ const Precios = {
                     <td>${Utils.nombreCatalogo(precio, 'cliente')}</td>
                     <td>${Utils.nombreCatalogo(precio, 'producto')}</td>
                     <td>${cantidad}</td>
-                    <td><input type="text" class="precio-real${precioRealEditado ? ' precio-real-editado' : ''}" data-id="${precio.id}" data-auto="${precioRealRecepcion}" data-price-input="true" value="${precioReal > 0 ? Utils.formatPrice(precioReal) : ''}" style="width: 100px;" placeholder="${precioRealRecepcion > 0 ? Utils.formatPrice(precioRealRecepcion) : 'Costo c/u'}" title="${precioRealEditado ? `Cambiado a mano (el de la recepción es ${Utils.formatCurrency(precioRealRecepcion)}). Borralo para volver al de la recepción.` : 'Sale de la recepción. Podés cambiarlo: solo cambia la ganancia de esta línea, no lo que le debés al proveedor.'}"></td>
+                    <td><input type="text" class="precio-real${precioRealEditado ? ' precio-real-editado' : ''}" data-id="${precio.id}" data-auto="${precioRealRecepcion}" data-price-input="true" value="${precioReal > 0 ? Utils.formatPrice(precioReal) : ''}" style="width: 100px;" placeholder="${precioRealRecepcion > 0 ? Utils.formatPrice(precioRealRecepcion) : 'Costo c/u'}" title="${precioRealEditado ? `Cambiado a mano (el de la recepción es ${Utils.formatCurrency(precioRealRecepcion)}). Borralo para volver al de la recepción.` : (costoLinea.detalle.length > 1 ? this._textoMezcla(costoLinea) : 'Sale de la recepción. Podés cambiarlo: solo cambia la ganancia de esta línea, no lo que le debés al proveedor.')}"></td>
                     <td><input type="text" class="precio-cliente" data-id="${precio.id}" data-price-input="true" value="${precioManual > 0 ? Utils.formatPrice(precioManual) : ''}" onchange="Precios.onPrecioChange()" style="width: 100px;" placeholder="Precio al cliente" title="Lo que le cobrás al cliente por unidad. La comisión se suma aparte."></td>
                     <td class="precio-comision-celda">${this._htmlComision(com)}</td>
                     <td style="color: ${gananciaTotal >= 0 ? 'var(--color-success)' : 'var(--color-danger)'}; font-weight: 600;">${precioManual > 0 ? `${gananciaTotal > 0 ? '+' : ''}${Utils.formatCurrency(gananciaTotal)}` : '—'}</td>
@@ -9158,9 +9441,8 @@ const Precios = {
 
             const cantidad = parseFloat(precio.cantidad || 0);
             totalCantidad += cantidad;
-            const recepcion = Recepcion.agregadoDe(this.recepciones, precio.producto_id);
-            const confirmada = recepcion && (recepcion.confirmado === true || recepcion.confirmado === 'true' || recepcion.confirmado === 1);
-            const precioRealRecepcion = confirmada ? Utils.parsePrice(recepcion.precio_real || 0) : 0;
+            const costoLinea = this._costoDeLinea(precio);
+            const precioRealRecepcion = costoLinea.costo;
             const inputReal = tr.querySelector('.precio-real');
             const valorReal = inputReal ? (Utils.parsePrice(inputReal.value) || 0) : 0;
             // El costo rellenado solo no cuenta como cambio a mano (ver render).
@@ -10841,6 +11123,12 @@ const Cierre = {
             const rec = Recepcion.agregadoDe(AppState.recepcion, pedido.producto_id);
             const confirmado = rec && (rec.confirmado === true || rec.confirmado === 'true' || rec.confirmado === 1);
             if (confirmado && (Number(rec.llego) || 0) <= 0) return false;
+            // Sin línea con cantidad y sin nada de lo que llegó para ese cliente: no hace falta su precio.
+            const tieneLineaConCantidad = (precios || []).some(pr =>
+                String(pr.cliente_id) === String(pedido.cliente_id) &&
+                String(pr.producto_id) === String(pedido.producto_id) &&
+                Number(pr.cantidad) > 0);
+            if (!tieneLineaConCantidad && Recepcion._clienteSinParte(pedido.cliente_id, pedido.producto_id)) return false;
             return !conPrecio.some(pr =>
                 String(pr.cliente_id) === String(pedido.cliente_id) &&
                 String(pr.producto_id) === String(pedido.producto_id)
@@ -12125,7 +12413,7 @@ const Cobranzas = {
             CacheManager.set('cobranzas:all:all', AppState.cobranzas);
             this.render();
             Utils.avisar(leido.total > saldo + 0.01
-                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado. ${Utils.formatCurrency(leido.total - saldo)} quedan a favor`
+                ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado. Los ${Utils.formatCurrency(leido.total - saldo)} que sobran se descuentan de las otras cargas del cliente`
                 : leido.total >= saldo
                 ? `Cobro de ${Utils.formatCurrency(leido.total)} registrado`
                 : `Cobro registrado. Queda ${Utils.formatCurrency(cobranza.saldo)}`);
@@ -12149,7 +12437,7 @@ const Cobranzas = {
                 fecha: cobranza.origen === 'manual' ? fechaHoyAR() : (cobranza.fecha || AppState.currentDate),
                 depositos: deposito.lineas,
                 permitir_exceso: true
-            }), () => {
+            }).then(respuesta => this._avisarDescuento(respuesta)), () => {
                 cobranza.saldo = saldoAnterior;
                 cobranza.pagado = pagadoAnterior;
                 cobranza.estado = estadoAnterior;
@@ -12164,6 +12452,17 @@ const Cobranzas = {
         MediosPago.enganchar(saldo, { tope: false });
     },
     
+    // Cuando el cliente paga de más, el servidor descuenta el sobrante de sus otras cargas pendientes (la siguiente
+    // primero). Acá se avisa de cuáles y se vuelve a leer la lista, porque cambiaron cargas que no eran la cobrada.
+    async _avisarDescuento(respuesta) {
+        const aplicado = respuesta && Array.isArray(respuesta.aplicado_en) ? respuesta.aplicado_en : [];
+        if (!aplicado.length) return;
+        const detalle = aplicado.map(a => `${Utils.formatCurrency(a.monto)} de la carga del ${Utils.formatDate(a.fecha)}`).join(' y ');
+        Utils.showSuccess(`El sobrante se descontó: ${detalle}.`);
+        CacheManager.invalidatePattern('cobranzas');
+        try { await this.load(); } catch (error) { /* se actualiza al volver a abrir la pantalla */ }
+    },
+
     // Saca lo cobrado por error: se elige cuánto deshacer en cada medio (por defecto, todo).
     deshacerPago(cobranzaId) {
         const cobranza = AppState.cobranzas.find(c => c.id === cobranzaId);

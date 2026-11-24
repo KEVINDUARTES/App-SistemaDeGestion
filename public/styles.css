@@ -4192,3 +4192,24 @@ body.recepcion-full:has(#recepcion.active) #recepcion-tabla.recepcion-planilla {
 .modal.modal-ancho { width: min(980px, calc(100vw - 24px)); max-width: 980px; }
 .modal-ancho .data-table td.money, .modal-ancho .data-table td[data-label="Fecha"] { white-space: nowrap; }
 .modal-ancho .data-table td[data-label="Detalle"] { min-width: 220px; }
+
+/* ===== Calendario de días con color (verde: cerrado, rojo: por cerrar) ===== */
+.dia-operativo-fecha::-webkit-calendar-picker-indicator { display: none; }
+.dia-cal-btn { font: inherit; line-height: 1; padding: 6px 9px; margin-left: 4px; cursor: pointer; background: #fff; border: 1px solid var(--color-gray-300, #cbd5e1); border-radius: 8px; }
+.dia-cal-btn:hover { background: var(--color-gray-100, #f1f5f9); }
+.dia-cal { position: fixed; z-index: 3000; width: 300px; padding: 12px; background: #fff; border: 1px solid var(--color-gray-300, #cbd5e1); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+.dia-cal-cab { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.dia-cal-nav { font: inherit; font-size: 18px; line-height: 1; padding: 4px 10px; cursor: pointer; background: transparent; border: 0; border-radius: 6px; color: #334155; }
+.dia-cal-nav:hover { background: var(--color-gray-100, #f1f5f9); }
+.dia-cal-sem, .dia-cal-grilla { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; text-align: center; }
+.dia-cal-sem span { font-size: 11px; font-weight: 600; color: #64748b; padding: 4px 0; }
+.dia-cal-dia { font: inherit; font-size: 13px; padding: 7px 0; cursor: pointer; color: #1e293b; background: transparent; border: 1px solid transparent; border-radius: 8px; }
+.dia-cal-dia:hover { border-color: #94a3b8; }
+.dia-cal-dia.cerrado { background: #bbf7d0; color: #14532d; font-weight: 600; }
+.dia-cal-dia.por-cerrar { background: #fecaca; color: #7f1d1d; font-weight: 600; }
+.dia-cal-dia.hoy { box-shadow: inset 0 0 0 2px #2563eb; }
+.dia-cal-dia.elegido { border-color: #1e293b; border-width: 2px; }
+.dia-cal-leyenda { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #e2e8f0; font-size: 12px; color: #475569; }
+.dia-cal-chip { display: inline-block; width: 12px; height: 12px; margin-right: 4px; vertical-align: -1px; border-radius: 3px; border: 1px solid #cbd5e1; }
+.dia-cal-chip.cerrado { background: #bbf7d0; border-color: #86efac; }
+.dia-cal-chip.por-cerrar { background: #fecaca; border-color: #fca5a5; }
