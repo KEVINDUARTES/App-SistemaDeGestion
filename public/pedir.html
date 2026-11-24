@@ -8,12 +8,12 @@
     <style>
         :root {
             --bg: #E9EDF5; --surface: #FFFFFF; --soft: #F1F4FA; --ink: #101A2E; --muted: #55627A; --line: #D0D8E6;
-            --brand: #1B2F5E; --on-brand: #FFFFFF; --warn: #B4531A; --warn-bg: #FBEBDD; --ok-bg: #DDE5F5;
+            --brand: #1B2F5E; --on-brand: #FFFFFF; --warn: #B4531A; --warn-bg: #FBEBDD; --ok-bg: #DDE5F5; --danger: #A3272B;
         }
         @media (prefers-color-scheme: dark) {
             :root {
                 --bg: #0A1020; --surface: #121B30; --soft: #18233D; --ink: #E5EAF5; --muted: #9AA8C4; --line: #27355A;
-                --brand: #6C8CE0; --on-brand: #08102A; --warn: #EE9559; --warn-bg: #3A2616; --ok-bg: #1B2A52;
+                --brand: #6C8CE0; --on-brand: #08102A; --warn: #EE9559; --warn-bg: #3A2616; --ok-bg: #1B2A52; --danger: #F08A8D;
             }
         }
         * { box-sizing: border-box; }
@@ -70,6 +70,17 @@
         .centro h2 { margin: 0; font-size: 24px; }
         .centro p { margin: 0; color: var(--muted); }
         .centro .boton { max-width: 320px; }
+        .resumen { display: flex; justify-content: space-between; align-items: baseline; margin: 14px 16px 0; padding: 10px 12px; border-radius: 12px; background: var(--ok-bg); font-weight: 600; }
+        .resumen span:last-child { color: var(--brand); }
+        .revisar { margin: 12px 16px 0; padding: 10px 12px; border-radius: 12px; background: var(--warn-bg); color: var(--warn); font-weight: 600; font-size: 14px; }
+        .fila.revision { align-items: flex-start; flex-wrap: wrap; }
+        .fila.revision .cant { margin-left: auto; }
+        .borrar { width: 38px; height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--danger); font-size: 16px; line-height: 1; cursor: pointer; }
+        .deshacer { margin: 12px 0 0; padding: 10px 12px; border-radius: 12px; background: var(--soft); display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; }
+        .link { background: none; border: 0; color: var(--brand); font: 600 15px inherit; padding: 0; cursor: pointer; }
+        .vacio { text-align: center; padding: 40px 12px; color: var(--muted); }
+        .vacio b { display: block; color: var(--ink); font-size: 17px; margin-bottom: 4px; }
+        .boton:focus-visible, .borrar:focus-visible, .link:focus-visible, .cant button:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
         [hidden] { display: none !important; }
     </style>
 </head>
@@ -93,8 +104,22 @@
         </header>
         <main id="lista"></main>
         <footer>
-            <button class="boton" id="enviar" type="button" disabled>Elegí lo que necesitás</button>
+            <button class="boton" id="revisar" type="button" disabled>Elegí lo que necesitás</button>
             <small id="pie"></small>
+        </footer>
+    </div>
+
+    <div id="revision" hidden style="display:flex;flex-direction:column;flex:1">
+        <header>
+            <div class="marca">Luciano Cargas</div>
+            <h1>Revisá tu pedido</h1>
+        </header>
+        <div class="resumen" id="resumen"></div>
+        <div class="revisar" id="revisar-aviso">Todavía no se envió. Cambiá lo que quieras y tocá Enviar.</div>
+        <main id="lista-revision" aria-live="polite"></main>
+        <footer>
+            <button class="boton" id="enviar" type="button">Enviar pedido</button>
+            <button class="boton suave" id="agregar" type="button">+ Agregar más productos</button>
         </footer>
     </div>
 

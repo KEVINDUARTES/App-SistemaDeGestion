@@ -42,7 +42,7 @@ function llamar(endpoint, method, datos, intento = 0) {
     });
 }
 
-const estado = { info: null, inicial: {}, actual: {}, busqueda: '' };
+const estado = { info: null, inicial: {}, actual: {}, busqueda: '', quitado: null };
 
 const fmt = n => String(Math.round((Number(n) || 0) * 100) / 100).replace('.', ',');
 function leer(texto, porKilo) {
@@ -58,7 +58,7 @@ function fechaLarga(iso) {
 }
 
 function mostrar(cual) {
-    ['cargando', 'error', 'pedido', 'hecho'].forEach(id => { $(id).hidden = id !== cual; });
+    ['cargando', 'error', 'pedido', 'revision', 'hecho'].forEach(id => { $(id).hidden = id !== cual; });
 }
 
 function cambios() {
@@ -73,13 +73,58 @@ function cambios() {
 
 function resumenBoton() {
     const info = estado.info;
-    const boton = $('enviar');
+    const boton = $('revisar');
     const pedidos = info.productos.filter(p => (estado.actual[p.id] || 0) > 0).length;
     const hayCambios = cambios().length > 0;
     boton.disabled = !info.abierto || !hayCambios;
     if (!info.abierto) boton.textContent = 'Pedidos cerrados';
     else if (!hayCambios) boton.textContent = pedidos ? 'Sin cambios' : 'Elegí lo que necesitás';
-    else boton.textContent = `Enviar pedido · ${pedidos} ${pedidos === 1 ? 'producto' : 'productos'}`;
+    else boton.textContent = `Revisar pedido · ${pedidos} ${pedidos === 1 ? 'producto' : 'productos'}`;
+}
+
+// Cantidad con − / campo / +, igual en la lista y en la revisión. "alCambiar" repinta lo que haga falta.
+function crearCant(p, nombre, alCambiar) {
+    const info = estado.info;
+    const cant = document.createElement('div');
+    cant.className = 'cant' + ((estado.actual[p.id] || 0) > 0 ? ' tiene' : '');
+    const menos = document.createElement('button');
+    menos.type = 'button'; menos.textContent = '−'; menos.setAttribute('aria-label', 'Menos ' + p.nombre);
+    const campo = document.createElement('input');
+    campo.type = 'text'; campo.inputMode = p.por_kilo ? 'decimal' : 'numeric'; campo.autocomplete = 'off';
+    campo.value = (estado.actual[p.id] || 0) > 0 ? fmt(estado.actual[p.id]) : '';
+    campo.placeholder = '0';
+    campo.setAttribute('aria-label', 'Cantidad de ' + p.nombre);
+    const mas = document.createElement('button');
+    mas.type = 'button'; mas.textContent = '+'; mas.setAttribute('aria-label', 'Más ' + p.nombre);
+    if (!info.abierto) { menos.disabled = mas.disabled = campo.disabled = true; }
+    // Sin stock: no se puede sumar; si ya lo había pedido, solo bajarlo o sacarlo.
+    if (p.sin_stock) {
+        const tope = estado.inicial[p.id] || 0;
+        if (nombre) {
+            const aviso = document.createElement('span');
+            aviso.className = 'sin-stock-txt';
+            aviso.textContent = 'Sin stock por ahora';
+            nombre.appendChild(aviso);
+        }
+        if (!tope) { menos.disabled = mas.disabled = campo.disabled = true; }
+    }
+    const poner = valor => {
+        const antes = estado.actual[p.id] || 0;
+        estado.actual[p.id] = Math.max(0, p.sin_stock ? Math.min(valor, estado.inicial[p.id] || 0) : valor);
+        campo.value = estado.actual[p.id] > 0 ? fmt(estado.actual[p.id]) : '';
+        cant.classList.toggle('tiene', estado.actual[p.id] > 0);
+        alCambiar(p, antes);
+    };
+    const paso = p.por_kilo ? 0.5 : 1;
+    menos.addEventListener('click', () => poner(Math.round(((estado.actual[p.id] || 0) - paso) * 100) / 100));
+    mas.addEventListener('click', () => poner(Math.round(((estado.actual[p.id] || 0) + paso) * 100) / 100));
+    campo.addEventListener('input', () => {
+        campo.value = p.por_kilo ? campo.value.replace(/[^\d,.]/g, '') : campo.value.replace(/\D/g, '');
+    });
+    campo.addEventListener('change', () => poner(leer(campo.value, p.por_kilo)));
+    campo.addEventListener('focus', () => campo.select());
+    cant.append(menos, campo, mas);
+    return cant;
 }
 
 function pintarLista() {
@@ -111,45 +156,8 @@ function pintarLista() {
             nombre.appendChild(u);
         }
 
-        const cant = document.createElement('div');
-        cant.className = 'cant' + ((estado.actual[p.id] || 0) > 0 ? ' tiene' : '');
-        const menos = document.createElement('button');
-        menos.type = 'button'; menos.textContent = '−'; menos.setAttribute('aria-label', 'Menos ' + p.nombre);
-        const campo = document.createElement('input');
-        campo.type = 'text'; campo.inputMode = p.por_kilo ? 'decimal' : 'numeric'; campo.autocomplete = 'off';
-        campo.value = (estado.actual[p.id] || 0) > 0 ? fmt(estado.actual[p.id]) : '';
-        campo.placeholder = '0';
-        campo.setAttribute('aria-label', 'Cantidad de ' + p.nombre);
-        const mas = document.createElement('button');
-        mas.type = 'button'; mas.textContent = '+'; mas.setAttribute('aria-label', 'Más ' + p.nombre);
-        if (!info.abierto) { menos.disabled = mas.disabled = campo.disabled = true; }
-        // Sin stock: no se puede sumar; si ya lo había pedido, solo bajarlo o sacarlo.
-        if (p.sin_stock) {
-            const tope = estado.inicial[p.id] || 0;
-            fila.classList.add('sin-stock');
-            const aviso = document.createElement('span');
-            aviso.className = 'sin-stock-txt';
-            aviso.textContent = 'Sin stock por ahora';
-            nombre.appendChild(aviso);
-            if (!tope) { menos.disabled = mas.disabled = campo.disabled = true; }
-        }
-
-        const poner = valor => {
-            estado.actual[p.id] = Math.max(0, p.sin_stock ? Math.min(valor, estado.inicial[p.id] || 0) : valor);
-            campo.value = estado.actual[p.id] > 0 ? fmt(estado.actual[p.id]) : '';
-            cant.classList.toggle('tiene', estado.actual[p.id] > 0);
-            resumenBoton();
-        };
-        const paso = p.por_kilo ? 0.5 : 1;
-        menos.addEventListener('click', () => poner(Math.round(((estado.actual[p.id] || 0) - paso) * 100) / 100));
-        mas.addEventListener('click', () => poner(Math.round(((estado.actual[p.id] || 0) + paso) * 100) / 100));
-        campo.addEventListener('input', () => {
-            campo.value = p.por_kilo ? campo.value.replace(/[^\d,.]/g, '') : campo.value.replace(/\D/g, '');
-        });
-        campo.addEventListener('change', () => poner(leer(campo.value, p.por_kilo)));
-        campo.addEventListener('focus', () => campo.select());
-
-        cant.append(menos, campo, mas);
+        if (p.sin_stock) fila.classList.add('sin-stock');
+        const cant = crearCant(p, nombre, () => resumenBoton());
         fila.append(nombre, cant);
         cont.appendChild(fila);
     });
@@ -187,6 +195,98 @@ function armar(info) {
     pintarLista();
 }
 
+function textoCantidad(p) {
+    const n = estado.actual[p.id] || 0;
+    return fmt(n) + (p.por_kilo ? ' kg' : (p.unidad ? ' ' + p.unidad : ''));
+}
+
+// Pantalla de revisión: solo lo que está pedido, para cambiarlo o quitarlo antes de enviar.
+function pintarRevision() {
+    const info = estado.info;
+    const cont = $('lista-revision');
+    cont.textContent = '';
+    const pedidos = info.productos.filter(p => (estado.actual[p.id] || 0) > 0);
+    $('resumen').textContent = '';
+    const r1 = document.createElement('span');
+    r1.textContent = `${pedidos.length} ${pedidos.length === 1 ? 'producto' : 'productos'}`;
+    $('resumen').appendChild(r1);
+
+    if (estado.quitado) {
+        const barra = document.createElement('div');
+        barra.className = 'deshacer';
+        const txt = document.createElement('span');
+        txt.textContent = 'Quitaste ' + estado.quitado.nombre;
+        const des = document.createElement('button');
+        des.type = 'button'; des.className = 'link'; des.textContent = 'Deshacer';
+        des.addEventListener('click', () => {
+            estado.actual[estado.quitado.id] = estado.quitado.cantidad;
+            estado.quitado = null;
+            pintarRevision();
+        });
+        barra.append(txt, des);
+        cont.appendChild(barra);
+    }
+    if (!pedidos.length) {
+        const vacio = document.createElement('div');
+        vacio.className = 'vacio';
+        const b = document.createElement('b');
+        b.textContent = 'No quedó ningún producto';
+        vacio.append(b, document.createTextNode(Object.keys(estado.inicial).length
+            ? 'Si enviás así, se saca todo lo que habías pedido. También podés agregar productos.'
+            : 'Agregá productos para poder enviar el pedido.'));
+        cont.appendChild(vacio);
+    }
+    let grupo = null;
+    pedidos.forEach(p => {
+        if (p.tipo !== grupo) {
+            grupo = p.tipo;
+            const g = document.createElement('div');
+            g.className = 'grupo';
+            g.textContent = grupo || 'Otros';
+            cont.appendChild(g);
+        }
+        const fila = document.createElement('div');
+        fila.className = 'fila revision';
+        const nombre = document.createElement('div');
+        nombre.className = 'nombre';
+        const b = document.createElement('b');
+        b.textContent = p.nombre;
+        const u = document.createElement('span');
+        u.textContent = textoCantidad(p);
+        nombre.append(b, u);
+        const cant = crearCant(p, null, (prod, antes) => {
+            if ((estado.actual[prod.id] || 0) === 0) estado.quitado = { id: prod.id, nombre: prod.nombre, cantidad: antes };
+            pintarRevision();
+        });
+        const borrar = document.createElement('button');
+        borrar.type = 'button'; borrar.className = 'borrar'; borrar.textContent = '✕';
+        borrar.setAttribute('aria-label', 'Quitar ' + p.nombre);
+        borrar.addEventListener('click', () => {
+            estado.quitado = { id: p.id, nombre: p.nombre, cantidad: estado.actual[p.id] };
+            estado.actual[p.id] = 0;
+            pintarRevision();
+        });
+        fila.append(nombre, cant, borrar);
+        cont.appendChild(fila);
+    });
+    const hayCambios = cambios().length > 0;
+    $('enviar').disabled = !info.abierto || !hayCambios;
+    $('enviar').textContent = pedidos.length || !hayCambios ? 'Enviar pedido' : 'Enviar sin productos';
+}
+
+function irRevision() {
+    estado.quitado = null;
+    mostrar('revision');
+    pintarRevision();
+    window.scrollTo(0, 0);
+}
+
+function irLista() {
+    estado.quitado = null;
+    mostrar('pedido');
+    pintarLista();
+}
+
 async function cargar() {
     if (!LINK) {
         $('error-texto').textContent = 'Este link no es válido. Pedile uno nuevo al equipo.';
@@ -210,6 +310,7 @@ async function enviar() {
     const boton = $('enviar');
     boton.disabled = true;
     boton.textContent = 'Enviando…';
+    $('agregar').disabled = true;
     try {
         for (let i = 0; i < lista.length; i += TANDA) {
             await llamar('pedido-link/guardar', 'POST', { items: lista.slice(i, i + TANDA) });
@@ -218,9 +319,11 @@ async function enviar() {
         }
     } catch (error) {
         alert('No se pudo enviar el pedido: ' + error.message + '\nLo que cargaste sigue acá. Probá de nuevo.');
-        resumenBoton();
+        $('agregar').disabled = false;
+        pintarRevision();
         return;
     }
+    $('agregar').disabled = false;
     const pedidos = estado.info.productos.filter(p => (estado.actual[p.id] || 0) > 0).length;
     $('hecho-texto').textContent = pedidos
         ? `Recibimos ${pedidos} ${pedidos === 1 ? 'producto' : 'productos'} para el ${fechaLarga(estado.info.fecha).toLowerCase()}. Podés cambiarlo cuando quieras.`
@@ -228,8 +331,14 @@ async function enviar() {
     mostrar('hecho');
 }
 
+$('revisar').addEventListener('click', irRevision);
+$('agregar').addEventListener('click', irLista);
 $('enviar').addEventListener('click', enviar);
-$('modificar').addEventListener('click', () => cargar());
+// "Modificar pedido": se vuelve a leer lo guardado y se abre directo la revisión para cambiarlo.
+$('modificar').addEventListener('click', async () => {
+    await cargar();
+    if (estado.info && estado.info.abierto && Object.keys(estado.inicial).length) irRevision();
+});
 $('reintentar').addEventListener('click', cargar);
 $('buscar').addEventListener('input', e => { estado.busqueda = e.target.value.trim(); pintarLista(); });
 cargar();
